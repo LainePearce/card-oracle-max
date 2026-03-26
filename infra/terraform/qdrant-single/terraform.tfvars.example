@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars and fill in your values.
+# terraform.tfvars is git-ignored — never commit credentials.
+
+key_pair_name  = "your-key-pair-name"
+qdrant_api_key = "your-secret-qdrant-api-key"
+my_ip          = "1.2.3.4/32"    # your public IP — find with: curl ifconfig.me
+
+# Optional overrides:
+# instance_type  = "r6gd.xlarge"
+# qdrant_version = "v1.8.2"
+# assign_eip     = false
+# name_prefix    = "qdrant-test"

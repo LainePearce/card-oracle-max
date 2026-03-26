@@ -1,0 +1,4 @@
+# Placeholder — 3-node Qdrant cluster for HA testing
+# Will be built when moving from single-node test to cluster validation
+version: "3.8"
+services: {}

@@ -1,0 +1,26 @@
+# Qdrant node configuration — local development
+# Mounted into container at /qdrant/config/production.yaml
+
+storage:
+  storage_path: /qdrant/storage
+
+  # Performance tuning for local dev
+  optimizers:
+    default_segment_number: 2
+    indexing_threshold_kb: 50000
+    memmap_threshold_kb: 50000
+
+  # WAL settings
+  wal:
+    wal_capacity_mb: 64
+    wal_segments_ahead: 0
+
+service:
+  host: "0.0.0.0"
+  http_port: 6333
+  grpc_port: 6334
+  enable_tls: false
+
+  # API key set via environment variable QDRANT__SERVICE__API_KEY
+
+log_level: INFO

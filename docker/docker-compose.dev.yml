@@ -1,0 +1,19 @@
+version: "3.8"
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.8.2
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # HTTP REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_storage:/qdrant/storage
+      - ./qdrant-config.yaml:/qdrant/config/production.yaml:ro
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT__LOG_LEVEL=INFO
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+
+volumes:
+  qdrant_storage:
