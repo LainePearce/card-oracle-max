@@ -1,9 +1,16 @@
 # Qdrant
 qdrant-client[grpc]>=1.8.0
 
-# OpenSearch
+# OpenSearch (extant cluster — read-only scroll + KNN experiment control)
 opensearch-py>=2.4.0
 requests-aws4auth>=1.3.0
+
+# Elasticsearch (new self-managed document cluster — write target)
+# ES 8.x client API is compatible with the operations we use (_bulk, _index_template, etc.)
+elasticsearch[async]>=8.13.0
+
+# MySQL (RDS backfill source — primary and secondary)
+pymysql>=1.1.0
 
 # Embedding models
 torch>=2.0.0
@@ -27,6 +34,11 @@ scikit-learn>=1.4.0
 # Async
 aiohttp>=3.9.0
 httpx>=0.26.0
+
+# Web server (GPU worker + search UI)
+flask>=3.0.0
+gunicorn>=21.2.0
+pillow>=10.0.0
 
 # Utilities
 python-dotenv>=1.0.0

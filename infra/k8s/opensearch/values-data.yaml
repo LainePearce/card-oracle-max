@@ -1,0 +1,66 @@
+# OpenSearch Helm chart values — Data + Ingest nodes
+# Handles BM25 search, aggregations, filters, mget enrichment.
+# No KNN/vector search — Qdrant handles all vector workloads.
+
+clusterName: card-oracle-docs
+nodeGroup: data
+
+replicas: 3
+
+roles:
+  - data
+  - ingest
+
+resources:
+  requests:
+    cpu: "6"
+    memory: "14Gi"
+  limits:
+    memory: "14Gi"
+
+# JVM heap = 50% of container memory (8GB heap, 6GB for OS page cache)
+opensearchJavaOpts: "-Xms8g -Xmx8g"
+
+persistence:
+  enabled: true
+  storageClass: gp3
+  size: 500Gi
+
+tolerations:
+  - key: workload
+    value: opensearch
+    effect: NoSchedule
+
+nodeSelector:
+  node-role: opensearch-data
+
+# One data pod per physical node — prevents two data pods on same host
+antiAffinity: hard
+
+config:
+  opensearch.yml: |
+    cluster.name: card-oracle-docs
+    plugins.security.disabled: true
+    # Tune for 1000+ indices
+    cluster.max_shards_per_node: 3000
+    # Search thread pool — sized for 50k-100k searches/min
+    thread_pool.search.queue_size: 2000
+
+extraEnvs:
+  - name: DISABLE_INSTALL_DEMO_CONFIG
+    value: "true"
+
+# Kernel tuning — required for OpenSearch
+sysctlInit:
+  enabled: true
+
+plugins:
+  enabled: true
+  installList:
+    - repository-s3
+
+# Service for client access (coordinators route through this too)
+service:
+  type: ClusterIP
+  port: 9200
+  transportPort: 9300

@@ -1,0 +1,50 @@
+# Copy to terraform.tfvars and fill in values — never commit terraform.tfvars
+
+aws_region         = "us-west-1"
+cluster_name       = "card-oracle-os"
+opensearch_version = "2.13.0"
+key_pair_name      = "qdrant-test"   # reuse existing key pair
+
+# Instances — exact equivalents of managed service
+data_instance_type   = "c7g.2xlarge"
+master_instance_type = "r7g.xlarge"
+
+# EBS — matches managed service config
+data_volume_gb         = 100
+data_volume_iops       = 4500
+data_volume_throughput = 250
+
+# JVM heap = half of instance RAM
+data_jvm_heap   = "8g"    # c7g.2xlarge has 16GB
+master_jvm_heap = "16g"   # r7g.xlarge has 32GB
+
+# Networking — fill in your VPC and subnet IDs
+# us-west-1 has 2 AZs for most accounts; use the same subnet twice for the 3rd
+# if a third AZ is not available.
+vpc_id = "vpc-XXXXXXXX"
+subnet_ids = [
+  "subnet-AAAA",   # us-west-1a
+  "subnet-BBBB",   # us-west-1b
+  "subnet-CCCC",   # us-west-1c (or repeat AAAA/BBBB if only 2 AZs available)
+]
+subnet_cidrs = [
+  "172.31.0.0/20",
+  "172.31.16.0/20",
+  "172.31.32.0/20",
+]
+
+# Set to false to expose NLB publicly (needed if Lambda is not in same VPC)
+internal_nlb = false
+
+# Operator IPs for SSH + direct HTTP access
+operator_ips = ["YOUR.IP.HERE/32"]
+
+# SG IDs of GPU workers and Lambda functions that need port 9200
+# Get gpu-worker SG ID from: cd ../gpu-worker && terraform output
+client_security_group_ids = []
+
+# Auth
+admin_password = "CHANGE_ME_strong_password_here"
+
+# S3 bucket for automated snapshots (create separately)
+snapshot_bucket = "card-oracle-snapshots"

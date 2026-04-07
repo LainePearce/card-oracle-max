@@ -1,0 +1,52 @@
+# OpenSearch Helm chart values — Dedicated Master nodes
+# Manages cluster state for ~1000+ indices. No data stored.
+
+clusterName: card-oracle-docs
+nodeGroup: master
+
+replicas: 3
+
+roles:
+  - cluster_manager
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "3Gi"
+  limits:
+    memory: "3Gi"
+
+opensearchJavaOpts: "-Xms2g -Xmx2g"
+
+persistence:
+  enabled: true
+  storageClass: gp3
+  size: 10Gi
+
+tolerations:
+  - key: workload
+    value: opensearch
+    effect: NoSchedule
+
+nodeSelector:
+  node-role: opensearch-master
+
+antiAffinity: hard
+
+config:
+  opensearch.yml: |
+    cluster.name: card-oracle-docs
+    plugins.security.disabled: true
+
+extraEnvs:
+  - name: DISABLE_INSTALL_DEMO_CONFIG
+    value: "true"
+
+# Kernel tuning — required for OpenSearch
+sysctlInit:
+  enabled: true
+
+plugins:
+  enabled: true
+  installList:
+    - repository-s3

@@ -1,5 +1,8 @@
 -r requirements.txt
 
+# Dev tools / local UI server
+flask>=3.0.0
+
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pytest-benchmark>=4.0.0

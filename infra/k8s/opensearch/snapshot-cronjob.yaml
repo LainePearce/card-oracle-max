@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: opensearch-snapshot
+  namespace: opensearch-docs
+  labels:
+    app.kubernetes.io/part-of: card-oracle
+spec:
+  # Every 6 hours
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: snapshot
+              image: curlimages/curl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  OS_URL="http://opensearch-data.opensearch-docs.svc.cluster.local:9200"
+                  SNAPSHOT_NAME="snapshot-$(date +%Y%m%d-%H%M%S)"
+
+                  # Ensure repository is registered
+                  curl -sf -X PUT "$OS_URL/_snapshot/s3-backups" \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "type": "s3",
+                      "settings": {
+                        "bucket": "'$S3_SNAPSHOT_BUCKET'",
+                        "base_path": "opensearch-snapshots",
+                        "region": "'$AWS_REGION'"
+                      }
+                    }' || true
+
+                  # Create snapshot
+                  curl -sf -X PUT "$OS_URL/_snapshot/s3-backups/$SNAPSHOT_NAME?wait_for_completion=false" \
+                    -H "Content-Type: application/json" \
+                    -d '{"indices": "*", "ignore_unavailable": true}'
+
+                  echo "Snapshot $SNAPSHOT_NAME initiated"
+
+                  # Clean up snapshots older than 7 days (keep last 28)
+                  SNAPSHOTS=$(curl -sf "$OS_URL/_snapshot/s3-backups/_all" | \
+                    python3 -c "
+                  import json, sys
+                  data = json.load(sys.stdin)
+                  snaps = sorted(data.get('snapshots', []), key=lambda s: s['start_time'])
+                  if len(snaps) > 28:
+                      for s in snaps[:-28]:
+                          print(s['snapshot'])
+                  " 2>/dev/null) || true
+
+                  for snap in $SNAPSHOTS; do
+                    echo "Deleting old snapshot: $snap"
+                    curl -sf -X DELETE "$OS_URL/_snapshot/s3-backups/$snap" || true
+                  done
+              env:
+                - name: S3_SNAPSHOT_BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: opensearch-config
+                      key: snapshot-bucket
+                - name: AWS_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: opensearch-config
+                      key: aws-region
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensearch-config
+  namespace: opensearch-docs
+data:
+  snapshot-bucket: "card-oracle-opensearch-snapshots"
+  aws-region: "us-west-1"

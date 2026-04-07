@@ -1,0 +1,53 @@
+# Copy to terraform.tfvars and fill in values — never commit terraform.tfvars
+
+aws_region    = "us-west-1"
+instance_type = "g4dn.xlarge"   # 1x T4 GPU, 16GB VRAM
+key_pair_name = "qdrant-test"
+name_prefix   = "gpu-worker"
+
+# Operator IPs for SSH access
+my_ips = ["YOUR.IP.HERE/32"]
+
+# Qdrant node (from qdrant-single terraform output or EC2 console)
+qdrant_host    = "QDRANT_INSTANCE_PRIVATE_IP"
+qdrant_port    = "6333"
+qdrant_api_key = "YOUR_QDRANT_API_KEY"
+
+# S3 vector store
+s3_vector_bucket = "card-oracle-vectors"
+s3_vector_prefix = "vectors"
+
+# OpenSearch — extant cluster (read-only experiment control)
+# Leave empty if cluster is offline
+opensearch_host     = ""
+opensearch_user     = ""
+opensearch_password = ""
+
+# OpenSearch — new self-managed cluster (write target)
+# Get NLB DNS from: cd ../opensearch-cluster && terraform output nlb_dns_name
+opensearch_docs_host     = "card-oracle-os-nlb-XXXX.elb.us-west-1.amazonaws.com"
+opensearch_docs_user     = "admin"
+opensearch_docs_password = "YOUR_STRONG_OS_PASSWORD"
+
+# RDS MySQL — primary (current database)
+rds_host     = "your-rds-instance.us-west-1.rds.amazonaws.com"
+rds_user     = "your-rds-user"
+rds_password = "YOUR_RDS_PASSWORD"
+rds_database = "your-database-name"
+
+# RDS MySQL — secondary (older database, pre-cutover)
+# Leave rds2_host as "" to disable. The pipeline will run primary-only.
+rds2_host     = "your-old-rds-instance.us-west-1.rds.amazonaws.com"
+rds2_user     = "your-rds2-user"
+rds2_password = "YOUR_RDS2_PASSWORD"
+rds2_database = "your-old-database-name"
+
+# Parallel backfill — one GPU worker per partition.
+# Adjust partition boundaries to balance doc counts across workers.
+# 2025-01-01 to 2026-04-04 split into 4 ~4.5-month windows:
+date_partitions = [
+  "endTime >= '2025-01-01' AND endTime < '2025-05-01'",
+  "endTime >= '2025-05-01' AND endTime < '2025-09-01'",
+  "endTime >= '2025-09-01' AND endTime < '2026-01-01'",
+  "endTime >= '2026-01-01' AND endTime < '2026-04-05'",
+]

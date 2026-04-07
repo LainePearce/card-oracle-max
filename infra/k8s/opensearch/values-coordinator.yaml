@@ -1,0 +1,48 @@
+# OpenSearch Helm chart values — Coordinator nodes
+# Stateless query routers: scatter-gather across 1000+ indices, merge results.
+# Run on data nodes (no dedicated instances needed).
+
+clusterName: card-oracle-docs
+nodeGroup: coordinator
+
+replicas: 2
+
+# Empty roles list = coordinator-only node
+roles: []
+
+resources:
+  requests:
+    cpu: "2"
+    memory: "4Gi"
+  limits:
+    memory: "4Gi"
+
+opensearchJavaOpts: "-Xms2g -Xmx2g"
+
+# Stateless — no persistent storage needed
+persistence:
+  enabled: false
+
+tolerations:
+  - key: workload
+    value: opensearch
+    effect: NoSchedule
+
+# Share data nodes — coordinators are lightweight
+nodeSelector:
+  node-role: opensearch-data
+
+# Prefer different nodes but allow colocating if needed
+antiAffinity: soft
+
+config:
+  opensearch.yml: |
+    cluster.name: card-oracle-docs
+    plugins.security.disabled: true
+
+extraEnvs:
+  - name: DISABLE_INSTALL_DEMO_CONFIG
+    value: "true"
+
+sysctlInit:
+  enabled: true

@@ -1,0 +1,28 @@
+# Copy this file to terraform.tfvars and fill in real values.
+# terraform.tfvars is git-ignored — never commit credentials.
+
+aws_region     = "us-west-1"
+instance_type  = "g4dn.xlarge"   # T4 GPU — upgrade to g5.xlarge for higher throughput
+instance_count = 1                # Start with 1; increase once stable
+name_prefix    = "search-worker"
+worker_port    = 8081
+
+key_pair_name  = "your-key-pair-name"
+
+# Your current public IP in CIDR notation.
+# Get it: curl -s https://checkip.amazonaws.com && echo /32
+# Update this before applying if your IP changes.
+my_ips = ["<your-ip>/32"]
+
+# Qdrant — point at the qdrant-single or qdrant-cluster instance
+qdrant_host    = "<qdrant-instance-ip-or-nlb-dns>"
+qdrant_port    = "6333"
+qdrant_api_key = "your-qdrant-api-key"
+
+# OpenSearch — extant read-only cluster for document enrichment
+opensearch_host     = "search-es130point-vector-h3eaau7mwcpyhgynkthfcwzeje.aos.us-west-1.on.aws"
+opensearch_user     = "your-opensearch-username"
+opensearch_password = "your-opensearch-password"
+
+# S3 vector store (read-only access granted to this instance)
+s3_vector_bucket = "card-oracle-vectors"

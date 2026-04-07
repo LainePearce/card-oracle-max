@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Card Oracle — Search</title>
+  <style>
+    /* ── Reset & Variables ───────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --surface2:    #1c2230;
+      --border:      #30363d;
+      --accent:      #58a6ff;
+      --accent-dim:  #1f4068;
+      --text:        #c9d1d9;
+      --text-muted:  #8b949e;
+      --text-bright: #f0f6fc;
+      --green:       #3fb950;
+      --yellow:      #d29922;
+      --red:         #f85149;
+      --orange:      #db6d28;
+      --purple:      #bc8cff;
+      --radius:      8px;
+      --panel-w:     440px;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; }
+
+    /* ── Header / Search Bar ─────────────────────────────────────────── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 20px;
+    }
+
+    .header-top { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+    .logo { font-size: 18px; font-weight: 700; color: var(--text-bright); white-space: nowrap; }
+    .logo span { color: var(--accent); }
+
+    .search-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    #q {
+      flex: 1; min-width: 240px;
+      background: var(--bg); border: 1px solid var(--border);
+      color: var(--text-bright); padding: 8px 12px; border-radius: var(--radius);
+      font-size: 15px; outline: none; transition: border-color .15s;
+    }
+    #q:focus { border-color: var(--accent); }
+    #q::placeholder { color: var(--text-muted); }
+
+    .date-group { display: flex; align-items: center; gap: 6px; }
+    .date-group label { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+    input[type="date"] {
+      background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); padding: 6px 10px; border-radius: var(--radius);
+      font-size: 13px; outline: none; cursor: pointer;
+    }
+    input[type="date"]:focus { border-color: var(--accent); }
+
+    .size-group { display: flex; align-items: center; gap: 6px; }
+    .size-group label { color: var(--text-muted); font-size: 12px; }
+    #size {
+      width: 70px; background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); padding: 6px 8px; border-radius: var(--radius);
+      font-size: 13px; text-align: center; outline: none;
+    }
+
+    .sort-group { display: flex; align-items: center; gap: 6px; }
+    .sort-group label { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+    #sort {
+      background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); padding: 6px 8px; border-radius: var(--radius);
+      font-size: 13px; outline: none; cursor: pointer;
+    }
+    #sort:focus { border-color: var(--accent); }
+
+    .btn {
+      padding: 7px 18px; border-radius: var(--radius); border: none;
+      cursor: pointer; font-size: 14px; font-weight: 600; transition: opacity .15s;
+    }
+    .btn:hover { opacity: .85; }
+    .btn-primary { background: var(--accent); color: #000; }
+    .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+    .btn-ghost:hover { color: var(--text); border-color: var(--text-muted); }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+    /* ── Status bar ──────────────────────────────────────────────────── */
+    .status-bar {
+      display: flex; align-items: center; gap: 14px;
+      padding: 6px 20px;
+      background: var(--surface2); border-bottom: 1px solid var(--border);
+      font-size: 12px; color: var(--text-muted); min-height: 32px;
+    }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .dot-green { background: var(--green); }
+    .dot-yellow { background: var(--yellow); }
+    .dot-red { background: var(--red); }
+    .status-count { color: var(--text-bright); font-weight: 600; }
+    .status-hint { margin-left: auto; color: var(--text-muted); }
+
+    /* ── Main layout ─────────────────────────────────────────────────── */
+    .layout {
+      display: flex; height: calc(100vh - 112px);
+      overflow: hidden;
+    }
+
+    /* ── Results panel ───────────────────────────────────────────────── */
+    .results-panel {
+      flex: 1; overflow-y: auto; padding: 16px 20px;
+      transition: margin-right .3s ease;
+    }
+    .results-panel.panel-open { margin-right: var(--panel-w); }
+
+    /* Results grid */
+    .results-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+      gap: 12px;
+    }
+
+    /* ── Card tile ───────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden;
+      cursor: pointer; transition: border-color .15s, transform .1s, box-shadow .15s;
+      position: relative;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 16px rgba(88,166,255,.15); }
+    .card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+
+    .card-img-wrap {
+      width: 100%; aspect-ratio: 1;
+      background: #1a1e2a; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; position: relative;
+    }
+    .card-img-wrap img {
+      max-width: 100%; max-height: 100%; object-fit: contain;
+      transition: transform .2s;
+    }
+    .card:hover .card-img-wrap img { transform: scale(1.04); }
+
+    .card-img-placeholder {
+      font-size: 36px; color: var(--border); user-select: none;
+    }
+
+    .card-body { padding: 8px 9px 10px; }
+
+    .card-title {
+      font-size: 11.5px; color: var(--text);
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      overflow: hidden; line-height: 1.4; margin-bottom: 5px; min-height: 2.8em;
+    }
+
+    .card-price {
+      font-size: 14px; font-weight: 700; color: var(--text-bright);
+      margin-bottom: 4px;
+    }
+    .card-price span { font-size: 11px; font-weight: 400; color: var(--text-muted); margin-left: 3px; }
+
+    .card-meta { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+
+    .badge {
+      display: inline-flex; align-items: center;
+      padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .03em; white-space: nowrap;
+    }
+    .badge-grade  { background: #1a2744; color: #79b8ff; }
+    .badge-psa    { background: #1c1c2e; color: #c792ea; }
+    .badge-bgs    { background: #1a2015; color: #85e89d; }
+    .badge-cgc    { background: #2e1a0e; color: #ffab70; }
+    .badge-raw    { background: #1e1e1e; color: #8b949e; }
+    .badge-fix    { background: #0d2137; color: #79b8ff; }
+    .badge-auc    { background: #2e1515; color: #f97583; }
+    .badge-ebay   { background: #1a1e0d; color: #b5e853; }
+    .badge-source { background: var(--surface2); color: var(--text-muted); }
+    .badge-score  { background: #0d2137; color: #fff; font-size: 11px; }
+    .badge-score-high { background: #0d2e1a; color: #3fb950; }
+    .badge-score-mid  { background: #2e2000; color: #d29922; }
+    .badge-score-low  { background: #2e0e00; color: #f85149; }
+
+    .card-date { font-size: 10.5px; color: var(--text-muted); margin-top: 4px; }
+
+    /* Score overlay on image */
+    .score-overlay {
+      position: absolute; top: 6px; right: 6px;
+      background: rgba(0,0,0,.75); backdrop-filter: blur(4px);
+      color: #fff; font-size: 11px; font-weight: 700;
+      padding: 2px 7px; border-radius: 4px;
+    }
+
+    /* ── Vector side panel ───────────────────────────────────────────── */
+    .vector-panel {
+      position: fixed; top: 0; right: 0;
+      width: var(--panel-w); height: 100vh;
+      background: var(--surface); border-left: 1px solid var(--border);
+      overflow-y: auto;
+      transform: translateX(100%); transition: transform .3s ease;
+      z-index: 200;
+    }
+    .vector-panel.open { transform: translateX(0); }
+
+    .panel-header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface2);
+      position: sticky; top: 0; z-index: 10;
+    }
+    .panel-title { font-size: 14px; font-weight: 700; color: var(--text-bright); flex: 1; }
+    .panel-close {
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; font-size: 20px; line-height: 1; padding: 2px 6px;
+      border-radius: 4px; transition: background .1s;
+    }
+    .panel-close:hover { background: var(--border); color: var(--text); }
+
+    /* Query card in panel */
+    .query-card-wrap {
+      flex-shrink: 0; padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .query-card-inner {
+      display: flex; gap: 10px; align-items: flex-start;
+    }
+    .query-img {
+      width: 80px; height: 80px; object-fit: contain;
+      background: var(--surface2); border-radius: 6px; flex-shrink: 0;
+    }
+    .query-info { flex: 1; min-width: 0; }
+    .query-label { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); font-weight: 700; margin-bottom: 4px; }
+    .query-title { font-size: 12px; color: var(--text-bright); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+    /* Section header in panel */
+    .section-label {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--text-muted); font-weight: 700;
+      padding: 10px 14px 6px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+
+    /* Matches list — natural height inside the panel's single scroll container */
+    .matches-scroll { }
+
+    /* Match row in panel */
+    .match-row {
+      display: flex; gap: 10px; padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      cursor: default; transition: background .1s;
+    }
+    .match-row:hover { background: var(--surface2); }
+    .match-row.top-match { background: rgba(88,166,255,.05); }
+
+    .match-rank {
+      width: 22px; font-size: 11px; color: var(--text-muted);
+      flex-shrink: 0; padding-top: 2px; text-align: center;
+    }
+    .top-match .match-rank { color: var(--accent); font-weight: 700; }
+
+    .match-img {
+      width: 68px; height: 68px; flex-shrink: 0;
+      object-fit: contain; background: var(--surface2);
+      border-radius: 5px;
+    }
+
+    .match-info { flex: 1; min-width: 0; }
+    .match-title {
+      font-size: 11.5px; color: var(--text);
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      overflow: hidden; line-height: 1.4; margin-bottom: 4px;
+    }
+    .match-price { font-size: 13px; font-weight: 700; color: var(--text-bright); margin-bottom: 3px; }
+    .match-badges { display: flex; gap: 3px; flex-wrap: wrap; }
+    .match-date { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+
+    .match-score-col {
+      width: 52px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .score-pill {
+      padding: 3px 7px; border-radius: 12px;
+      font-size: 12px; font-weight: 700; text-align: center;
+    }
+
+    /* ── Loading / empty states ──────────────────────────────────────── */
+    .loading-wrap { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 60px 20px; color: var(--text-muted); }
+    .spinner { width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .empty-state { text-align: center; padding: 80px 20px; color: var(--text-muted); }
+    .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+    .empty-state h3 { font-size: 16px; color: var(--text); margin-bottom: 6px; }
+
+    .error-banner { background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.3); border-radius: var(--radius); padding: 10px 14px; color: var(--red); font-size: 13px; margin-bottom: 12px; }
+
+    /* ── Panel encoding indicator ────────────────────────────────────── */
+    .encoding-progress {
+      padding: 16px 14px; text-align: center;
+      color: var(--text-muted); font-size: 13px;
+    }
+    .encoding-progress .spinner { margin: 0 auto 10px; }
+
+    /* ── Pagination ──────────────────────────────────────────────────── */
+    .pagination { display: flex; gap: 6px; align-items: center; padding: 16px 0 4px; flex-wrap: wrap; }
+    .page-btn { padding: 5px 12px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); color: var(--text); cursor: pointer; font-size: 13px; transition: border-color .1s; }
+    .page-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .page-btn.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); font-weight: 700; }
+    .page-info { font-size: 12px; color: var(--text-muted); margin: 0 6px; }
+
+    /* ── Scrollbar ───────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+    /* ── Tooltip ─────────────────────────────────────────────────────── */
+    [title] { cursor: help; }
+    .card [title] { cursor: pointer; }
+
+    /* ── Item detail modal ───────────────────────────────────────────── */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 1000;
+      background: rgba(0,0,0,.75); backdrop-filter: blur(4px);
+      display: flex; align-items: center; justify-content: center;
+      padding: 20px;
+      opacity: 0; pointer-events: none;
+      transition: opacity .2s ease;
+    }
+    .modal-overlay.visible { opacity: 1; pointer-events: all; }
+
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; overflow: hidden;
+      max-width: 780px; width: 100%; max-height: 90vh;
+      display: flex; flex-direction: column;
+      transform: translateY(12px); transition: transform .2s ease;
+      box-shadow: 0 24px 64px rgba(0,0,0,.6);
+    }
+    .modal-overlay.visible .modal { transform: translateY(0); }
+
+    .modal-header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 18px; flex-shrink: 0;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface2);
+    }
+    .modal-header-title {
+      font-size: 13px; font-weight: 700; color: var(--text-bright); flex: 1; min-width: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .modal-close {
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; font-size: 20px; line-height: 1;
+      padding: 2px 6px; border-radius: 4px; transition: background .1s; flex-shrink: 0;
+    }
+    .modal-close:hover { background: var(--border); color: var(--text); }
+
+    .modal-body {
+      display: flex; gap: 0; overflow: hidden; flex: 1; min-height: 0;
+    }
+
+    .modal-img-col {
+      width: 260px; flex-shrink: 0;
+      background: #1a1e2a;
+      display: flex; align-items: center; justify-content: center;
+      padding: 20px;
+      border-right: 1px solid var(--border);
+    }
+    .modal-img-col img {
+      max-width: 100%; max-height: 380px; object-fit: contain;
+      border-radius: 6px;
+    }
+    .modal-img-placeholder { font-size: 72px; }
+
+    .modal-details-col {
+      flex: 1; overflow-y: auto; padding: 20px 22px;
+    }
+
+    .modal-price-row {
+      display: flex; align-items: baseline; gap: 10px;
+      margin-bottom: 14px; flex-wrap: wrap;
+    }
+    .modal-price {
+      font-size: 26px; font-weight: 700; color: var(--text-bright);
+    }
+    .modal-badges { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+
+    .modal-section {
+      margin-bottom: 18px;
+    }
+    .modal-section-label {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+      color: var(--text-muted); font-weight: 700; margin-bottom: 8px;
+      padding-bottom: 5px; border-bottom: 1px solid var(--border);
+    }
+
+    .modal-fields {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 6px 16px;
+    }
+    .modal-field { display: flex; flex-direction: column; gap: 2px; }
+    .modal-field-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; }
+    .modal-field-value { font-size: 13px; color: var(--text-bright); word-break: break-word; }
+    .modal-field-value.muted { color: var(--text-muted); font-style: italic; }
+
+    .modal-title-full {
+      font-size: 14px; line-height: 1.5; color: var(--text);
+      margin-bottom: 16px;
+    }
+
+    .modal-score-row {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 16px;
+    }
+    .modal-score-label { font-size: 11px; color: var(--text-muted); }
+    .modal-score-bar-wrap {
+      flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;
+    }
+    .modal-score-bar { height: 100%; border-radius: 3px; transition: width .4s ease; }
+
+    .modal-link {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 12px; color: var(--accent); text-decoration: none;
+      padding: 5px 10px; border: 1px solid var(--accent-dim);
+      border-radius: var(--radius); transition: background .1s;
+    }
+    .modal-link:hover { background: var(--accent-dim); }
+
+    .match-row { cursor: pointer; }
+    .match-row:hover .match-title { color: var(--accent); }
+
+    /* ── Specifics density map ──────────────────────────────────── */
+    .density-header {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--text-muted); font-weight: 700;
+      padding: 7px 14px 5px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .density-compiled {
+      padding: 7px 14px 8px;
+      background: rgba(88,166,255,.07);
+      border-bottom: 1px solid var(--border);
+      font-size: 12px; color: var(--text-bright);
+      line-height: 1.5; word-break: break-word;
+    }
+    .density-table {
+      padding: 5px 14px 7px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }
+    .density-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 3px 0;
+    }
+    .density-field {
+      width: 72px; flex-shrink: 0;
+      font-size: 10px; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: .04em;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .density-val-wrap {
+      flex: 1; display: flex; align-items: center; gap: 6px; min-width: 0;
+    }
+    .density-value {
+      font-size: 11.5px; color: var(--text-bright); font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 110px; flex-shrink: 0;
+    }
+    .density-bar-track {
+      flex: 1; height: 3px; background: var(--border);
+      border-radius: 2px; overflow: hidden; min-width: 20px;
+    }
+    .density-bar-fill {
+      height: 100%; border-radius: 2px; transition: width .35s ease;
+    }
+    .density-pct {
+      font-size: 10px; color: var(--text-muted);
+      white-space: nowrap; min-width: 30px; text-align: right;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────────── -->
+<header>
+  <div class="header-top">
+    <div class="logo">🃏 Card <span>Oracle</span></div>
+    <div style="font-size:11px; color:var(--text-muted)">Search ↔ Vector Test Harness</div>
+    <div style="margin-left:auto; display:flex; gap:6px; align-items:center">
+      <span id="health-os" class="status-dot" title="OpenSearch"></span>
+      <span style="font-size:11px;color:var(--text-muted)">OS</span>
+      <span id="health-qdrant" class="status-dot" style="margin-left:8px" title="Qdrant"></span>
+      <span style="font-size:11px;color:var(--text-muted)">Qdrant</span>
+    </div>
+  </div>
+  <div class="search-row">
+    <input id="q" type="text" placeholder="Search cards — e.g.  psa 10  or  charizard base set  …" autocomplete="off" spellcheck="false">
+    <div class="date-group">
+      <label>From</label>
+      <input id="date-from" type="date" value="2026-03-01">
+      <label>to</label>
+      <input id="date-to"   type="date" value="2026-03-01">
+    </div>
+    <div class="size-group">
+      <label>Show</label>
+      <input id="size" type="number" value="50" min="10" max="1000" step="10">
+    </div>
+    <div class="sort-group">
+      <label>Sort</label>
+      <select id="sort" onchange="doSearch(0)">
+        <option value="newest">Newest first</option>
+        <option value="oldest">Oldest first</option>
+      </select>
+    </div>
+    <button class="btn btn-primary" id="search-btn" onclick="doSearch(0)">Search</button>
+    <button class="btn btn-ghost btn-sm" onclick="clearDates()" title="Search all available dates">All dates</button>
+  </div>
+</header>
+
+<!-- ── Status bar ───────────────────────────────────────────────────────── -->
+<div class="status-bar">
+  <span id="result-count"></span>
+  <span id="search-status" style="color:var(--text-muted);font-size:12px"></span>
+  <span class="status-hint" id="click-hint" style="display:none">
+    💡 Click any card image to run a Qdrant vector search
+  </span>
+</div>
+
+<!-- ── Main layout ──────────────────────────────────────────────────────── -->
+<div class="layout">
+
+  <!-- Results panel -->
+  <div class="results-panel" id="results-panel">
+    <div id="results-area">
+      <div class="empty-state">
+        <div class="icon">🔍</div>
+        <h3>Search for cards</h3>
+        <p>Enter a query above and press Search, or leave blank to browse by date range.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Vector search side panel -->
+  <div class="vector-panel" id="vector-panel">
+    <div class="panel-header">
+      <div class="panel-title">⚡ Qdrant Vector Matches</div>
+      <button class="panel-close" onclick="closePanel()" title="Close">✕</button>
+    </div>
+    <div class="query-card-wrap" id="query-card-wrap" style="display:none">
+      <div class="query-card-inner">
+        <img class="query-img" id="query-img" src="" alt="Query">
+        <div class="query-info">
+          <div class="query-label">Query image</div>
+          <div class="query-title" id="query-title"></div>
+        </div>
+      </div>
+    </div>
+    <div class="section-label" id="matches-label" style="display:none">
+      <span>Results by similarity</span>
+      <span id="matches-meta" style="font-size:10px; font-weight:400; color:var(--text-muted)"></span>
+    </div>
+    <div id="density-wrap" style="display:none;">
+      <div class="density-header">
+        <span>Specifics Density</span>
+        <span id="density-meta" style="font-size:10px;font-weight:400;color:var(--text-muted)"></span>
+      </div>
+      <div class="density-compiled" id="density-compiled" style="display:none;"></div>
+      <div class="density-table" id="density-table"></div>
+    </div>
+    <div id="title-density-wrap" style="display:none;">
+      <div class="density-header">
+        <span>Title Word Frequency</span>
+        <span id="title-density-meta" style="font-size:10px;font-weight:400;color:var(--text-muted)"></span>
+      </div>
+      <div class="density-compiled" id="title-density-compiled" style="display:none;"></div>
+      <div class="density-table" id="title-density-table"></div>
+    </div>
+    <div class="matches-scroll" id="matches-scroll">
+      <div style="padding:40px 20px; text-align:center; color:var(--text-muted); font-size:13px">
+        Click a card image on the left to start a vector search.
+      </div>
+    </div>
+  </div>
+
+</div><!-- /layout -->
+
+<!-- ── Item detail modal ─────────────────────────────────────────────────── -->
+<div class="modal-overlay" id="item-modal" onclick="onModalOverlayClick(event)">
+  <div class="modal" id="item-modal-box">
+    <div class="modal-header">
+      <div class="modal-header-title" id="modal-header-title"></div>
+      <button class="modal-close" onclick="closeItemModal()" title="Close (Esc)">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-img-col" id="modal-img-col">
+        <img id="modal-img" src="" alt="" onerror="this.style.display='none';document.getElementById('modal-img-placeholder').style.display='block'">
+        <div id="modal-img-placeholder" class="modal-img-placeholder" style="display:none">🃏</div>
+      </div>
+      <div class="modal-details-col" id="modal-details-col"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ───────────────────────────────────────────────────────────────
+let currentPage = 0;
+let currentQuery = {};
+let currentHits = [];
+let selectedCardId = null;
+let panelOpen = false;
+let vectorResults = [];   // last Qdrant results — used by item modal
+
+const PAGE_SIZE_DEFAULT = 50;
+
+// ── Health check ────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    setDot('health-os', d.opensearch === 'green' ? 'green' : d.opensearch === 'yellow' ? 'yellow' : 'red');
+    setDot('health-qdrant', d.qdrant === 'ok' ? 'green' : 'red');
+  } catch(e) {
+    setDot('health-os', 'red');
+    setDot('health-qdrant', 'red');
+  }
+}
+
+function setDot(id, color) {
+  const el = document.getElementById(id);
+  el.className = `status-dot dot-${color}`;
+}
+
+// ── Text search ─────────────────────────────────────────────────────────
+async function doSearch(fromVal = 0) {
+  const q        = document.getElementById('q').value.trim();
+  const dateFrom = document.getElementById('date-from').value;
+  const dateTo   = document.getElementById('date-to').value;
+  const size     = parseInt(document.getElementById('size').value) || PAGE_SIZE_DEFAULT;
+  const sort     = document.getElementById('sort').value;
+
+  currentQuery = { q, dateFrom, dateTo, size, sort };
+  currentPage  = Math.floor(fromVal / size);
+
+  const params = new URLSearchParams({ from: fromVal, size, sort });
+  if (q)        params.set('q', q);
+  if (dateFrom) params.set('date_from', dateFrom);
+  if (dateTo)   params.set('date_to', dateTo);
+
+  document.getElementById('search-status').textContent = 'Searching…';
+  document.getElementById('result-count').textContent  = '';
+  document.getElementById('click-hint').style.display  = 'none';
+  renderLoading('results-area');
+
+  try {
+    const r = await fetch(`/api/text-search?${params}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const hits  = data?.hits?.hits || [];
+    const total = data?.hits?.total?.value ?? hits.length;
+
+    currentHits = hits;
+    renderResults(hits, total, fromVal, size);
+
+    document.getElementById('search-status').textContent = `${total.toLocaleString()} results`;
+    document.getElementById('result-count').textContent  = hits.length
+      ? `Showing ${fromVal + 1}–${fromVal + hits.length} of ${total.toLocaleString()}`
+      : '';
+    if (hits.length) document.getElementById('click-hint').style.display = '';
+  } catch(e) {
+    document.getElementById('search-status').textContent = `Error: ${e.message}`;
+    renderError('results-area', `Search failed: ${e.message}`);
+  }
+}
+
+function clearDates() {
+  document.getElementById('date-from').value = '';
+  document.getElementById('date-to').value   = '';
+  doSearch(0);
+}
+
+// ── Render text results ──────────────────────────────────────────────────
+function renderResults(hits, total, fromVal, size) {
+  const area = document.getElementById('results-area');
+
+  if (!hits.length) {
+    area.innerHTML = `<div class="empty-state"><div class="icon">🃏</div><h3>No results</h3><p>Try broadening your search or date range.</p></div>`;
+    return;
+  }
+
+  let html = `<div class="results-grid" id="results-grid">`;
+  hits.forEach((hit, i) => {
+    html += buildCardHtml(hit._id, hit._source, null, i);
+  });
+  html += `</div>`;
+
+  // Pagination
+  if (total > size) {
+    const pages    = Math.min(Math.ceil(total / size), 20);
+    const curPage  = Math.floor(fromVal / size);
+    html += `<div class="pagination">`;
+    if (curPage > 0) html += `<button class="page-btn" onclick="doSearch(${(curPage-1)*size})">← Prev</button>`;
+    for (let p = Math.max(0, curPage - 3); p < Math.min(pages, curPage + 4); p++) {
+      html += `<button class="page-btn ${p === curPage ? 'active' : ''}" onclick="doSearch(${p*size})">${p+1}</button>`;
+    }
+    if (curPage < pages - 1) html += `<button class="page-btn" onclick="doSearch(${(curPage+1)*size})">Next →</button>`;
+    html += `<span class="page-info">Page ${curPage+1} of ${pages}</span></div>`;
+  }
+
+  area.innerHTML = html;
+}
+
+// ── Build a card tile HTML ───────────────────────────────────────────────
+function buildCardHtml(id, src, qdrantScore, index) {
+  const title    = esc(src.title || '(no title)');
+  const imgUrl   = src.galleryURL || '';
+  const price    = formatPrice(src.currentPrice, src.currentPriceCurrency);
+  const date     = formatDate(src.endTime);
+  const specs    = src.itemSpecifics || {};
+  const graded   = specs.graded || false;
+  const grader   = (specs.grader || '').toLowerCase();
+  const grade    = specs.grade || '';
+  const saleType = src.saleType || '';
+  const globalId = src.globalId || src.source || '';
+  const isSelected = id === selectedCardId ? 'selected' : '';
+
+  let badges = '';
+  if (graded && grader) {
+    const cls = grader === 'psa' ? 'badge-psa' : grader === 'bgs' ? 'badge-bgs' : grader === 'cgc' ? 'badge-cgc' : 'badge-grade';
+    badges += `<span class="badge ${cls}">${esc(grader.toUpperCase())} ${esc(grade)}</span>`;
+  } else if (!graded) {
+    badges += `<span class="badge badge-raw">Raw</span>`;
+  }
+  if (saleType === 'Auction') badges += `<span class="badge badge-auc">Auction</span>`;
+  if (saleType === 'FixedPrice') badges += `<span class="badge badge-fix">BIN</span>`;
+  if (globalId) badges += `<span class="badge badge-source" title="${esc(globalId)}">${esc(globalId.replace('EBAY-', ''))}</span>`;
+
+  const scoreHtml = qdrantScore !== null
+    ? `<div class="score-overlay">${qdrantScore.toFixed(3)}</div>` : '';
+
+  const imgHtml = imgUrl
+    ? `<img src="${esc(imgUrl)}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+    : '';
+  const placeholderStyle = imgUrl ? 'display:none' : 'display:flex';
+
+  return `
+  <div class="card ${isSelected}" id="card-${esc(id)}" onclick="onCardClick('${esc(id)}', '${esc(imgUrl)}', '${esc(src.title || '')}')">
+    <div class="card-img-wrap">
+      ${imgHtml}
+      <div class="card-img-placeholder" style="${placeholderStyle}">🃏</div>
+      ${scoreHtml}
+    </div>
+    <div class="card-body">
+      <div class="card-title" title="${title}">${title}</div>
+      <div class="card-price">${price}</div>
+      <div class="card-meta">${badges}</div>
+      <div class="card-date">${date}</div>
+    </div>
+  </div>`;
+}
+
+// ── Card click → vector search ───────────────────────────────────────────
+async function onCardClick(id, imgUrl, title) {
+  if (!imgUrl) {
+    alert('This card has no image — cannot perform vector search.');
+    return;
+  }
+
+  // Highlight selected card
+  if (selectedCardId) {
+    const prev = document.getElementById(`card-${selectedCardId}`);
+    if (prev) prev.classList.remove('selected');
+  }
+  selectedCardId = id;
+  const curr = document.getElementById(`card-${id}`);
+  if (curr) curr.classList.add('selected');
+
+  // Open panel with query card
+  openPanel();
+  document.getElementById('query-card-wrap').style.display = '';
+  document.getElementById('query-img').src   = imgUrl;
+  document.getElementById('query-title').textContent = title;
+  document.getElementById('matches-label').style.display       = 'none';
+  document.getElementById('density-wrap').style.display        = 'none';
+  document.getElementById('title-density-wrap').style.display  = 'none';
+
+  // Show encoding spinner with live timer
+  const spinnerEl = document.getElementById('matches-scroll');
+  spinnerEl.innerHTML = `
+    <div class="encoding-progress">
+      <div class="spinner"></div>
+      <div>Encoding image with CLIP ViT-L/14…</div>
+      <div style="font-size:11px;margin-top:4px;color:var(--text-muted)" id="encode-timer">
+        Elapsed: 0s — GPU worker speeds this up significantly.
+      </div>
+    </div>`;
+
+  const encodeStart  = Date.now();
+  const timerHandle = setInterval(() => {
+    const el = document.getElementById('encode-timer');
+    if (el) el.textContent = `Elapsed: ${((Date.now() - encodeStart)/1000).toFixed(0)}s — GPU worker speeds this up significantly.`;
+  }, 1000);
+
+  const VECTOR_TIMEOUT_MS = 180_000; // 3 minutes — CPU ViT-L/14 can be slow
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), VECTOR_TIMEOUT_MS);
+
+  try {
+    const t0 = Date.now();
+    const r  = await fetch('/api/vector-search', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ image_url: imgUrl, top_k: 20 }),
+      signal:  controller.signal,
+    });
+    clearTimeout(abortTimer);
+    clearInterval(timerHandle);
+    if (!r.ok) {
+      const err = await r.json();
+      throw new Error(err.error || `HTTP ${r.status}`);
+    }
+    const data    = await r.json();
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+    renderVectorResults(data, elapsed);
+  } catch(e) {
+    clearTimeout(abortTimer);
+    clearInterval(timerHandle);
+    const msg = e.name === 'AbortError'
+      ? 'Request timed out after 3 minutes. Set GPU_WORKER_URL in .env to use the GPU instance for fast encoding.'
+      : `Vector search failed: ${esc(e.message)}`;
+    document.getElementById('matches-scroll').innerHTML =
+      `<div style="padding:20px"><div class="error-banner">${msg}</div></div>`;
+    document.getElementById('matches-label').style.display = 'none';
+  }
+}
+
+// ── Build specifics density map ──────────────────────────────────────────
+// Dynamically discovers all fields present in r.doc.itemSpecifics across
+// all results. No hardcoded field list — shows every field returned by OS
+// with its modal value and percentage, sorted by % descending.
+function buildDensityMap(results) {
+  if (!results || !results.length) return '';
+
+  const n      = results.length;
+  const counts = {};   // { fieldKey: { value: count, ... } }
+
+  results.forEach(r => {
+    const specs = (r.doc || {}).itemSpecifics || {};
+    Object.entries(specs).forEach(([key, val]) => {
+      if (val === undefined || val === null || val === '') return;
+      if (typeof val === 'boolean') val = val ? 'Yes' : 'No';
+      val = String(val).trim();
+      if (!val) return;
+      if (!counts[key]) counts[key] = {};
+      counts[key][val] = (counts[key][val] || 0) + 1;
+    });
+  });
+
+  if (!Object.keys(counts).length) return '';
+
+  // For each field compute the modal value and its percentage
+  const rows = [];
+  Object.entries(counts).forEach(([field, valueCounts]) => {
+    const entries = Object.entries(valueCounts).sort((a, b) => b[1] - a[1]);
+    const [modeVal, modeCount] = entries[0];
+    rows.push({ label: field, value: modeVal, pct: modeCount / n, count: modeCount });
+  });
+
+  rows.sort((a, b) => b.pct - a.pct);
+
+  // Compiled summary: built only from results with score ≥ 0.85
+  const COMPILED_ORDER = ['player','brand','set','cardNumber','year','grader','grade',
+                           'parallel','subset','team','genre','country'];
+  const highConf = results.filter(r => (r.score || 0) >= 0.85);
+  const hcCounts = {};
+  highConf.forEach(r => {
+    const specs = (r.doc || {}).itemSpecifics || {};
+    Object.entries(specs).forEach(([key, val]) => {
+      if (val === undefined || val === null || val === '') return;
+      if (typeof val === 'boolean') val = val ? 'Yes' : 'No';
+      val = String(val).trim();
+      if (!val) return;
+      if (!hcCounts[key]) hcCounts[key] = {};
+      hcCounts[key][val] = (hcCounts[key][val] || 0) + 1;
+    });
+  });
+  const hcN = highConf.length;
+  const compiledRows = [];
+  Object.entries(hcCounts).forEach(([field, valueCounts]) => {
+    const [modeVal, modeCount] = Object.entries(valueCounts).sort((a, b) => b[1] - a[1])[0];
+    if (hcN > 0 && modeCount / hcN >= 0.25)
+      compiledRows.push({ label: field, value: modeVal, pct: modeCount / hcN });
+  });
+  const orderedQualifying = [
+    ...COMPILED_ORDER.map(f => compiledRows.find(r => r.label === f)).filter(Boolean),
+    ...compiledRows.filter(r => !COMPILED_ORDER.includes(r.label)).sort((a, b) => b.pct - a.pct),
+  ];
+  const compiled = orderedQualifying.map(r => r.value).join(' · ');
+
+  let html = '';
+  rows.forEach(row => {
+    const pctFmt = Math.round(row.pct * 100);
+    const barClr = row.pct >= 0.90 ? 'var(--green)' : row.pct >= 0.70 ? 'var(--accent)' : 'var(--yellow)';
+    html += `<div class="density-row">
+        <div class="density-field" title="${esc(row.label)}">${esc(row.label)}</div>
+        <div class="density-val-wrap">
+          <div class="density-value" title="${esc(row.value)}">${esc(row.value)}</div>
+          <div class="density-bar-track">
+            <div class="density-bar-fill" style="width:${pctFmt}%;background:${barClr}"></div>
+          </div>
+          <div class="density-pct">${pctFmt}%</div>
+        </div>
+      </div>`;
+  });
+
+  return { html, rowCount: rows.length, compiled };
+}
+
+// ── Build title word frequency map ───────────────────────────────────────
+// Counts how many result titles contain each word (binary per doc, not total
+// occurrences). Filters English stop words and tokens under 3 characters.
+// Rows sorted by % descending; all words shown in a scrollable container.
+function buildTitleDensity(results) {
+  if (!results || !results.length) return '';
+
+  const STOP = new Set([
+    'the','and','for','with','from','this','that','are','was',
+    'have','has','been','will','can','not','all','but','its',
+    'per','via','lot','set','new','one','two','buy','now',
+  ]);
+
+  const n          = results.length;
+  const wordCounts = {};   // word → number of docs containing it
+
+  results.forEach(r => {
+    const title = ((r.doc || {}).title || '').toLowerCase();
+    if (!title) return;
+    // Unique words per title so one doc can only contribute 1 to each count
+    const words = new Set(title.split(/[^a-z0-9]+/).filter(w =>
+      w.length >= 3 && !STOP.has(w) && !/^\d{1,2}$/.test(w)
+    ));
+    words.forEach(w => { wordCounts[w] = (wordCounts[w] || 0) + 1; });
+  });
+
+  if (!Object.keys(wordCounts).length) return '';
+
+  const rows = Object.entries(wordCounts)
+    .map(([word, count]) => ({ word, pct: count / n, count }))
+    .sort((a, b) => b.pct - a.pct);
+
+  // Compiled summary: words appearing in ≥50% of high-confidence results (score ≥ 0.85)
+  const highConf = results.filter(r => (r.score || 0) >= 0.85);
+  const hcN = highConf.length;
+  const hcWordCounts = {};
+  highConf.forEach(r => {
+    const title = ((r.doc || {}).title || '').toLowerCase();
+    if (!title) return;
+    const words = new Set(title.split(/[^a-z0-9]+/).filter(w =>
+      w.length >= 3 && !STOP.has(w) && !/^\d{1,2}$/.test(w)
+    ));
+    words.forEach(w => { hcWordCounts[w] = (hcWordCounts[w] || 0) + 1; });
+  });
+  const compiled = hcN > 0
+    ? Object.entries(hcWordCounts)
+        .filter(([w, c]) => c / hcN >= 0.50)
+        .sort((a, b) => b[1] - a[1])
+        .map(([w, c]) => w)
+        .join(' ')
+    : '';
+
+  let html = '';
+  rows.forEach(row => {
+    const pctFmt = Math.round(row.pct * 100);
+    const barClr = row.pct >= 0.90 ? 'var(--green)' : row.pct >= 0.70 ? 'var(--accent)' : 'var(--yellow)';
+    html += `<div class="density-row">
+        <div class="density-field" title="${esc(row.word)}">${esc(row.word)}</div>
+        <div class="density-val-wrap">
+          <div class="density-value" style="color:var(--text-muted);font-weight:400">${row.count}/${n}</div>
+          <div class="density-bar-track">
+            <div class="density-bar-fill" style="width:${pctFmt}%;background:${barClr}"></div>
+          </div>
+          <div class="density-pct">${pctFmt}%</div>
+        </div>
+      </div>`;
+  });
+
+  return { html, rowCount: rows.length, compiled };
+}
+
+// ── Render vector search results ─────────────────────────────────────────
+function renderVectorResults(data, elapsed) {
+  vectorResults = data.qdrant_results || [];
+
+  document.getElementById('matches-label').style.display = '';
+  document.getElementById('matches-meta').textContent    =
+    `${vectorResults.length} matches · ${elapsed}s`;
+
+  if (!vectorResults.length) {
+    document.getElementById('density-wrap').style.display       = 'none';
+    document.getElementById('title-density-wrap').style.display = 'none';
+    document.getElementById('matches-scroll').innerHTML =
+      `<div class="empty-state"><div class="icon">🤷</div><h3>No Qdrant matches</h3><p>The collection may be empty or the image could not be encoded.</p></div>`;
+    return;
+  }
+
+  // Specifics density map
+  const density = buildDensityMap(vectorResults);
+  const densityWrap = document.getElementById('density-wrap');
+  const densityCompiled = document.getElementById('density-compiled');
+  if (density) {
+    document.getElementById('density-table').innerHTML = density.html;
+    document.getElementById('density-meta').textContent =
+      `${density.rowCount} field${density.rowCount !== 1 ? 's' : ''} · ${vectorResults.length} cards`;
+    if (density.compiled) {
+      densityCompiled.textContent = density.compiled;
+      densityCompiled.style.display = '';
+    } else {
+      densityCompiled.style.display = 'none';
+    }
+    densityWrap.style.display = '';
+  } else {
+    densityCompiled.style.display = 'none';
+    densityWrap.style.display = 'none';
+  }
+
+  // Title word frequency map
+  const titleDensity = buildTitleDensity(vectorResults);
+  const titleDensityWrap = document.getElementById('title-density-wrap');
+  const titleDensityCompiled = document.getElementById('title-density-compiled');
+  if (titleDensity) {
+    document.getElementById('title-density-table').innerHTML = titleDensity.html;
+    document.getElementById('title-density-meta').textContent =
+      `${titleDensity.rowCount} words · ${vectorResults.length} titles`;
+    if (titleDensity.compiled) {
+      titleDensityCompiled.textContent = titleDensity.compiled;
+      titleDensityCompiled.style.display = '';
+    } else {
+      titleDensityCompiled.style.display = 'none';
+    }
+    titleDensityWrap.style.display = '';
+  } else {
+    titleDensityCompiled.style.display = 'none';
+    titleDensityWrap.style.display = 'none';
+  }
+
+  let html = '';
+  vectorResults.forEach((r, i) => {
+    const doc    = r.doc || {};
+    const title  = esc(doc.title || (doc.itemSpecifics || {}).player || (doc.itemSpecifics || {}).set || '(no title)');
+    const imgUrl = doc.galleryURL || '';
+    const price  = formatPrice(doc.currentPrice, doc.currentPriceCurrency);
+    const date   = formatDate(doc.endTime);
+    const specs  = doc.itemSpecifics || {};
+    const graded = specs.graded ?? false;
+    const grader = (specs.grader || '').toLowerCase();
+    const grade  = specs.grade  || '';
+    const isTop  = i === 0 ? 'top-match' : '';
+
+    const score    = r.score;
+    const scoreCls = score >= 0.90 ? 'badge-score-high' : score >= 0.75 ? 'badge-score-mid' : 'badge-score-low';
+
+    let badges = '';
+    if (graded && grader) {
+      const cls = grader === 'psa' ? 'badge-psa' : grader === 'bgs' ? 'badge-bgs' : grader === 'cgc' ? 'badge-cgc' : 'badge-grade';
+      badges += `<span class="badge ${cls}">${esc(grader.toUpperCase())} ${esc(grade)}</span>`;
+    } else {
+      badges += `<span class="badge badge-raw">Raw</span>`;
+    }
+    const saleType = doc.saleType || '';
+    if (saleType === 'Auction')    badges += `<span class="badge badge-auc">Auc</span>`;
+    if (saleType === 'FixedPrice') badges += `<span class="badge badge-fix">BIN</span>`;
+
+    const imgHtml = imgUrl
+      ? `<img class="match-img" src="${esc(imgUrl)}" alt="" loading="lazy" onerror="this.src='';this.style.background='#1a1e2a'">`
+      : `<div class="match-img" style="display:flex;align-items:center;justify-content:center;font-size:28px">🃏</div>`;
+
+    html += `
+    <div class="match-row ${isTop}" onclick="openItemModal(${i})" title="Click for full details">
+      <div class="match-rank">${i === 0 ? '★' : i + 1}</div>
+      ${imgHtml}
+      <div class="match-info">
+        <div class="match-title">${title}</div>
+        <div class="match-price">${price}</div>
+        <div class="match-badges">${badges}</div>
+        <div class="match-date">${date}</div>
+      </div>
+      <div class="match-score-col">
+        <div class="score-pill ${scoreCls}" title="Qdrant cosine similarity">${score.toFixed(3)}</div>
+      </div>
+    </div>`;
+  });
+
+  document.getElementById('matches-scroll').innerHTML = html;
+}
+
+// ── Item detail modal ────────────────────────────────────────────────────
+function openItemModal(index) {
+  const r   = vectorResults[index];
+  if (!r) return;
+  const doc     = r.doc || {};
+  const payload = r.payload || {};
+  const specs   = doc.itemSpecifics || {};
+
+  const title   = doc.title || specs.player || specs.set || '(no title)';
+  const imgUrl  = doc.galleryURL || '';
+  const price   = formatPrice(doc.currentPrice, doc.currentPriceCurrency);
+  const date    = formatDate(doc.endTime);
+  const itemUrl = doc.itemURL || '';
+  const score   = r.score;
+
+  // Source all card identity fields from OpenSearch itemSpecifics (r.doc.itemSpecifics).
+  // OS enrichment is 20/20 matched; Qdrant payload fields are empty pending backfill fix.
+  const graded   = specs.graded   ?? false;
+  const grader   = (specs.grader  || '').toUpperCase();
+  const grade    = specs.grade    || '';
+  const player   = specs.player   || '';
+  const brand    = specs.brand    || '';
+  const set      = specs.set      || '';
+  const cardNum  = specs.cardNumber || '';
+  const year     = specs.year     || '';
+  const subset   = specs.subset   || '';
+  const parallel = specs.parallel || '';
+  const serial   = specs.serialNumber || '';
+  const team     = specs.team     || '';
+  const genre    = specs.genre    || '';
+  const country  = specs.country  || '';
+  const auto     = specs.autographed ?? false;
+  const saleType = doc.saleType   || '';
+  const source   = doc.globalId   || doc.source || '';
+
+  // Image
+  const imgEl = document.getElementById('modal-img');
+  const phEl  = document.getElementById('modal-img-placeholder');
+  if (imgUrl) {
+    imgEl.src = imgUrl;
+    imgEl.style.display = '';
+    phEl.style.display = 'none';
+  } else {
+    imgEl.style.display = 'none';
+    phEl.style.display = 'block';
+  }
+
+  // Header
+  document.getElementById('modal-header-title').textContent = title;
+
+  // Score bar colour
+  const scoreBarColour = score >= 0.90 ? 'var(--green)' : score >= 0.75 ? 'var(--yellow)' : 'var(--red)';
+
+  // Badges for modal
+  let badgeHtml = '';
+  if (graded && grader) {
+    const cls = grader === 'PSA' ? 'badge-psa' : grader === 'BGS' ? 'badge-bgs' : grader === 'CGC' ? 'badge-cgc' : 'badge-grade';
+    badgeHtml += `<span class="badge ${cls}">${esc(grader)} ${esc(grade)}</span>`;
+  } else {
+    badgeHtml += `<span class="badge badge-raw">Raw</span>`;
+  }
+  if (auto)                        badgeHtml += `<span class="badge badge-grade">Auto</span>`;
+  if (saleType === 'Auction')      badgeHtml += `<span class="badge badge-auc">Auction</span>`;
+  if (saleType === 'FixedPrice')   badgeHtml += `<span class="badge badge-fix">Buy It Now</span>`;
+  if (source)                      badgeHtml += `<span class="badge badge-source">${esc(source.replace('EBAY-', ''))}</span>`;
+
+  // Build specifics field rows (only non-empty)
+  function field(label, value) {
+    if (!value && value !== 0) return '';
+    return `<div class="modal-field">
+      <div class="modal-field-label">${label}</div>
+      <div class="modal-field-value">${esc(String(value))}</div>
+    </div>`;
+  }
+
+  const specsHtml = [
+    field('Player / Character', player),
+    field('Brand',              brand),
+    field('Genre / Sport',      genre),
+    field('Set',                set),
+    field('Card Number',        cardNum),
+    field('Year',               year),
+    field('Subset / Insert',    subset),
+    field('Parallel',           parallel),
+    field('Serial Number',      serial),
+    field('Team',               team),
+    field('Country',            country),
+    field('Grader',             graded ? grader : ''),
+    field('Grade',              graded ? grade  : ''),
+  ].filter(Boolean).join('');
+
+  const detailsHtml = `
+    <div class="modal-title-full">${esc(title)}</div>
+
+    <div class="modal-price-row">
+      <div class="modal-price">${price}</div>
+      <div class="modal-badges">${badgeHtml}</div>
+    </div>
+
+    <div class="modal-score-row">
+      <div class="modal-score-label">Similarity score</div>
+      <div class="modal-score-bar-wrap">
+        <div class="modal-score-bar" style="width:${(score*100).toFixed(1)}%;background:${scoreBarColour}"></div>
+      </div>
+      <div style="font-size:12px;font-weight:700;color:${scoreBarColour};min-width:36px;text-align:right">${score.toFixed(3)}</div>
+    </div>
+
+    ${specsHtml ? `
+    <div class="modal-section">
+      <div class="modal-section-label">Card Details</div>
+      <div class="modal-fields">${specsHtml}</div>
+    </div>` : ''}
+
+    <div class="modal-section">
+      <div class="modal-section-label">Sale Info</div>
+      <div class="modal-fields">
+        ${field('Sale Date',  date)}
+        ${field('Sale Type',  saleType)}
+        ${field('Source',     source)}
+        ${field('Item ID',    r.os_id)}
+      </div>
+    </div>
+
+    ${itemUrl ? `
+    <div class="modal-section">
+      <a href="${esc(itemUrl)}" target="_blank" rel="noopener" class="modal-link">
+        🔗 View original listing
+      </a>
+    </div>` : ''}
+  `;
+
+  document.getElementById('modal-details-col').innerHTML = detailsHtml;
+
+  // Show modal
+  document.getElementById('item-modal').classList.add('visible');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeItemModal() {
+  document.getElementById('item-modal').classList.remove('visible');
+  document.body.style.overflow = '';
+}
+
+function onModalOverlayClick(e) {
+  // Close only when clicking the backdrop, not the modal box itself
+  if (e.target === document.getElementById('item-modal')) closeItemModal();
+}
+
+// ── Panel open/close ─────────────────────────────────────────────────────
+function openPanel() {
+  panelOpen = true;
+  document.getElementById('vector-panel').classList.add('open');
+  document.getElementById('results-panel').classList.add('panel-open');
+}
+
+function closePanel() {
+  panelOpen = false;
+  document.getElementById('vector-panel').classList.remove('open');
+  document.getElementById('results-panel').classList.remove('panel-open');
+  document.getElementById('density-wrap').style.display       = 'none';
+  document.getElementById('title-density-wrap').style.display = 'none';
+  if (selectedCardId) {
+    const el = document.getElementById(`card-${selectedCardId}`);
+    if (el) el.classList.remove('selected');
+    selectedCardId = null;
+  }
+}
+
+// ── Utilities ────────────────────────────────────────────────────────────
+function formatPrice(price, currency) {
+  if (!price) return '<span style="color:var(--text-muted)">—</span>';
+  const sym = { GBP: '£', USD: '$', EUR: '€', AUD: 'A$', CAD: 'C$' }[currency] || (currency || '') + ' ';
+  return `${sym}${parseFloat(price).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}`;
+}
+
+function formatDate(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' });
+  } catch { return iso; }
+}
+
+function renderLoading(id) {
+  document.getElementById(id).innerHTML =
+    `<div class="loading-wrap"><div class="spinner"></div><span>Searching…</span></div>`;
+}
+
+function renderError(id, msg) {
+  document.getElementById(id).innerHTML =
+    `<div style="padding:20px"><div class="error-banner">${esc(msg)}</div></div>`;
+}
+
+function esc(str) {
+  return String(str || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.target.id === 'q' || e.target.id === 'size')) {
+    doSearch(0);
+  }
+  if (e.key === 'Escape') {
+    if (document.getElementById('item-modal').classList.contains('visible')) {
+      closeItemModal();
+    } else if (panelOpen) {
+      closePanel();
+    }
+  }
+});
+
+// ── Init ─────────────────────────────────────────────────────────────────
+checkHealth();
+// Refresh health dots every 30s
+setInterval(checkHealth, 30000);
+// Auto-search on page load with default date range
+doSearch(0);
+</script>
+</body>
+</html>
