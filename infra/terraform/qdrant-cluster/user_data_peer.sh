@@ -1,34 +1,54 @@
 #!/bin/bash
 set -euo pipefail
-exec > /var/log/user-data.log 2>&1
+exec >> /var/log/user-data.log 2>&1
 
-echo "=== Qdrant cluster PEER node bootstrap ==="
+echo "=== Qdrant cluster PEER node bootstrap ($(date -u)) ==="
 echo "    Seed URI: http://${seed_private_ip}:6335"
 
-# --- 1. Mount NVMe instance store ---
+# --- 1. Mount NVMe instance store (idempotent) ---
 DEVICE="/dev/nvme1n1"
 MOUNT="/mnt/qdrant-storage"
 
-echo "Mounting NVMe instance store..."
-mkfs.ext4 -F "$DEVICE"
+echo "Checking NVMe instance store..."
+if ! blkid "$DEVICE" | grep -q ext4; then
+  echo "No ext4 filesystem found — formatting $DEVICE"
+  mkfs.ext4 -F "$DEVICE"
+else
+  echo "ext4 filesystem already present on $DEVICE — skipping format"
+fi
+
 mkdir -p "$MOUNT"
-mount "$DEVICE" "$MOUNT"
+if ! mountpoint -q "$MOUNT"; then
+  echo "Mounting $DEVICE at $MOUNT..."
+  mount "$DEVICE" "$MOUNT"
+  chown -R ec2-user:ec2-user "$MOUNT"
+  echo "Mounted."
+else
+  echo "$MOUNT already mounted — skipping"
+fi
+
+# Add fstab entry only once
+if ! grep -q "$DEVICE" /etc/fstab; then
+  echo "$DEVICE $MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+
+mkdir -p "$MOUNT/data" "$MOUNT/snapshots" "$MOUNT/config"
 chown -R ec2-user:ec2-user "$MOUNT"
-echo "$DEVICE $MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
-echo "NVMe mounted at $MOUNT"
+echo "NVMe ready at $MOUNT"
 
-mkdir -p "$MOUNT/data" "$MOUNT/snapshots"
-chown -R ec2-user:ec2-user "$MOUNT"
+# --- 2. Install Docker (idempotent) ---
+if ! command -v docker &>/dev/null; then
+  echo "Installing Docker..."
+  dnf install -y docker
+  systemctl enable docker
+  systemctl start docker
+  usermod -aG docker ec2-user
+else
+  echo "Docker already installed — ensuring it is running"
+  systemctl start docker || true
+fi
 
-# --- 2. Install Docker ---
-echo "Installing Docker..."
-dnf install -y docker
-systemctl enable docker
-systemctl start docker
-usermod -aG docker ec2-user
-
-# --- 3. Write Qdrant config (cluster-enabled) to persistent NVMe storage ---
-mkdir -p "$MOUNT/config"
+# --- 3. Write Qdrant config to persistent NVMe storage ---
 cat > "$MOUNT/config/qdrant.yaml" <<'QDRANT_CONFIG'
 storage:
   storage_path: /qdrant/storage
@@ -55,23 +75,30 @@ cluster:
 log_level: INFO
 QDRANT_CONFIG
 
-# --- 4. Start Qdrant peer node (bootstraps from seed) ---
-# Cluster mode requires each node to advertise its own URI via --uri
+# --- 4. Start Qdrant peer node (idempotent) ---
 MY_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-echo "Starting Qdrant ${qdrant_version} (peer node, uri=http://$MY_IP:6335, bootstrap=http://${seed_private_ip}:6335)..."
-docker run -d \
-  --name qdrant \
-  --restart unless-stopped \
-  -p 6333:6333 \
-  -p 6334:6334 \
-  -p 6335:6335 \
-  -v "$MOUNT/data:/qdrant/storage" \
-  -v "$MOUNT/snapshots:/qdrant/snapshots" \
-  -v "$MOUNT/config/qdrant.yaml:/qdrant/config/production.yaml:ro" \
-  -e "QDRANT__SERVICE__API_KEY=${qdrant_api_key}" \
-  --ulimit nofile=65535:65535 \
-  "qdrant/qdrant:${qdrant_version}" \
-  ./qdrant --uri "http://$MY_IP:6335" --bootstrap "http://${seed_private_ip}:6335"
+
+if docker ps --format '{{.Names}}' | grep -q '^qdrant$'; then
+  echo "Qdrant container already running — skipping start"
+elif docker ps -a --format '{{.Names}}' | grep -q '^qdrant$'; then
+  echo "Qdrant container exists but stopped — starting it"
+  docker start qdrant
+else
+  echo "Starting Qdrant ${qdrant_version} (peer, uri=http://$MY_IP:6335, bootstrap=http://${seed_private_ip}:6335)..."
+  docker run -d \
+    --name qdrant \
+    --restart unless-stopped \
+    -p 6333:6333 \
+    -p 6334:6334 \
+    -p 6335:6335 \
+    -v "$MOUNT/data:/qdrant/storage" \
+    -v "$MOUNT/snapshots:/qdrant/snapshots" \
+    -v "$MOUNT/config/qdrant.yaml:/qdrant/config/production.yaml:ro" \
+    -e "QDRANT__SERVICE__API_KEY=${qdrant_api_key}" \
+    --ulimit nofile=65535:65535 \
+    "qdrant/qdrant:${qdrant_version}" \
+    ./qdrant --uri "http://$MY_IP:6335" --bootstrap "http://${seed_private_ip}:6335"
+fi
 
 # --- 5. Wait for peer to be healthy ---
 echo "Waiting for Qdrant peer to start..."

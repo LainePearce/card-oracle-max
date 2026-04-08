@@ -396,10 +396,13 @@ def run(args: argparse.Namespace) -> None:
     logger.info("Image encoder: ViT-L/14 on {}. Text encoder: MiniLM on cpu.", device)
 
     # ── Count rows for progress logging ─────────────────────────────────────
+    # Use resume_date (not start_date) so the count reflects rows that will
+    # actually be streamed, giving an accurate ETA when resuming mid-range.
     try:
+        count_from = resume_date or args.start_date
         total = count_rows_range(
             primary_conn, RDS_TABLE,
-            args.start_date, args.end_date,
+            count_from, args.end_date,
             extra_where=args.extra_where,
         )
         logger.info("Rows to process (primary): {:,}", total)
