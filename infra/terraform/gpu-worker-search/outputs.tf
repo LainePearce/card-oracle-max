@@ -27,3 +27,13 @@ output "deploy_command" {
   description = "Rsync command to push code to the first worker instance"
   value       = "rsync -av --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='*.pyc' ./ ec2-user@${aws_instance.search_worker[0].public_ip}:~/card-oracle-max/"
 }
+
+output "internal_alb_dns" {
+  description = "Internal ALB DNS name — set GPU_WORKER_URL=http://<this value> in Lambda environment variables"
+  value       = aws_lb.internal.dns_name
+}
+
+output "lambda_search_sg_id" {
+  description = "Security group ID to attach to the Lambda function for GPU worker access"
+  value       = aws_security_group.lambda_search.id
+}

@@ -39,11 +39,12 @@ N_WORKERS = 12
 # Phases in execution order — most recent data first, then work backwards.
 # Each entry is (inclusive_start, exclusive_end).
 PHASES: list[tuple[date, date]] = [
-    (date(2026, 1, 1),  date(2026, 4, 8)),   # Phase 1: 2026 Q1  ← current priority
-    (date(2025, 10, 1), date(2026, 1, 1)),   # Phase 2: 2025 Q4
-    (date(2025, 7, 1),  date(2025, 10, 1)),  # Phase 3: 2025 Q3
-    (date(2025, 4, 1),  date(2025, 7, 1)),   # Phase 4: 2025 Q2
-    (date(2025, 1, 1),  date(2025, 4, 1)),   # Phase 5: 2025 Q1
+    (date(2026, 3, 15), date(2026, 4, 8)),   # Phase 1: Mar-Apr 2026 remaining ← all 12 workers
+    (date(2026, 1, 1),  date(2026, 3, 15)),  # Phase 2: Jan-Mar 2026 cleanup (workers skip via checkpoint)
+    (date(2025, 10, 1), date(2026, 1, 1)),   # Phase 3: 2025 Q4
+    (date(2025, 7, 1),  date(2025, 10, 1)),  # Phase 4: 2025 Q3
+    (date(2025, 4, 1),  date(2025, 7, 1)),   # Phase 5: 2025 Q2
+    (date(2025, 1, 1),  date(2025, 4, 1)),   # Phase 6: 2025 Q1
 ]
 
 

@@ -130,6 +130,7 @@ def get_secondary_rds_connection():
         database=os.environ["RDS2_DATABASE"],
         charset="utf8mb4",
         connect_timeout=30,
+        read_timeout=300,
     )
 
 

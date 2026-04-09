@@ -177,3 +177,65 @@ resource "aws_lb_listener" "http" {
     target_group_arn = aws_lb_target_group.search_worker.arn
   }
 }
+
+# ── Internal ALB (Lambda access only) ────────────────────────────────────────
+# internal = true → resolves to private IPs only; unreachable from the internet.
+# Lambda placed in the same VPC reaches this via private IP — no NAT Gateway needed.
+# AWS does not allow a target group to be associated with more than one ALB, so
+# a dedicated target group is created here pointing to the same instances/port.
+
+resource "aws_lb" "internal" {
+  name               = "${var.name_prefix}-internal-alb"
+  internal           = true
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.internal_alb.id]
+  subnets            = data.aws_subnets.default.ids
+
+  tags = {
+    Name    = "${var.name_prefix}-internal-alb"
+    Project = "card-oracle-max"
+  }
+}
+
+# Dedicated target group for the internal ALB — same instances/port/health check
+# as the external TG, but AWS requires a separate TG per ALB.
+resource "aws_lb_target_group" "internal" {
+  name     = "${var.name_prefix}-internal-tg"
+  port     = var.worker_port
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+
+  health_check {
+    path                = "/health"
+    protocol            = "HTTP"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 10
+    interval            = 30
+    matcher             = "200"
+  }
+
+  tags = {
+    Name    = "${var.name_prefix}-internal-tg"
+    Project = "card-oracle-max"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "internal" {
+  count = var.instance_count
+
+  target_group_arn = aws_lb_target_group.internal.arn
+  target_id        = aws_instance.search_worker[count.index].id
+  port             = var.worker_port
+}
+
+resource "aws_lb_listener" "internal_http" {
+  load_balancer_arn = aws_lb.internal.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.internal.arn
+  }
+}

@@ -60,7 +60,8 @@ WORKER_IPS = [
 N_WORKERS = len(WORKER_IPS)
 
 PHASES: list[tuple[date, date, str]] = [
-    (date(2026, 1, 1),  date(2026, 4, 7),  "2026 Q1"),
+    (date(2026, 3, 15), date(2026, 4, 8),  "2026 Mar–Apr (priority)"),
+    (date(2026, 1, 1),  date(2026, 3, 15), "2026 Jan–Mar"),
     (date(2025, 10, 1), date(2026, 1, 1),  "2025 Q4"),
     (date(2025, 7, 1),  date(2025, 10, 1), "2025 Q3"),
     (date(2025, 4, 1),  date(2025, 7, 1),  "2025 Q2"),
@@ -105,7 +106,7 @@ def build_worker_phase_map() -> dict[tuple[int, int], tuple[date, date]]:
 
 
 WORKER_PHASE_MAP = build_worker_phase_map()
-PHASE_NUMS = list(range(1, len(PHASES) + 1))  # [1, 2, 3, 4, 5]
+PHASE_NUMS = list(range(1, len(PHASES) + 1))  # [1, 2, 3, 4, 5, 6]
 
 
 # ── S3 helpers (proxied via SSH to worker-0 which has an IAM instance profile) ─

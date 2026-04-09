@@ -35,6 +35,7 @@ def get_rds_connection() -> pymysql.Connection:
         database=os.environ["RDS_DATABASE"],
         charset="utf8mb4",
         connect_timeout=30,
+        read_timeout=300,
     )
 
 
@@ -396,11 +397,15 @@ def scroll_rds(
         logger.debug("Date band: {} → {}", day, next_day)
         with conn.cursor(pymysql.cursors.SSDictCursor) as cursor:
             cursor.execute(query)
+            day_rows: list[dict] = []
             while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
+                chunk = cursor.fetchmany(batch_size)
+                if not chunk:
                     break
-                yield from rows
+                day_rows.extend(chunk)
+
+        logger.info("Fetched {:,} rows for {}", len(day_rows), day)
+        yield from day_rows
 
         day = next_day
 

@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars and fill in values.
+# Never commit terraform.tfvars — it contains secrets.
+
+aws_region     = "us-west-1"
+instance_type  = "g4dn.xlarge"   # T4 GPU, 16GB VRAM — sufficient for 1-2 day window
+key_pair_name  = "your-key-pair"
+name_prefix    = "daily-worker"
+my_ips         = ["your.ip.address/32"]
+
+# Qdrant — same cluster as the backfill workers
+qdrant_host    = "your-qdrant-host"
+qdrant_port    = "6333"
+qdrant_api_key = "your-qdrant-api-key"
+
+# S3 — same bucket as the backfill workers
+s3_vector_bucket = "card-oracle-vectors"
+s3_vector_prefix = "vectors"
+
+# RDS primary
+rds_host     = "your-rds-host.rds.amazonaws.com"
+rds_user     = "your-rds-user"
+rds_password = "your-rds-password"
+rds_database = "your-database"
+
+# RDS secondary (leave empty to disable)
+rds2_host     = ""
+rds2_user     = ""
+rds2_password = ""
+rds2_database = ""
+
+# How many days back to process each run (2 catches late-arriving data)
+lookback_days = 2
