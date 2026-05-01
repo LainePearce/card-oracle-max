@@ -89,7 +89,11 @@ load_dotenv(ROOT / ".env")
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 QDRANT_HOST       = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT       = int(os.environ.get("QDRANT_PORT", 6333))
+# QDRANT_HTTP_PORT is the REST port (6333). Fall back to QDRANT_PORT if set,
+# then to 6333. This avoids the bug where QDRANT_PORT=6334 (gRPC) causes
+# h11 "illegal request line" when the worker connects via HTTP REST.
+QDRANT_PORT       = int(os.environ.get("QDRANT_HTTP_PORT",
+                        os.environ.get("QDRANT_PORT", 6333)))
 QDRANT_API_KEY    = os.environ.get("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "cards")
 
@@ -221,6 +225,134 @@ def _encode_via_batch(pil_image) -> "np.ndarray":
     return payload
 
 
+# ── Adaptive Qdrant search ────────────────────────────────────────────────────
+
+# Score-threshold ladder used by _qdrant_search_adaptive():
+#
+#   Phase 1  0.99 → 0.95  step -0.01    stop when ≥25 results
+#   Phase 2  0.95 → 0.85  step -0.025   triggered when phase-1 exits with <20 results
+#   Floor    0.85          return whatever exists, even if <25
+#   Fallback no threshold  if floor returns 0 results, return top-20 unconstrained
+#
+# Phase-2 queries: 0.925, 0.90, 0.875, 0.85 (0.95 already tried in phase 1).
+
+_SEARCH_TARGET         = 25      # desired result count
+_PHASE1_START          = 0.99
+_PHASE1_STOP           = 0.95    # inclusive — last threshold tried in phase 1
+_PHASE1_STEP           = 0.01
+_PHASE2_TRIGGER_COUNT  = 20      # switch to phase 2 if results at 0.95 < this
+_PHASE2_STEP           = 0.025   # coarser step in phase 2 (0.925 → 0.90 → 0.875 → 0.85)
+_SCORE_FLOOR           = 0.85    # never go below this; return whatever we have
+
+
+def _qdrant_search_adaptive(
+    vec: "np.ndarray",
+    hnsw_ef: int = 128,
+) -> tuple[list, float, int]:
+    """
+    Search Qdrant with an adaptive score-threshold ladder.
+
+    Phase 1: threshold steps down from 0.99 → 0.95 in 0.01 increments,
+             stopping as soon as ≥ _SEARCH_TARGET (25) results are returned.
+
+    Phase 2: if phase 1 ends at 0.95 with fewer than _PHASE2_TRIGGER_COUNT (20)
+             results, continue in _PHASE2_STEP (0.025) increments
+             (queries: 0.925, 0.90, 0.875, 0.85).
+
+    Floor:   once the threshold would go below _SCORE_FLOOR (0.85), clamp to
+             0.85, run one final query, and return whatever comes back.
+
+    Fallback: if the floor query returns 0 results, run one final unconstrained
+              query (no score_threshold) and return the top 20 by score.
+
+    Returns:
+        (hits, final_threshold, qdrant_call_count)
+    """
+    from qdrant_client.models import SearchParams, QuantizationSearchParams
+
+    qdrant = get_qdrant()
+    params = SearchParams(
+        hnsw_ef=hnsw_ef,
+        exact=False,
+        quantization=QuantizationSearchParams(rescore=True),
+    )
+
+    def _search(threshold: float) -> list:
+        return qdrant.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=("image", vec.tolist()),
+            limit=_SEARCH_TARGET,
+            score_threshold=round(threshold, 4),
+            with_payload=True,
+            search_params=params,
+        )
+
+    calls = 0
+    hits  = []
+
+    # ── Phase 1: 0.99 → 0.95 in 0.01 steps ───────────────────────────────────
+    threshold = _PHASE1_START
+    while threshold >= _PHASE1_STOP - 1e-9:   # -epsilon for float rounding
+        hits  = _search(threshold)
+        calls += 1
+        logger.debug(
+            "Adaptive search: threshold={:.2f} → {} results (phase 1)",
+            threshold, len(hits),
+        )
+        if len(hits) >= _SEARCH_TARGET:
+            return hits, threshold, calls
+        threshold = round(threshold - _PHASE1_STEP, 4)
+
+    # Phase 1 exhausted — re-anchor to exactly 0.95 for the phase-2 decision.
+    threshold = _PHASE1_STOP
+
+    if len(hits) >= _PHASE2_TRIGGER_COUNT:
+        # Already have enough — no need for phase 2
+        return hits, threshold, calls
+
+    # ── Phase 2: 0.925 → 0.85 in 0.025 steps ─────────────────────────────────
+    # 0.95 already queried in phase 1; first new query is 0.95 - 0.025 = 0.925.
+    threshold = round(threshold - _PHASE2_STEP, 4)   # 0.95 - 0.025 = 0.925
+    while threshold > _SCORE_FLOOR - 1e-9:
+        if threshold < _SCORE_FLOOR:
+            threshold = _SCORE_FLOOR   # clamp to floor
+
+        hits  = _search(threshold)
+        calls += 1
+        logger.debug(
+            "Adaptive search: threshold={:.2f} → {} results (phase 2)",
+            threshold, len(hits),
+        )
+        if len(hits) >= _SEARCH_TARGET:
+            return hits, threshold, calls
+        if abs(threshold - _SCORE_FLOOR) < 1e-9:
+            # At the floor — return what we have if non-empty, otherwise break
+            # to the unconstrained fallback below.
+            if hits:
+                return hits, threshold, calls
+            break
+
+        threshold = round(threshold - _PHASE2_STEP, 4)
+
+    # ── Fallback: unconstrained top-20 ───────────────────────────────────────
+    # Reached when the floor query (0.85) returned 0 results.
+    if not hits:
+        hits = qdrant.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=("image", vec.tolist()),
+            limit=20,
+            with_payload=True,
+            search_params=params,
+        )
+        calls += 1
+        threshold = 0.0
+        logger.debug(
+            "Adaptive search: fallback unconstrained → {} results", len(hits),
+        )
+
+    return hits, threshold, calls
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/health")
@@ -319,29 +451,19 @@ def search():
     encode_ms = int((time.perf_counter() - t0) * 1000)
     logger.info("Encoded {} in {}ms ({}-dim)", image_url[:60], encode_ms, len(vec))
 
-    # ── Step 2: Qdrant ANN search ─────────────────────────────────────────────
+    # ── Step 2: Qdrant ANN search (adaptive score threshold) ─────────────────
     t1 = time.perf_counter()
     try:
-        from qdrant_client.models import SearchParams, QuantizationSearchParams
-
-        qdrant = get_qdrant()
-        hits = qdrant.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=("image", vec.tolist()),
-            limit=top_k,
-            with_payload=True,
-            search_params=SearchParams(
-                hnsw_ef=hnsw_ef,
-                exact=False,
-                quantization=QuantizationSearchParams(rescore=True),
-            ),
-        )
+        hits, final_threshold, qdrant_calls = _qdrant_search_adaptive(vec, hnsw_ef)
     except Exception as e:
         logger.error("Qdrant search error: {}", e)
         return jsonify({"error": f"Qdrant search failed: {e}"}), 500
 
     qdrant_ms = int((time.perf_counter() - t1) * 1000)
-    logger.info("Qdrant returned {} hits in {}ms", len(hits), qdrant_ms)
+    logger.info(
+        "Qdrant returned {} hits in {}ms (threshold={:.2f}, {} calls)",
+        len(hits), qdrant_ms, final_threshold, qdrant_calls,
+    )
 
     # Build result list and gather os_ids for enrichment
     qdrant_results = []
@@ -392,12 +514,14 @@ def search():
     enrich_ms = int((time.perf_counter() - t2) * 1000)
 
     return jsonify({
-        "query_image_url": image_url,
-        "qdrant_results":  qdrant_results,
-        "total":           len(qdrant_results),
-        "encode_ms":       encode_ms,
-        "qdrant_ms":       qdrant_ms,
-        "enrich_ms":       enrich_ms,
+        "query_image_url":  image_url,
+        "qdrant_results":   qdrant_results,
+        "total":            len(qdrant_results),
+        "score_threshold":  round(final_threshold, 4),
+        "qdrant_calls":     qdrant_calls,
+        "encode_ms":        encode_ms,
+        "qdrant_ms":        qdrant_ms,
+        "enrich_ms":        enrich_ms,
     })
 
 
@@ -496,29 +620,19 @@ def search_b64():
     encode_ms = int((time.perf_counter() - t0) * 1000)
     logger.info("B64 search: decoded {}px image in {}ms ({}-dim)", orig_size, encode_ms, len(vec))
 
-    # ── Step 2: Qdrant ANN search ─────────────────────────────────────────────
+    # ── Step 2: Qdrant ANN search (adaptive score threshold) ─────────────────
     t1 = time.perf_counter()
     try:
-        from qdrant_client.models import SearchParams, QuantizationSearchParams
-
-        qdrant = get_qdrant()
-        hits = qdrant.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=("image", vec.tolist()),
-            limit=top_k,
-            with_payload=True,
-            search_params=SearchParams(
-                hnsw_ef=hnsw_ef,
-                exact=False,
-                quantization=QuantizationSearchParams(rescore=True),
-            ),
-        )
+        hits, final_threshold, qdrant_calls = _qdrant_search_adaptive(vec, hnsw_ef)
     except Exception as e:
         logger.error("Qdrant search error: {}", e)
         return jsonify({"error": f"Qdrant search failed: {e}"}), 500
 
     qdrant_ms = int((time.perf_counter() - t1) * 1000)
-    logger.info("Qdrant returned {} hits in {}ms", len(hits), qdrant_ms)
+    logger.info(
+        "Qdrant returned {} hits in {}ms (threshold={:.2f}, {} calls)",
+        len(hits), qdrant_ms, final_threshold, qdrant_calls,
+    )
 
     qdrant_results = []
     os_ids = []
@@ -568,12 +682,14 @@ def search_b64():
     enrich_ms = int((time.perf_counter() - t2) * 1000)
 
     return jsonify({
-        "image_size":     orig_size,
-        "qdrant_results": qdrant_results,
-        "total":          len(qdrant_results),
-        "encode_ms":      encode_ms,
-        "qdrant_ms":      qdrant_ms,
-        "enrich_ms":      enrich_ms,
+        "image_size":      orig_size,
+        "qdrant_results":  qdrant_results,
+        "total":           len(qdrant_results),
+        "score_threshold": round(final_threshold, 4),
+        "qdrant_calls":    qdrant_calls,
+        "encode_ms":       encode_ms,
+        "qdrant_ms":       qdrant_ms,
+        "enrich_ms":       enrich_ms,
     })
 
 

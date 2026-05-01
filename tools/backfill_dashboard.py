@@ -24,6 +24,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,7 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 WORKER_IPS = [
-    "54.176.253.45",    # w0
+    "54.176.253.45",    # w0  (public — also used by local dev)
     "204.236.180.247",  # w1
     "54.219.84.133",    # w2
     "13.56.115.249",    # w3
@@ -56,6 +57,50 @@ WORKER_IPS = [
     "184.72.25.240",    # w10
     "13.56.139.224",    # w11
 ]
+
+# Private IPs for intra-fleet SSH (used when dashboard runs on w0).
+# Avoids internet egress and works with the SG self-referencing rule.
+WORKER_PRIVATE_IPS = [
+    "172.31.30.150",    # w0
+    "172.31.20.243",    # w1
+    "172.31.20.183",    # w2
+    "172.31.19.90",     # w3
+    "172.31.25.68",     # w4
+    "172.31.28.23",     # w5
+    "172.31.27.204",    # w6
+    "172.31.29.15",     # w7
+    "172.31.25.243",    # w8
+    "172.31.17.121",    # w9
+    "172.31.28.66",     # w10
+    "172.31.19.135",    # w11
+]
+
+# Detect if we're running on an EC2 instance in the same VPC.
+# If so, use private IPs for SSH — faster and avoids SG public-IP restrictions.
+def _detect_private_ip() -> str | None:
+    """Return our own private IP if running on EC2 (IMDSv2), else None."""
+    try:
+        import urllib.request
+        # IMDSv2: fetch token first, then use it for the metadata request
+        tok_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"},
+            method="PUT",
+        )
+        token = urllib.request.urlopen(tok_req, timeout=2).read().decode().strip()
+        ip_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/local-ipv4",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        return urllib.request.urlopen(ip_req, timeout=2).read().decode().strip()
+    except Exception:
+        return None
+
+_MY_PRIVATE_IP = _detect_private_ip()
+_USE_PRIVATE_IPS = _MY_PRIVATE_IP in WORKER_PRIVATE_IPS
+
+# Resolved SSH targets — private IPs when on EC2, public IPs otherwise
+SSH_TARGETS = WORKER_PRIVATE_IPS if _USE_PRIVATE_IPS else WORKER_IPS
 
 N_WORKERS = len(WORKER_IPS)
 
@@ -108,11 +153,230 @@ def build_worker_phase_map() -> dict[tuple[int, int], tuple[date, date]]:
 WORKER_PHASE_MAP = build_worker_phase_map()
 PHASE_NUMS = list(range(1, len(PHASES) + 1))  # [1, 2, 3, 4, 5, 6]
 
+# ── Cleanup task definitions (generated identically to worker_cleanup.py) ───────
+# Monthly windows newest-first, each split evenly across N_WORKERS.
+# All 12 workers work the same month simultaneously before advancing backwards.
 
-# ── S3 helpers (proxied via SSH to worker-0 which has an IAM instance profile) ─
-# Local machine may not have AWS creds — we SSH to a worker and run boto3 there.
+_BACKFILL_START = date(2025, 1, 1)
+_BACKFILL_END   = date(2026, 4, 8)
 
-_S3_PROXY_IP = WORKER_IPS[0]  # worker-0 is always the proxy
+
+def _cleanup_monthly_windows() -> list[tuple[date, date]]:
+    windows: list[tuple[date, date]] = []
+    cur_end = _BACKFILL_END
+    while cur_end > _BACKFILL_START:
+        last_day = cur_end - timedelta(days=1)
+        month_start = date(last_day.year, last_day.month, 1)
+        win_start = max(_BACKFILL_START, month_start)
+        windows.append((win_start, cur_end))
+        cur_end = month_start
+    return windows
+
+
+def _cleanup_split_range(start: date, end: date, n: int) -> list[tuple[date, date]]:
+    total = (end - start).days
+    base  = total // n
+    extra = total % n
+    slices: list[tuple[date, date]] = []
+    cur = start
+    for i in range(n):
+        days = base + (1 if i < extra else 0)
+        nxt  = cur + timedelta(days=days)
+        slices.append((cur, min(nxt, end)))
+        cur = nxt
+    return slices
+
+
+def _build_cleanup_tasks() -> list[tuple[date, date, str]]:
+    tasks: list[tuple[date, date, str]] = []
+    for win_start, win_end in _cleanup_monthly_windows():
+        month_tag = win_start.strftime("%Y%m")
+        slices = _cleanup_split_range(win_start, win_end, N_WORKERS)
+        for w_idx, (s, e) in enumerate(slices):
+            if (e - s).days == 0:
+                continue   # skip zero-day slices (month shorter than N_WORKERS)
+            tasks.append((s, e, f"m{month_tag}w{w_idx}"))
+    return tasks
+
+
+CLEANUP_TASKS = _build_cleanup_tasks()
+
+# Pre-build a lookup: for any date, which cleanup task covers it?
+_CLEANUP_DATE_MAP: dict[date, str] = {}
+for _cs, _ce, _cid in CLEANUP_TASKS:
+    _d = _cs
+    while _d < _ce:
+        _CLEANUP_DATE_MAP[_d] = _cid
+        _d += timedelta(days=1)
+
+
+# ── Non-eBay task definitions (mirrors worker_nonebay.py) ─────────────────────
+# Workers 6–11 run these tasks. Checkpoint IDs use nonebay-m{YYYYMM}w{N} prefix
+# so they never collide with the eBay cleanup tasks above.
+
+_NONEBAY_START        = date(2025, 1, 1)
+_NONEBAY_END          = date.today() + timedelta(days=1)  # dynamic — includes today
+_NONEBAY_N_WORKERS    = 6   # workers 6–11 (local indices 0–5)
+_NONEBAY_FIRST_WORKER = 6   # global index offset
+
+
+def _nonebay_monthly_windows() -> list[tuple[date, date]]:
+    windows: list[tuple[date, date]] = []
+    cur_end = _NONEBAY_END
+    while cur_end > _NONEBAY_START:
+        last_day = cur_end - timedelta(days=1)
+        month_start = date(last_day.year, last_day.month, 1)
+        win_start = max(_NONEBAY_START, month_start)
+        windows.append((win_start, cur_end))
+        cur_end = month_start
+    return windows
+
+
+def _build_nonebay_tasks() -> list[tuple[date, date, str]]:
+    tasks: list[tuple[date, date, str]] = []
+    for win_start, win_end in _nonebay_monthly_windows():
+        month_tag = win_start.strftime("%Y%m")
+        slices = _cleanup_split_range(win_start, win_end, _NONEBAY_N_WORKERS)
+        for w_idx, (s, e) in enumerate(slices):
+            if (e - s).days == 0:
+                continue
+            tasks.append((s, e, f"nonebay-m{month_tag}w{w_idx}"))
+    return tasks
+
+
+NONEBAY_TASKS = _build_nonebay_tasks()
+
+# Pre-build a lookup: for any date, which non-eBay task covers it?
+_NONEBAY_DATE_MAP: dict[date, str] = {}
+for _ns, _ne, _ncid in NONEBAY_TASKS:
+    _d = _ns
+    while _d < _ne:
+        _NONEBAY_DATE_MAP[_d] = _ncid
+        _d += timedelta(days=1)
+
+
+# ── S3 helpers ────────────────────────────────────────────────────────────────
+# When running on an EC2 instance with an IAM role (e.g. on worker-0 itself)
+# boto3 has direct credentials — no SSH proxy needed.
+# When running locally without AWS creds, we SSH to worker-0 and run boto3 there.
+
+_S3_PROXY_IP = WORKER_PRIVATE_IPS[0] if _USE_PRIVATE_IPS else WORKER_IPS[0]
+
+
+def _fetch_s3_state_direct() -> dict:
+    """
+    Fetch checkpoint state using local boto3 credentials.
+    Used when running on an EC2 instance with an IAM role.
+    Returns the same dict structure as poll_s3_via_ssh().
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    s3     = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-west-1"))
+    bucket = os.environ.get("S3_VECTOR_BUCKET", "")
+    prefix = os.environ.get("S3_CHECKPOINT_PREFIX", "checkpoints")
+
+    result: dict = {}
+
+    # ── Phase checkpoints ──────────────────────────────────────────────────────
+    for w in range(N_WORKERS):
+        result[w] = {}
+        for p in PHASE_NUMS:
+            entry: dict = {"complete": False, "last_completed_date": None}
+            mk = f"{prefix}/backfill-w{w}-phase{p}-complete.json"
+            try:
+                s3.head_object(Bucket=bucket, Key=mk)
+                entry["complete"] = True
+            except ClientError:
+                pass
+            if not entry["complete"]:
+                ck = f"{prefix}/backfill-w{w}-phase{p}.json"
+                try:
+                    data = json.loads(s3.get_object(Bucket=bucket, Key=ck)["Body"].read())
+                    entry["last_completed_date"] = data.get("last_completed_date")
+                except ClientError:
+                    pass
+            result[w][p] = entry
+
+    # ── Cleanup tasks ──────────────────────────────────────────────────────────
+    cleanup: dict = {}
+    for _s, _e, cid in CLEANUP_TASKS:
+        entry = {"complete": False, "claimed": False, "last_completed_date": None}
+        mk = f"{prefix}/{cid}-complete.json"
+        try:
+            s3.head_object(Bucket=bucket, Key=mk)
+            entry["complete"] = True
+        except ClientError:
+            pass
+        if not entry["complete"]:
+            clk = f"{prefix}/{cid}-claimed.json"
+            try:
+                cd = json.loads(s3.get_object(Bucket=bucket, Key=clk)["Body"].read())
+                entry["claimed"]    = True
+                entry["claimed_by"] = cd.get("worker")
+            except ClientError:
+                pass
+            ck = f"{prefix}/{cid}.json"
+            try:
+                data = json.loads(s3.get_object(Bucket=bucket, Key=ck)["Body"].read())
+                entry["last_completed_date"] = data.get("last_completed_date")
+            except ClientError:
+                pass
+        cleanup[cid] = entry
+    result["__cleanup__"] = cleanup
+
+    # ── Daily completion markers ───────────────────────────────────────────────
+    daily: dict = {}
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/daily-",
+                                   PaginationConfig={"MaxItems": 400}):
+        for obj in page.get("Contents", []):
+            fname = obj["Key"].split("/")[-1]
+            if fname.endswith("-complete.json"):
+                day = fname.replace("daily-", "").replace("-complete.json", "")
+                if len(day) == 10:
+                    daily[day] = True
+    result["__daily__"] = daily
+
+    # ── Gap-fill completion markers ────────────────────────────────────────────
+    gap_complete: dict = {}
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/gap-",
+                                   PaginationConfig={"MaxItems": 200}):
+        for obj in page.get("Contents", []):
+            fname = obj["Key"].split("/")[-1]
+            if fname.endswith("-complete.json"):
+                try:
+                    data = json.loads(s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read())
+                    cid  = fname.replace("-complete.json", "")
+                    gap_complete[cid] = {"start": data.get("start"), "end": data.get("end")}
+                except ClientError:
+                    pass
+    result["__gap_complete__"] = gap_complete
+
+    # ── Non-eBay tasks (nonebay-m{YYYYMM}w{N}) ────────────────────────────────
+    nonebay: dict = {}
+    for _s, _e, cid in NONEBAY_TASKS:
+        entry: dict = {"complete": False, "claimed": False,
+                       "start": str(_s), "end": str(_e)}
+        mk = f"{prefix}/{cid}-complete.json"
+        try:
+            s3.head_object(Bucket=bucket, Key=mk)
+            entry["complete"] = True
+        except ClientError:
+            pass
+        if not entry["complete"]:
+            clk = f"{prefix}/{cid}-claimed.json"
+            try:
+                cd = json.loads(s3.get_object(Bucket=bucket, Key=clk)["Body"].read())
+                entry["claimed"]    = True
+                entry["claimed_by"] = cd.get("worker")
+            except ClientError:
+                pass
+        nonebay[cid] = entry
+    result["__nonebay__"] = nonebay
+
+    return result
+
 
 def _build_s3_proxy_script() -> str:
     """Build the remote Python script with values baked in (avoids .format() conflicts)."""
@@ -145,16 +409,110 @@ def _build_s3_proxy_script() -> str:
         "            except ClientError:\n"
         "                pass\n"
         "        result[w][p]=entry\n"
+        # ── Cleanup tasks ──────────────────────────────────────────────────────
+        "cleanup={}\n"
+        f"cleanup_cids={json.dumps([cid for _s, _e, cid in CLEANUP_TASKS])}\n"
+        "for cid in cleanup_cids:\n"
+        "    entry=dict(complete=False,claimed=False,last_completed_date=None)\n"
+        "    mk=f'{prefix}/{cid}-complete.json'\n"
+        "    try:\n"
+        "        s3.head_object(Bucket=bucket,Key=mk)\n"
+        "        entry['complete']=True\n"
+        "    except ClientError:\n"
+        "        pass\n"
+        "    if not entry['complete']:\n"
+        "        clk=f'{prefix}/{cid}-claimed.json'\n"
+        "        try:\n"
+        "            cd=json.loads(s3.get_object(Bucket=bucket,Key=clk)['Body'].read())\n"
+        "            entry['claimed']=True\n"
+        "            entry['claimed_by']=cd.get('worker')\n"
+        "        except ClientError:\n"
+        "            pass\n"
+        "        ck=f'{prefix}/{cid}.json'\n"
+        "        try:\n"
+        "            data=json.loads(s3.get_object(Bucket=bucket,Key=ck)['Body'].read())\n"
+        "            entry['last_completed_date']=data.get('last_completed_date')\n"
+        "        except ClientError:\n"
+        "            pass\n"
+        "    cleanup[cid]=entry\n"
+        "result['__cleanup__']=cleanup\n"
+        # ── Daily completion markers ───────────────────────────────────────────
+        "daily={}\n"
+        "paginator=s3.get_paginator('list_objects_v2')\n"
+        "for page in paginator.paginate(Bucket=bucket,Prefix=prefix+'/daily-',PaginationConfig={'MaxItems':400}):\n"
+        "    for obj in page.get('Contents',[]):\n"
+        "        key=obj['Key']\n"
+        "        fname=key.split('/')[-1]\n"
+        "        if fname.endswith('-complete.json'):\n"
+        "            day=fname.replace('daily-','').replace('-complete.json','')\n"
+        "            if len(day)==10:\n"
+        "                daily[day]=True\n"
+        "result['__daily__']=daily\n"
+        # ── Gap-fill completion markers ────────────────────────────────────────
+        "gap_complete={}\n"
+        "for page in paginator.paginate(Bucket=bucket,Prefix=prefix+'/gap-',PaginationConfig={'MaxItems':200}):\n"
+        "    for obj in page.get('Contents',[]):\n"
+        "        key=obj['Key']\n"
+        "        fname=key.split('/')[-1]\n"
+        "        if fname.endswith('-complete.json'):\n"
+        "            try:\n"
+        "                data=json.loads(s3.get_object(Bucket=bucket,Key=key)['Body'].read())\n"
+        "                gap_complete[fname.replace('-complete.json','')]={'start':data.get('start'),'end':data.get('end')}\n"
+        "            except ClientError:\n"
+        "                pass\n"
+        "result['__gap_complete__']=gap_complete\n"
+        # ── Non-eBay tasks ────────────────────────────────────────────────────
+        "nonebay={}\n"
+        f"nonebay_cids={json.dumps([(str(s), str(e), cid) for s, e, cid in NONEBAY_TASKS])}\n"
+        "for s,e,cid in nonebay_cids:\n"
+        "    entry=dict(complete=False,claimed=False,start=s,end=e)\n"
+        "    mk=f'{prefix}/{cid}-complete.json'\n"
+        "    try:\n"
+        "        s3.head_object(Bucket=bucket,Key=mk)\n"
+        "        entry['complete']=True\n"
+        "    except ClientError:\n"
+        "        pass\n"
+        "    if not entry['complete']:\n"
+        "        clk=f'{prefix}/{cid}-claimed.json'\n"
+        "        try:\n"
+        "            cd=json.loads(s3.get_object(Bucket=bucket,Key=clk)['Body'].read())\n"
+        "            entry['claimed']=True\n"
+        "            entry['claimed_by']=cd.get('worker')\n"
+        "        except ClientError:\n"
+        "            pass\n"
+        "    nonebay[cid]=entry\n"
+        "result['__nonebay__']=nonebay\n"
         "print(json.dumps(result))\n"
     )
 
 
 def poll_s3_via_ssh() -> dict:
     """
-    Run a Python S3 query on worker-0 (IAM instance profile) by piping the
-    script over stdin — avoids all shell quoting issues with python3 -c "...".
-    Returns {worker_idx: {phase_num: {complete, last_completed_date}}}
+    Fetch S3 checkpoint state.
+
+    Strategy:
+      1. If boto3 is available and local credentials work (e.g. EC2 IAM role),
+         query S3 directly — fast, no SSH round-trip.
+      2. Otherwise SSH to worker-0 and run the proxy script there.
+
+    Returns {worker_idx: {phase_num: {complete, last_completed_date}}, ...}
     """
+    # ── Try direct boto3 first ─────────────────────────────────────────────────
+    if _BOTO3_AVAILABLE and os.environ.get("S3_VECTOR_BUCKET"):
+        try:
+            raw = _fetch_s3_state_direct()
+            # Normalise: separate __xxx__ blocks from numeric worker keys
+            result: dict = {}
+            for k, v in raw.items():
+                if isinstance(k, str) and k.startswith("__"):
+                    result[k] = v
+                else:
+                    result[int(k)] = {int(p): pv for p, pv in v.items()}
+            return result
+        except Exception as e:
+            print(f"[s3-direct] failed ({e}), falling back to SSH proxy", flush=True)
+
+    # ── SSH proxy fallback ─────────────────────────────────────────────────────
     script = _build_s3_proxy_script()
     cmd = (
         "cd /home/ec2-user/card-oracle-max && "
@@ -188,8 +546,14 @@ def poll_s3_via_ssh() -> dict:
             line = line.strip()
             if line.startswith("{"):
                 raw = json.loads(line)
-                return {int(w): {int(p): v for p, v in phases.items()}
-                        for w, phases in raw.items()}
+                # Separate string-keyed blocks from numeric worker keys
+                result: dict = {}
+                for w, val in raw.items():
+                    if w.startswith("__"):
+                        result[w] = val  # __cleanup__, __daily__, __gap_complete__
+                    else:
+                        result[int(w)] = {int(p): v for p, v in val.items()}
+                return result
         print(f"[s3-proxy] no JSON in output: {out[:200]}", flush=True)
         return {}
     except Exception as e:
@@ -208,15 +572,15 @@ def phase_checkpoint_key(worker_idx: int, phase_num: int) -> str:
 # ── SSH polling ────────────────────────────────────────────────────────────────
 
 _SSH_LOG_RE = re.compile(
-    r"Processed ([\d,]+) rows \| (\d+) rows/s \| skipped (\d+) \| .* ETA ~([\d.]+)min"
+    r"Processed ([\d,]+) rows \| (\d+) rows/s \| skipped (\d+) \| .* ETA ~(-?[\d.]+)min"
 )
 
 
 def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
-    """SSH into one worker and scrape the latest log line."""
+    """SSH into one worker and scrape the latest journald log line."""
     result: dict[str, Any] = {
         "index":    worker_idx,
-        "ip":       ip,
+        "ip":       WORKER_IPS[worker_idx],  # always show public IP in UI
         "active":   False,
         "rows":     0,
         "rows_s":   0,
@@ -226,6 +590,9 @@ def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
         "error":    None,
     }
     try:
+        # Build log-file fallback paths for this specific worker index
+        cleanup_log = f"/home/ec2-user/card-oracle-max/logs/cleanup-w{worker_idx}.log"
+        gaps_log    = f"/home/ec2-user/card-oracle-max/logs/gaps-w{worker_idx}.log"
         out = subprocess.check_output(
             [
                 "ssh", "-i", SSH_KEY,
@@ -233,12 +600,21 @@ def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
                 "-o", "ConnectTimeout=6",
                 "-o", "BatchMode=yes",
                 f"ec2-user@{ip}",
-                "systemctl is-active backfill 2>/dev/null; "
-                "sudo journalctl -u backfill --no-pager -n 5 2>/dev/null "
-                "| grep 'Processed' | tail -1",
+                # Active check: look for python processes running our scripts.
+                # Uses 'ps' + grep rather than pgrep -f to avoid pgrep self-matching
+                # (pgrep -f matches the bash process running this very SSH command
+                # because the command string itself contains the search terms).
+                "ps aux | grep -E '[p]ython.*(worker_phases|worker_cleanup|worker_nonebay|rds_batch_job)' "
+                "| grep -qv grep && echo active || echo inactive; "
+                # Log: try journald (systemd service) first; fall back to nohup log files
+                "LOG=$(sudo journalctl -u backfill --no-pager -n 50 --output=cat 2>/dev/null "
+                "| grep 'Processed' | tail -1); "
+                f'if [ -z "$LOG" ]; then LOG=$(tail -n 100 "{cleanup_log}" "{gaps_log}" 2>/dev/null '
+                "| grep 'Processed' | tail -1); fi; "
+                'echo "$LOG"',
             ],
             stderr=subprocess.DEVNULL,
-            timeout=10,
+            timeout=12,
         ).decode().strip()
 
         lines = out.splitlines()
@@ -252,7 +628,8 @@ def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
             result["rows"]    = int(m.group(1).replace(",", ""))
             result["rows_s"]  = int(m.group(2))
             result["skipped"] = int(m.group(3))
-            result["eta_min"] = float(m.group(4))
+            eta = float(m.group(4))
+            result["eta_min"] = eta if eta >= 0 else None  # negative = past ETA, show as —
 
     except subprocess.TimeoutExpired:
         result["error"] = "SSH timeout"
@@ -268,16 +645,18 @@ def poll_all_workers_ssh() -> list[dict]:
     results = [None] * N_WORKERS
     threads = []
 
-    def _poll(idx: int, ip: str) -> None:
-        results[idx] = poll_worker_ssh(idx, ip)
+    def _poll(idx: int) -> None:
+        # Use private IP when running on EC2 in same VPC, else public IP
+        target_ip = SSH_TARGETS[idx]
+        results[idx] = poll_worker_ssh(idx, target_ip)
 
-    for idx, ip in enumerate(WORKER_IPS):
-        t = threading.Thread(target=_poll, args=(idx, ip), daemon=True)
+    for idx in range(N_WORKERS):
+        t = threading.Thread(target=_poll, args=(idx,), daemon=True)
         t.start()
         threads.append(t)
 
     for t in threads:
-        t.join(timeout=15)
+        t.join(timeout=18)
 
     return [r or {"index": i, "ip": WORKER_IPS[i], "active": False, "error": "no response"}
             for i, r in enumerate(results)]
@@ -288,13 +667,19 @@ def poll_all_workers_ssh() -> list[dict]:
 def poll_s3_state() -> dict:
     """
     Fetches checkpoint state via SSH proxy to worker-0 (IAM instance profile).
-    Returns normalised {phase_complete, last_completed_date} dicts.
+    Returns normalised {phase_complete, last_completed_date, cleanup_state} dicts.
     phase_num is 1-indexed throughout (matches worker_phases.py).
     """
     raw = poll_s3_via_ssh()
 
     phase_complete:      dict[int, dict[int, bool]]       = {i: {} for i in range(N_WORKERS)}
     last_completed_date: dict[int, dict[int, str | None]] = {i: {} for i in range(N_WORKERS)}
+
+    # Extract string-keyed blocks before iterating numeric worker keys
+    cleanup_state:  dict[str, dict] = raw.pop("__cleanup__", {})
+    daily_complete: dict[str, bool] = raw.pop("__daily__", {})
+    gap_complete:   dict[str, dict] = raw.pop("__gap_complete__", {})
+    nonebay_state:  dict[str, dict] = raw.pop("__nonebay__", {})
 
     for w_idx in range(N_WORKERS):
         for phase_num in PHASE_NUMS:
@@ -305,6 +690,10 @@ def poll_s3_state() -> dict:
     return {
         "phase_complete":      phase_complete,
         "last_completed_date": last_completed_date,
+        "cleanup_state":       cleanup_state,
+        "daily_complete":      daily_complete,
+        "gap_complete":        gap_complete,
+        "nonebay_state":       nonebay_state,
     }
 
 
@@ -312,15 +701,37 @@ def poll_s3_state() -> dict:
 
 def build_calendar(s3_state: dict) -> dict[str, str]:
     """
-    Returns {date_str: status} for every day in the full backfill range.
+    Returns {date_str: status} for every day from backfill start to today.
     Status: "complete" | "in_progress" | "scheduled" | "not_started" | "out_of_scope"
-    """
-    phase_complete     = s3_state.get("phase_complete", {})
-    last_completed_date = s3_state.get("last_completed_date", {})
 
-    # All dates covered by any phase
+    Priority order for status resolution (highest wins):
+      1. daily-complete marker       — written by daily_update.py cron
+      2. gap-fill complete marker    — written by gap_fill_wN.sh
+      3. cleanup task progress       — monthly window cleanup workers
+      4. phase-based checkpoint      — original worker_phases.py logic
+    """
+    phase_complete      = s3_state.get("phase_complete", {})
+    last_completed_date = s3_state.get("last_completed_date", {})
+    cleanup_state       = s3_state.get("cleanup_state", {})
+    daily_complete      = s3_state.get("daily_complete", {})   # {YYYY-MM-DD: True}
+    gap_complete        = s3_state.get("gap_complete", {})     # {gap-id: {start, end}}
+
+    # Build a set of dates confirmed complete by gap-fill markers
+    gap_complete_dates: set[date] = set()
+    for _cid, meta in gap_complete.items():
+        try:
+            gs = date.fromisoformat(meta["start"])
+            ge = date.fromisoformat(meta["end"])
+            d = gs
+            while d < ge:
+                gap_complete_dates.add(d)
+                d += timedelta(days=1)
+        except (KeyError, ValueError):
+            pass
+
+    # Calendar runs from backfill start to today (inclusive)
     all_start = min(s for s, _e, _l in PHASES)
-    all_end   = max(e for _s, e, _l in PHASES)
+    all_end   = date.today() + timedelta(days=1)  # exclusive, so today is included
 
     calendar: dict[str, str] = {}
     today = date.today()
@@ -329,7 +740,7 @@ def build_calendar(s3_state: dict) -> dict[str, str]:
     while d < all_end:
         d_str = d.isoformat()
 
-        # Find which phase this date belongs to (phase_num is 1-indexed)
+        # ── Layer 4 (base): phase-based checkpoint logic ──────────────────────
         phase_num_for_day: int | None = None
         for p_num, (p_start, p_end, _) in enumerate(PHASES, 1):
             if p_start <= d < p_end:
@@ -337,60 +748,111 @@ def build_calendar(s3_state: dict) -> dict[str, str]:
                 break
 
         if phase_num_for_day is None:
-            calendar[d_str] = "out_of_scope"
-            d += timedelta(days=1)
-            continue
-
-        # Find which worker slice owns this date
-        worker_for_day: int | None = None
-        for w_idx in range(N_WORKERS):
-            s, e = WORKER_PHASE_MAP.get((w_idx, phase_num_for_day), (None, None))
-            if s and e and s <= d < e:
-                worker_for_day = w_idx
-                break
-
-        if worker_for_day is None:
-            calendar[d_str] = "out_of_scope"
-            d += timedelta(days=1)
-            continue
-
-        # Determine status
-        w_complete = phase_complete.get(worker_for_day, {})
-        w_lcd_map  = last_completed_date.get(worker_for_day, {})
-
-        if w_complete.get(phase_num_for_day):
-            calendar[d_str] = "complete"
+            # Date is outside original phase windows (e.g. Apr 8+ covered by daily cron)
+            calendar[d_str] = "not_started"
         else:
-            lcd = w_lcd_map.get(phase_num_for_day)
-            if lcd:
-                try:
-                    # last_completed_date is the last day whose band was processed.
-                    # Days up to and including lcd_date are complete.
-                    # The day after lcd_date is currently in progress.
-                    lcd_date = date.fromisoformat(lcd[:10])  # handle any datetime prefix
-                    if d <= lcd_date:
-                        calendar[d_str] = "complete"
-                    elif d == lcd_date + timedelta(days=1):
-                        calendar[d_str] = "in_progress"
-                    else:
-                        # Date is ahead of the checkpoint — still pending for this worker.
-                        # Phase 1 (highest priority) days that haven't been reached = not_started.
-                        # Later phase days = scheduled (not yet their turn).
-                        if phase_num_for_day == 1:
-                            calendar[d_str] = "not_started"
-                        else:
-                            calendar[d_str] = "scheduled"
-                except ValueError:
-                    calendar[d_str] = "not_started"
-            else:
-                # No checkpoint at all for this worker/phase yet.
-                # Phase 1 (highest priority, currently active) = not_started.
-                # Later phases = scheduled (haven't begun yet).
-                if phase_num_for_day == 1:
-                    calendar[d_str] = "not_started"
-                else:
-                    calendar[d_str] = "scheduled"
+            worker_for_day: int | None = None
+            for w_idx in range(N_WORKERS):
+                s, e = WORKER_PHASE_MAP.get((w_idx, phase_num_for_day), (None, None))
+                if s and e and s <= d < e:
+                    worker_for_day = w_idx
+                    break
 
+            if worker_for_day is None:
+                calendar[d_str] = "not_started"
+            else:
+                w_complete = phase_complete.get(worker_for_day, {})
+                w_lcd_map  = last_completed_date.get(worker_for_day, {})
+
+                if w_complete.get(phase_num_for_day):
+                    calendar[d_str] = "complete"
+                else:
+                    lcd = w_lcd_map.get(phase_num_for_day)
+                    if lcd:
+                        try:
+                            lcd_date = date.fromisoformat(lcd[:10])
+                            if d <= lcd_date:
+                                calendar[d_str] = "complete"
+                            elif d == lcd_date + timedelta(days=1):
+                                calendar[d_str] = "in_progress"
+                            else:
+                                calendar[d_str] = "scheduled" if phase_num_for_day > 1 else "not_started"
+                        except ValueError:
+                            calendar[d_str] = "not_started"
+                    else:
+                        calendar[d_str] = "scheduled" if phase_num_for_day > 1 else "not_started"
+
+        # ── Layer 3: cleanup task progress ────────────────────────────────────
+        # Cleanup is a re-processing pass on already-ingested data.
+        # Rule: cleanup can UPGRADE a day to "complete" but must NEVER downgrade
+        # a day that is already "complete" (e.g. from phase checkpoint).
+        # A cleanup task being claimed/in-progress does not mean data is missing.
+        cid = _CLEANUP_DATE_MAP.get(d)
+        if cid and cleanup_state:
+            ct = cleanup_state.get(cid, {})
+            has_data = ct.get("complete") or ct.get("claimed") or ct.get("last_completed_date")
+            if has_data:
+                if ct.get("complete"):
+                    # Cleanup fully done — always mark complete
+                    calendar[d_str] = "complete"
+                elif calendar[d_str] != "complete":
+                    # Only show cleanup progress if the day isn't already phase-complete
+                    lcd = ct.get("last_completed_date")
+                    if lcd:
+                        try:
+                            lcd_date = date.fromisoformat(lcd[:10])
+                            calendar[d_str] = "complete" if d <= lcd_date else "in_progress"
+                        except ValueError:
+                            pass
+                    elif ct.get("claimed"):
+                        calendar[d_str] = "in_progress"
+
+        # ── Layer 2: gap-fill completion markers ──────────────────────────────
+        # Written by gap_fill_wN.sh after each date range completes.
+        if d in gap_complete_dates:
+            calendar[d_str] = "complete"
+
+        # ── Layer 1 (highest priority): daily-complete markers ────────────────
+        # Written by daily_update.py — authoritative for recent days.
+        if daily_complete.get(d_str):
+            calendar[d_str] = "complete"
+
+        d += timedelta(days=1)
+
+    return calendar
+
+
+def build_nonebay_calendar(s3_state: dict) -> dict[str, str]:
+    """
+    Returns {date_str: status} for every day from NONEBAY_START to today.
+    Status is derived purely from the non-eBay task claim/complete markers.
+
+    Status values:
+      "complete"     — nonebay task for this day is fully complete
+      "in_progress"  — task is claimed but not yet complete
+      "not_started"  — task exists but has no markers yet
+      "out_of_scope" — date predates the non-eBay backfill window
+    """
+    nonebay_state = s3_state.get("nonebay_state", {})
+
+    all_start = _NONEBAY_START
+    all_end   = date.today() + timedelta(days=1)  # inclusive of today
+
+    calendar: dict[str, str] = {}
+    d = all_start
+    while d < all_end:
+        d_str = d.isoformat()
+        cid = _NONEBAY_DATE_MAP.get(d)
+        if cid is None:
+            calendar[d_str] = "out_of_scope"
+        else:
+            ct = nonebay_state.get(cid, {})
+            if ct.get("complete"):
+                calendar[d_str] = "complete"
+            elif ct.get("claimed"):
+                calendar[d_str] = "in_progress"
+            else:
+                calendar[d_str] = "not_started"
         d += timedelta(days=1)
 
     return calendar
@@ -401,17 +863,19 @@ def build_calendar(s3_state: dict) -> dict[str, str]:
 # Shared state (protected by _state_lock)
 _state_lock = threading.Lock()
 _state: dict = {
-    "workers":          [],
-    "calendar":         {},
-    "phase_summary":    [],
-    "total_rows":       0,
-    "total_skipped":    0,
-    "combined_rps":     0,
-    "workers_active":   0,
-    "workers_in_phase": {},
-    "updated_at":       None,
-    "next_update_at":   None,
-    "s3_available":     bool(S3_BUCKET),
+    "workers":           [],
+    "calendar":          {},
+    "nonebay_calendar":  {},
+    "phase_summary":     [],
+    "nonebay_summary":   [],
+    "total_rows":        0,
+    "total_skipped":     0,
+    "combined_rps":      0,
+    "workers_active":    0,
+    "workers_in_phase":  {},
+    "updated_at":        None,
+    "next_update_at":    None,
+    "s3_available":      bool(S3_BUCKET),
 }
 
 
@@ -443,6 +907,24 @@ def poll_and_update() -> None:
     workers_raw = _ssh_results.get(0, [{"index": i, "ip": WORKER_IPS[i], "active": False, "error": "poll failed"} for i in range(N_WORKERS)])
     s3_state    = _s3_results.get(0, {"phase_complete": {}, "last_completed_date": {}})
 
+    # Build reverse map: worker_idx → current cleanup CID (claimed-but-not-complete)
+    cleanup_state = s3_state.get("cleanup_state", {})
+    worker_cleanup_cid: dict[int, str] = {}
+    for cid, ct in cleanup_state.items():
+        if ct.get("claimed") and not ct.get("complete"):
+            cb = ct.get("claimed_by")
+            if cb is not None:
+                worker_cleanup_cid[int(cb)] = cid
+
+    # Build reverse map: worker_idx → current non-eBay task CID (workers 6–11)
+    nonebay_state = s3_state.get("nonebay_state", {})
+    worker_nonebay_cid: dict[int, str] = {}
+    for cid, ct in nonebay_state.items():
+        if ct.get("claimed") and not ct.get("complete"):
+            cb = ct.get("claimed_by")
+            if cb is not None:
+                worker_nonebay_cid[int(cb)] = cid
+
     # Enrich workers with phase info
     workers = []
     phase_counts: dict[str, int] = {}
@@ -457,9 +939,30 @@ def poll_and_update() -> None:
         w["phase_num"]   = phase_num
         w["phase_label"] = phase_label
 
+        # Attach current cleanup CID if the worker has one claimed
+        w["cleanup_cid"] = worker_cleanup_cid.get(w_idx)
+
+        # Attach current non-eBay task CID (workers 6–11 running worker_nonebay.py)
+        w["nonebay_cid"] = worker_nonebay_cid.get(w_idx)
+
         # Clamp phase_num to valid range for lookup (1–len(PHASES))
         lookup_phase = min(phase_num, len(PHASES))
         slice_start, slice_end = WORKER_PHASE_MAP.get((w_idx, lookup_phase), (None, None))
+
+        # If worker is on a cleanup task, use that task's date range for the slice display
+        if w["cleanup_cid"]:
+            for cs, ce, ccid in CLEANUP_TASKS:
+                if ccid == w["cleanup_cid"]:
+                    slice_start, slice_end = cs, ce
+                    break
+
+        # If worker is on a non-eBay task, use that task's date range
+        if w["nonebay_cid"]:
+            for ns, ne, ncid in NONEBAY_TASKS:
+                if ncid == w["nonebay_cid"]:
+                    slice_start, slice_end = ns, ne
+                    break
+
         w["slice_start"] = slice_start.isoformat() if slice_start else "—"
         w["slice_end"]   = slice_end.isoformat()   if slice_end   else "—"
 
@@ -472,8 +975,9 @@ def poll_and_update() -> None:
         if w.get("active"):
             active_count += 1
 
-    # Calendar
-    calendar = build_calendar(s3_state)
+    # Calendars
+    calendar         = build_calendar(s3_state)
+    nonebay_calendar = build_nonebay_calendar(s3_state)
 
     # Phase summary (phase_num is 1-indexed)
     phase_summary = []
@@ -498,10 +1002,34 @@ def poll_and_update() -> None:
             "pct":             round(complete_days / total_days * 100, 1) if total_days else 0,
         })
 
+    # Non-eBay monthly summary (workers 6–11)
+    nonebay_summary = []
+    for win_start, win_end in _nonebay_monthly_windows():
+        month_tag = win_start.strftime("%Y%m")
+        month_tasks = [(s, e, cid) for s, e, cid in NONEBAY_TASKS
+                       if cid.startswith(f"nonebay-m{month_tag}")]
+        total_t    = len(month_tasks)
+        complete_t = sum(1 for _s, _e, cid in month_tasks
+                         if nonebay_state.get(cid, {}).get("complete"))
+        claimed_t  = sum(1 for _s, _e, cid in month_tasks
+                         if nonebay_state.get(cid, {}).get("claimed")
+                         and not nonebay_state.get(cid, {}).get("complete"))
+        nonebay_summary.append({
+            "label":          win_start.strftime("%b %Y"),
+            "start":          str(win_start),
+            "end":            str(win_end),
+            "total_tasks":    total_t,
+            "complete_tasks": complete_t,
+            "in_progress":    claimed_t,
+            "pct":            round(complete_t / total_t * 100, 0) if total_t else 0,
+        })
+
     with _state_lock:
         _state["workers"]          = workers
         _state["calendar"]         = calendar
+        _state["nonebay_calendar"] = nonebay_calendar
         _state["phase_summary"]    = phase_summary
+        _state["nonebay_summary"]  = nonebay_summary
         _state["total_rows"]       = total_rows
         _state["total_skipped"]    = total_skipped
         _state["combined_rps"]     = combined_rps
@@ -654,8 +1182,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="two-col">
 
     <div class="section">
-      <div class="section-title">Phase Progress</div>
+      <div class="section-title">eBay Phase Progress (w0–w5)</div>
       <div class="phase-grid" id="phase-grid"><div class="loading">Loading…</div></div>
+      <div style="margin-top:14px">
+        <div class="section-title">Non-eBay Backfill Progress (w6–w11)</div>
+        <div class="phase-grid" id="nonebay-grid"><div class="loading">Loading…</div></div>
+      </div>
     </div>
 
     <div class="section">
@@ -663,7 +1195,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div style="overflow-x:auto">
         <table class="worker-table">
           <thead><tr>
-            <th>#</th><th>Status</th><th>Phase</th><th>Slice</th><th>Rows</th><th>r/s</th><th>ETA</th>
+            <th>#</th><th>Status</th><th>Task</th><th>Slice</th><th>Rows</th><th>r/s</th><th>ETA</th>
           </tr></thead>
           <tbody id="worker-tbody"><tr><td colspan="7" class="loading">Loading…</td></tr></tbody>
         </table>
@@ -672,10 +1204,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   </div>
 
-  <!-- Calendar -->
+  <!-- eBay calendar -->
   <div class="section calendar-section">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-      <div class="section-title" style="margin:0">Date Coverage Calendar</div>
+      <div>
+        <div class="section-title" style="margin:0">eBay Vector Coverage</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Jan 2025 – present · workers w0–w5</div>
+      </div>
       <div class="legend">
         <div class="legend-item"><div class="legend-dot complete"></div>Complete</div>
         <div class="legend-item"><div class="legend-dot in_progress"></div>In progress</div>
@@ -684,6 +1219,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="calendar-grid" id="calendar-grid"><div class="loading">Loading…</div></div>
+  </div>
+
+  <!-- Non-eBay calendar -->
+  <div class="section calendar-section">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <div>
+        <div class="section-title" style="margin:0">Non-eBay Vector Coverage</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Jan 2025 – present · workers w6–w11 · Fanatics/PWCC · Pristine · Goldin · MySlabs · Heritage</div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot complete"></div>Complete</div>
+        <div class="legend-item"><div class="legend-dot in_progress"></div>In progress</div>
+        <div class="legend-item"><div class="legend-dot not_started"></div>Not started</div>
+      </div>
+    </div>
+    <div class="calendar-grid" id="nonebay-calendar-grid"><div class="loading">Loading…</div></div>
   </div>
 
 </div>
@@ -726,21 +1277,30 @@ function renderSummary(data) {
   document.getElementById('updated-at').textContent = fmtTime(data.updated_at);
 }
 
-function renderPhases(phases) {
-  const el = document.getElementById('phase-grid');
-  el.innerHTML = phases.map(p => {
+function renderPhaseGrid(gridId, rows, workerCount) {
+  const el = document.getElementById(gridId);
+  if (!rows || rows.length === 0) { el.innerHTML = '<div style="color:var(--muted);font-size:11px">No data</div>'; return; }
+  el.innerHTML = rows.map(p => {
     const pct  = p.pct;
     const cls  = pct === 0 ? 'zero' : pct < 100 ? 'partial' : '';
     const pcls = pct === 0 ? 'zero' : '';
+    // For non-eBay rows use task count instead of days
+    const subtitle = p.total_tasks !== undefined
+      ? `${p.complete_tasks}/${p.total_tasks} tasks${p.in_progress > 0 ? ' · ' + p.in_progress + ' active' : ''}`
+      : `${p.complete_days}/${p.total_days} days · ${p.complete_workers}/${workerCount} workers done`;
     return `<div class="phase-row">
       <div class="phase-label">${p.label}</div>
       <div>
         <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
-        <div style="font-size:10px;color:var(--muted);margin-top:3px">${p.complete_days}/${p.total_days} days · ${p.complete_workers}/12 workers done</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:3px">${subtitle}</div>
       </div>
       <div class="phase-pct ${pcls}">${pct}%</div>
     </div>`;
   }).join('');
+}
+
+function renderPhases(phases) {
+  renderPhaseGrid('phase-grid', phases, 12);
 }
 
 function renderWorkers(workers) {
@@ -750,10 +1310,29 @@ function renderWorkers(workers) {
       ? '<span class="badge active">● active</span>'
       : '<span class="badge inactive">○ down</span>';
 
-    const allDone = w.phase_num >= 5;
-    const phaseBadge = allDone
-      ? '<span class="badge done">✓ all done</span>'
-      : `<span class="${phaseColor(w.phase_num)}">P${w.phase_num + 1} · ${w.phase_label}</span>`;
+    const isNonEbayWorker = w.index >= 6;  // workers 6–11 run worker_nonebay.py
+    const allOrigDone = w.phase_num > 6;   // all 6 original phases complete
+    const onCleanup   = !isNonEbayWorker && allOrigDone && w.cleanup_cid;
+    const onNonEbay   = isNonEbayWorker;
+
+    let taskBadge;
+    if (onNonEbay) {
+      if (w.nonebay_cid) {
+        taskBadge = `<span class="badge active">✦ non-eBay · ${w.nonebay_cid}</span>`;
+      } else if (w.active) {
+        taskBadge = '<span class="badge active">✦ non-eBay</span>';
+      } else {
+        taskBadge = '<span class="badge phase">✦ non-eBay</span>';
+      }
+    } else if (!isNonEbayWorker && allOrigDone && !w.cleanup_cid && !w.active) {
+      taskBadge = '<span class="badge done">✓ eBay done</span>';
+    } else if (onCleanup) {
+      taskBadge = `<span class="badge active">↻ cleanup · ${w.cleanup_cid}</span>`;
+    } else if (!isNonEbayWorker && allOrigDone && w.active) {
+      taskBadge = '<span class="badge active">↻ eBay cleanup</span>';
+    } else {
+      taskBadge = `<span class="${phaseColor(w.phase_num)}">P${w.phase_num} · ${w.phase_label}</span>`;
+    }
 
     const rowsCell  = `<span class="rows">${fmt(w.rows || 0)}</span>`;
     const rpsCell   = w.rows_s ? `<span class="rps">${w.rows_s}</span>` : '<span class="muted">—</span>';
@@ -763,7 +1342,7 @@ function renderWorkers(workers) {
     return `<tr>
       <td><b>w${w.index}</b><br><span class="ip">${w.ip}</span></td>
       <td>${statusBadge}${w.error ? `<div class="err">${w.error}</div>` : ''}</td>
-      <td>${phaseBadge}</td>
+      <td>${taskBadge}</td>
       <td>${sliceCell}</td>
       <td>${rowsCell}</td>
       <td>${rpsCell}</td>
@@ -772,7 +1351,8 @@ function renderWorkers(workers) {
   }).join('');
 }
 
-function renderCalendar(calendar) {
+function renderCalendar(calendar, gridId) {
+  gridId = gridId || 'calendar-grid';
   const months = {};
   for (const [d, status] of Object.entries(calendar)) {
     const [y, m] = d.split('-');
@@ -784,8 +1364,8 @@ function renderCalendar(calendar) {
   const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const DAY_NAMES   = ['Mo','Tu','We','Th','Fr','Sa','Su'];
 
-  const sortedMonths = Object.keys(months).sort();
-  const grid = document.getElementById('calendar-grid');
+  const sortedMonths = Object.keys(months).sort().reverse(); // newest first
+  const grid = document.getElementById(gridId);
 
   grid.innerHTML = sortedMonths.map(key => {
     const [y, m] = key.split('-').map(Number);
@@ -840,8 +1420,10 @@ async function fetchAndRender() {
 
     renderSummary(data);
     renderPhases(data.phase_summary || []);
+    renderPhaseGrid('nonebay-grid', data.nonebay_summary || [], 6);
     renderWorkers(data.workers || []);
-    renderCalendar(data.calendar || {});
+    renderCalendar(data.calendar || {}, 'calendar-grid');
+    renderCalendar(data.nonebay_calendar || {}, 'nonebay-calendar-grid');
   } catch(e) {
     console.error('Fetch error:', e);
   }
@@ -857,7 +1439,15 @@ setInterval(fetchAndRender, 60000);
 """
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Multi-threaded HTTP server — each request in its own thread."""
+    daemon_threads    = True   # threads die with the process
+    allow_reuse_address = True
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
+    timeout = 10  # seconds to wait for request headers before dropping connection
+
     def log_message(self, fmt, *args):  # suppress access logs
         pass
 
@@ -913,7 +1503,7 @@ def main():
     poller = threading.Thread(target=_background_poller, daemon=True)
     poller.start()
 
-    server = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print(f"[dashboard] Serving at http://localhost:{args.port}", flush=True)
     if not S3_BUCKET:
         print("[dashboard] WARNING: S3_VECTOR_BUCKET not set — calendar will use SSH data only", flush=True)

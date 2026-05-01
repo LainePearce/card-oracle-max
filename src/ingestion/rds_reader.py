@@ -340,6 +340,65 @@ def _format_datetime(val) -> str | None:
 
 # ── Scroll reader ────────────────────────────────────────────────
 
+def _fetch_day_with_retry(
+    conn: pymysql.Connection,
+    query: str,
+    batch_size: int,
+    day,
+    max_retries: int = 5,
+    retry_delay: float = 15.0,
+) -> tuple[list[dict], pymysql.Connection]:
+    """
+    Fetch all rows for a single day query, retrying on connection reset.
+
+    High-volume days (e.g. 700K+ rows) can take several hours to drain via
+    SSDictCursor.  RDS occasionally resets the TCP connection mid-stream
+    (errno 104 / OperationalError 2013).  On each retry the connection is
+    re-established and the day query is replayed from the beginning.  Qdrant
+    upserts are idempotent, so re-fetching a day is safe.
+
+    Returns (day_rows, conn) — the connection object may have been replaced
+    on retry; callers should use the returned connection going forward.
+    """
+    import time as _time
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            day_rows: list[dict] = []
+            with conn.cursor(pymysql.cursors.SSDictCursor) as cursor:
+                cursor.execute(query)
+                while True:
+                    chunk = cursor.fetchmany(batch_size)
+                    if not chunk:
+                        break
+                    day_rows.extend(chunk)
+            return day_rows, conn
+
+        except (pymysql.OperationalError, ConnectionResetError, OSError) as exc:
+            if attempt >= max_retries:
+                logger.error(
+                    "Day {} fetch failed after {} attempts: {}", day, max_retries, exc
+                )
+                raise
+
+            logger.warning(
+                "Connection error fetching {} (attempt {}/{}): {}. "
+                "Reconnecting in {:.0f}s…",
+                day, attempt, max_retries, exc, retry_delay,
+            )
+            _time.sleep(retry_delay)
+
+            # Re-establish connection before retrying
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = get_rds_connection()
+
+    # Unreachable — loop always returns or raises
+    raise RuntimeError("fetch_day_with_retry: unexpected exit")
+
+
 def scroll_rds(
     conn: pymysql.Connection,
     table: str = "salesdata",
@@ -357,6 +416,9 @@ def scroll_rds(
     Each daily query is fast because the result set is small (~50k–200k rows),
     avoiding the multi-minute MySQL sort that a single multi-million-row
     ORDER BY query would require.
+
+    High-volume days automatically retry with reconnect if the MySQL
+    connection is reset during streaming (see _fetch_day_with_retry).
 
     Args:
         conn:        MySQL connection.
@@ -395,14 +457,7 @@ def scroll_rds(
         query = f"SELECT * FROM {table} WHERE {where_clause} ORDER BY id"
 
         logger.debug("Date band: {} → {}", day, next_day)
-        with conn.cursor(pymysql.cursors.SSDictCursor) as cursor:
-            cursor.execute(query)
-            day_rows: list[dict] = []
-            while True:
-                chunk = cursor.fetchmany(batch_size)
-                if not chunk:
-                    break
-                day_rows.extend(chunk)
+        day_rows, conn = _fetch_day_with_retry(conn, query, batch_size, day)
 
         logger.info("Fetched {:,} rows for {}", len(day_rows), day)
         yield from day_rows

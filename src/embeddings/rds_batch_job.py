@@ -58,6 +58,12 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+try:
+    import grpc  # type: ignore
+    _GRPC_AVAILABLE = True
+except ImportError:
+    _GRPC_AVAILABLE = False
+
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -140,11 +146,20 @@ def iter_merged_rows(
     start_date: str,
     end_date: str,
     extra_where: str | None = None,
+    secondary_extra_where: str | None = "SAME",  # sentinel: use same as primary
     resume_date: str | None = None,
 ):
     """
     Yield rows from primary RDS day-by-day, then fill gaps from secondary.
     Primary wins on duplicate IDs.
+
+    secondary_extra_where controls the filter applied to the secondary RDS:
+      "SAME" (default) — use the same extra_where as the primary
+      None             — query secondary with no extra filter (all rows)
+      any string       — use that SQL fragment on the secondary
+
+    Pass secondary_extra_where=None when the secondary schema lacks a column
+    referenced in extra_where (e.g. source_feed not present on old RDS).
 
     Yields: (row_dict, source_label)
     """
@@ -164,16 +179,19 @@ def iter_merged_rows(
     if secondary_conn is None:
         return
 
+    sec_where = extra_where if secondary_extra_where == "SAME" else secondary_extra_where
+
     logger.info(
-        "Primary complete ({} rows). Checking secondary RDS for gaps...",
+        "Primary complete ({} rows). Checking secondary RDS for gaps (filter: {})...",
         len(seen_ids),
+        repr(sec_where),
     )
     gap_count = 0
     for row in scroll_rds(
         secondary_conn, RDS_TABLE,
         start_date=start_date,
         end_date=end_date,
-        extra_where=extra_where,
+        extra_where=sec_where,
         resume_date=resume_date,
     ):
         if int(row["id"]) not in seen_ids:
@@ -421,11 +439,13 @@ def run(args: argparse.Namespace) -> None:
     start_time   = time.perf_counter()
     qdrant_batch : list = []
 
+    sec_extra_where = None if getattr(args, "no_secondary_extra_where", False) else "SAME"
     row_stream = iter_merged_rows(
         primary_conn, secondary_conn,
         start_date=args.start_date,
         end_date=args.end_date,
         extra_where=args.extra_where,
+        secondary_extra_where=sec_extra_where,
         resume_date=resume_date,
     )
 
@@ -616,16 +636,73 @@ def run(args: argparse.Namespace) -> None:
         pass
 
 
+_QDRANT_RETRY_DELAYS = [30, 60, 120, 240, 300]  # seconds between retries (5 attempts)
+
+
+def _is_qdrant_transient(exc: Exception) -> bool:
+    """Return True if the exception is a transient Qdrant gRPC error worth retrying.
+
+    Matches DEADLINE_EXCEEDED and UNAVAILABLE status codes — both indicate a
+    temporary cluster overload or shard healthcheck timeout rather than a
+    permanent data error.  Any other status code (e.g. INVALID_ARGUMENT) is
+    not retried.
+    """
+    if not _GRPC_AVAILABLE:
+        return False
+    if isinstance(exc, grpc.RpcError):
+        code = exc.code()
+        return code in (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE)
+    # grpc exceptions sometimes surface as plain RuntimeError wrapping RpcError;
+    # fall back to string matching so we still retry even without the grpc import.
+    msg = str(exc)
+    return "DEADLINE_EXCEEDED" in msg or "Healthcheck timeout" in msg or "UNAVAILABLE" in msg
+
+
 def _flush_qdrant(batch: list, qdrant, args: argparse.Namespace) -> None:
-    """Upsert a batch of points to Qdrant, skipping if dry-run."""
+    """Upsert a batch of points to Qdrant, with retry on transient errors.
+
+    Retries up to len(_QDRANT_RETRY_DELAYS) times on DEADLINE_EXCEEDED or
+    UNAVAILABLE.  Waits increase from 30s → 300s so that a Qdrant shard
+    healthcheck timeout (which caused all May 2025 workers to crash on
+    2026-04-17) does not abort the whole job — just pauses until the cluster
+    recovers.  Non-transient errors (bad data, auth, etc.) are raised
+    immediately without retrying.
+    """
     if args.dry_run:
         logger.info("[dry-run] Would upsert {} points to Qdrant", len(batch))
         return
-    try:
-        upsert_batch(qdrant, batch)
-    except Exception as e:
-        logger.error("Qdrant upsert failed: {}", e)
-        raise
+
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate([0] + _QDRANT_RETRY_DELAYS, start=1):
+        if delay:
+            logger.warning(
+                "Qdrant upsert attempt {}/{}: waiting {}s before retry…",
+                attempt, len(_QDRANT_RETRY_DELAYS) + 1, delay,
+            )
+            time.sleep(delay)
+        try:
+            upsert_batch(qdrant, batch)
+            if attempt > 1:
+                logger.info("Qdrant upsert succeeded on attempt {}", attempt)
+            return
+        except Exception as e:
+            last_exc = e
+            if _is_qdrant_transient(e):
+                logger.warning(
+                    "Qdrant transient error (attempt {}/{}): {}",
+                    attempt, len(_QDRANT_RETRY_DELAYS) + 1, e,
+                )
+                continue  # retry
+            # Non-transient — fail fast
+            logger.error("Qdrant upsert failed (non-transient): {}", e)
+            raise
+
+    # All retries exhausted
+    logger.error(
+        "Qdrant upsert failed after {} attempts. Last error: {}",
+        len(_QDRANT_RETRY_DELAYS) + 1, last_exc,
+    )
+    raise last_exc  # type: ignore[misc]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -651,6 +728,17 @@ def _parse_args(argv=None) -> argparse.Namespace:
         default=None,
         dest="extra_where",
         help='Optional extra SQL filter ANDed into every daily band query (e.g. "source_feed = \'EBAY\'")',
+    )
+    p.add_argument(
+        "--no-secondary-extra-where",
+        action="store_true",
+        dest="no_secondary_extra_where",
+        help=(
+            "Query the secondary RDS without any --extra-where filter. "
+            "Use when the secondary schema lacks a column referenced in --extra-where "
+            "(e.g. old RDS without source_feed). Gap rows from secondary are still "
+            "deduped against primary by ID before being yielded."
+        ),
     )
     # Kept for backward compat but ignored if --start-date/--end-date are supplied
     p.add_argument("--where", default=None, help=argparse.SUPPRESS)
