@@ -113,6 +113,15 @@ OS_HEADERS = {
 EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "cuda")
 WORKER_PORT      = int(os.environ.get("WORKER_PORT", 8081))
 
+# ── Metric head config ────────────────────────────────────────────────────────
+# When METRIC_HEAD_ENABLED=1, query vectors are projected through MetricHead
+# before Qdrant search, and the "image_v2" (128-dim) named vector is used.
+# When 0 (default), the raw CLIP "image" (768-dim) vector is used.
+# Rollback = set METRIC_HEAD_ENABLED=0, kill -HUP gunicorn master PID.
+METRIC_HEAD_ENABLED = os.environ.get("METRIC_HEAD_ENABLED", "0").strip() == "1"
+METRIC_HEAD_PATH    = os.environ.get("METRIC_HEAD_PATH", str(ROOT / "models" / "metric_head_v2.pt"))
+QDRANT_VECTOR_NAME  = "image_v2" if METRIC_HEAD_ENABLED else "image"
+
 # Batch encoding config — tune these for throughput vs latency trade-off
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", 8))
 BATCH_TIMEOUT_MS = float(os.environ.get("BATCH_TIMEOUT_MS", 20)) / 1000
@@ -124,6 +133,54 @@ app = Flask(__name__)
 # CLIP encoder — loaded once at startup, shared across requests
 _encoder      = None
 _encoder_lock = threading.Lock()
+
+# Metric head — loaded once at startup if METRIC_HEAD_ENABLED=1
+_metric_head      = None
+_metric_head_lock = threading.Lock()
+
+
+def get_metric_head():
+    """Return the MetricHead instance (lazy-loaded). Returns None if disabled."""
+    global _metric_head
+    if not METRIC_HEAD_ENABLED:
+        return None
+    if _metric_head is None:
+        with _metric_head_lock:
+            if _metric_head is None:
+                import torch
+                from src.embeddings.metric_head import MetricHead
+                logger.info("Loading MetricHead from {}...", METRIC_HEAD_PATH)
+                ckpt = torch.load(METRIC_HEAD_PATH, map_location=EMBEDDING_DEVICE,
+                                  weights_only=True)
+                head = MetricHead(
+                    input_dim  = ckpt.get("input_dim",  768),
+                    output_dim = ckpt.get("output_dim", 128),
+                )
+                head.load_state_dict(ckpt["state_dict"])
+                head.eval()
+                head = head.to(EMBEDDING_DEVICE)
+                _metric_head = head
+                logger.info("MetricHead ready: {}d → {}d (training R@10={:.3f})",
+                            ckpt.get("input_dim", 768), ckpt.get("output_dim", 128),
+                            ckpt.get("recall10", 0.0))
+    return _metric_head
+
+
+def project_clip_vector(clip_vec: "np.ndarray") -> "np.ndarray":
+    """
+    Project a raw CLIP vector through MetricHead if enabled.
+    Returns the original vector unchanged if metric head is disabled.
+    """
+    head = get_metric_head()
+    if head is None:
+        return clip_vec
+    import torch
+    import numpy as np
+    with torch.no_grad():
+        t   = torch.tensor(clip_vec, dtype=torch.float32,
+                           device=EMBEDDING_DEVICE).unsqueeze(0)
+        out = head(t).squeeze(0)
+    return out.cpu().numpy()
 
 
 def get_encoder():
@@ -280,7 +337,7 @@ def _qdrant_search_adaptive(
     def _search(threshold: float) -> list:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
-            query_vector=("image", vec.tolist()),
+            query_vector=(QDRANT_VECTOR_NAME, vec.tolist()),
             limit=_SEARCH_TARGET,
             score_threshold=round(threshold, 4),
             with_payload=True,
@@ -339,7 +396,7 @@ def _qdrant_search_adaptive(
     if not hits:
         hits = qdrant.search(
             collection_name=QDRANT_COLLECTION,
-            query_vector=("image", vec.tolist()),
+            query_vector=(QDRANT_VECTOR_NAME, vec.tolist()),
             limit=20,
             with_payload=True,
             search_params=params,
@@ -369,12 +426,14 @@ def health():
         points = f"error: {e}"
 
     return jsonify({
-        "status":          "ok",
-        "device":          EMBEDDING_DEVICE,
-        "embedding_dim":   encoder._embedding_dim(),
-        "qdrant":          "ok" if qdrant_ok else "error",
-        "qdrant_points":   points,
-        "opensearch":      OS_BASE or "(not configured)",
+        "status":           "ok",
+        "device":           EMBEDDING_DEVICE,
+        "embedding_dim":    encoder._embedding_dim(),
+        "metric_head":      "enabled" if METRIC_HEAD_ENABLED else "disabled",
+        "vector_field":     QDRANT_VECTOR_NAME,
+        "qdrant":           "ok" if qdrant_ok else "error",
+        "qdrant_points":    points,
+        "opensearch":       OS_BASE or "(not configured)",
     })
 
 
@@ -448,6 +507,7 @@ def search():
     except Exception as e:
         return jsonify({"error": f"Failed to encode image: {e}"}), 422
 
+    vec = project_clip_vector(vec)   # no-op if METRIC_HEAD_ENABLED=0
     encode_ms = int((time.perf_counter() - t0) * 1000)
     logger.info("Encoded {} in {}ms ({}-dim)", image_url[:60], encode_ms, len(vec))
 
@@ -617,6 +677,7 @@ def search_b64():
     except Exception as e:
         return jsonify({"error": f"Failed to encode image: {e}"}), 422
 
+    vec = project_clip_vector(vec)   # no-op if METRIC_HEAD_ENABLED=0
     encode_ms = int((time.perf_counter() - t0) * 1000)
     logger.info("B64 search: decoded {}px image in {}ms ({}-dim)", orig_size, encode_ms, len(vec))
 
@@ -706,6 +767,8 @@ def _start_services() -> None:
     logger.info("  OpenSearch:   {}", OS_BASE or "(not configured)")
     logger.info("  Batch size:   {}", BATCH_SIZE)
     logger.info("  Batch timeout: {}ms", int(BATCH_TIMEOUT_MS * 1000))
+    logger.info("  Metric head:  {} (vector='{}')",
+                "ENABLED" if METRIC_HEAD_ENABLED else "disabled", QDRANT_VECTOR_NAME)
     logger.info("─" * 60)
 
     # Start the batch encoding daemon before pre-loading CLIP
@@ -716,6 +779,11 @@ def _start_services() -> None:
     # Pre-load CLIP so the first request is not slow
     logger.info("Pre-loading CLIP ViT-L/14...")
     get_encoder()
+
+    # Pre-load MetricHead if enabled
+    if METRIC_HEAD_ENABLED:
+        get_metric_head()
+
     logger.info("GPU worker ready")
 
 

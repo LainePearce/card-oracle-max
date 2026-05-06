@@ -280,17 +280,18 @@ def recall_at_k(
 # ── Training loop ─────────────────────────────────────────────────────────────────
 
 def train_metric_head(
-    dataset_path:  str | Path,
-    epochs:        int    = 30,
-    batch_size:    int    = 512,
-    lr:            float  = 3e-4,
-    margin:        float  = 0.3,
-    dropout:       float  = 0.1,
-    val_fraction:  float  = 0.15,
-    eval_every:    int    = 5,
-    output_path:   Optional[str | Path] = None,
-    seed:          int    = 42,
-    epoch_sample:  Optional[int] = None,
+    dataset_path:    str | Path,
+    epochs:          int    = 30,
+    batch_size:      int    = 512,
+    lr:              float  = 3e-4,
+    margin:          float  = 0.3,
+    dropout:         float  = 0.1,
+    val_fraction:    float  = 0.15,
+    eval_every:      int    = 5,
+    output_path:     Optional[str | Path] = None,
+    seed:            int    = 42,
+    epoch_sample:    Optional[int] = None,
+    init_checkpoint: Optional[str | Path] = None,
 ) -> MetricHead:
     """
     Train the MetricHead on the extracted dataset.
@@ -306,10 +307,14 @@ def train_metric_head(
         eval_every:    Evaluate Recall@K every N epochs
         output_path:   Where to save the best checkpoint (default: models/metric_head_v1.pt)
         seed:          Random seed for reproducibility
-        epoch_sample:  If set, randomly sample this many training points per epoch.
-                       Useful for large datasets (>200k) to keep each epoch fast.
-                       e.g. epoch_sample=150_000 trains on a fresh 150k subset each epoch.
-                       None = use all training points every epoch.
+        epoch_sample:    If set, randomly sample this many training points per epoch.
+                         Useful for large datasets (>200k) to keep each epoch fast.
+                         e.g. epoch_sample=150_000 trains on a fresh 150k subset each epoch.
+                         None = use all training points every epoch.
+        init_checkpoint: Optional path to a saved checkpoint (.pt). If provided, the
+                         model is warm-started from that checkpoint's weights before
+                         training begins. Useful for fine-tuning the best checkpoint
+                         from a previous run with a lower learning rate.
 
     Returns:
         Best MetricHead (by Recall@10 on val set)
@@ -376,13 +381,22 @@ def train_metric_head(
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     logger.info("Training on {}", device)
 
-    model     = MetricHead(input_dim=vec_dim, output_dim=128, dropout=dropout).to(device)
+    model = MetricHead(input_dim=vec_dim, output_dim=128, dropout=dropout).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=epochs, eta_min=lr/10)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=epochs, eta_min=lr/20)
 
     best_recall10 = baseline[10]
     best_state    = None
     history       = []
+
+    # Warm-start: load weights AFTER best_recall10 is set so we correctly
+    # require the fine-tuned model to beat the checkpoint, not just the baseline.
+    if init_checkpoint is not None:
+        ckpt = torch.load(str(init_checkpoint), map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["state_dict"])
+        init_r10 = ckpt.get("recall10", baseline[10])
+        logger.info("Warm-started from {} (R@10={:.3f})", Path(init_checkpoint).name, init_r10)
+        best_recall10 = init_r10   # must beat the checkpoint to save a new one
 
     if epoch_sample:
         effective_n = min(epoch_sample, len(train_vecs))
@@ -564,6 +578,9 @@ def main() -> None:
                          "(e.g. 150000). None = use full training set each epoch.")
     ap.add_argument("--output",       default="models/metric_head_v1.pt",
                     help="Where to save the best checkpoint")
+    ap.add_argument("--init-checkpoint", default=None,
+                    help="Warm-start from this checkpoint before training "
+                         "(fine-tuning a previous best model)")
     args = ap.parse_args()
 
     try:
@@ -575,15 +592,16 @@ def main() -> None:
         pass
 
     train_metric_head(
-        dataset_path  = args.dataset,
-        epochs        = args.epochs,
-        batch_size    = args.batch_size,
-        lr            = args.lr,
-        margin        = args.margin,
-        dropout       = args.dropout,
-        eval_every    = args.eval_every,
-        output_path   = args.output,
-        epoch_sample  = args.epoch_sample,
+        dataset_path    = args.dataset,
+        epochs          = args.epochs,
+        batch_size      = args.batch_size,
+        lr              = args.lr,
+        margin          = args.margin,
+        dropout         = args.dropout,
+        eval_every      = args.eval_every,
+        output_path     = args.output,
+        epoch_sample    = args.epoch_sample,
+        init_checkpoint = args.init_checkpoint,
     )
 
 
