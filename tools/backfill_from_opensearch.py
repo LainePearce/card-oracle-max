@@ -72,7 +72,6 @@ from src.ingestion.opensearch_reader import (
     classify_index,
     get_opensearch_client,
     SCROLL_SOURCE_FIELDS,
-    SCROLL_TIMEOUT,
 )
 from src.ingestion.qdrant_writer import (
     build_point,
@@ -348,12 +347,12 @@ def _mark_failed(s3, job: dict, reason: str) -> None:
     logger.error("Failed job {}: {}", job["job_id"], reason)
 
 
-def _save_checkpoint(s3, job: dict, stats: dict, scroll_id: str | None) -> None:
+def _save_checkpoint(s3, job: dict, stats: dict, search_after: list | None) -> None:
     ckpt = {
-        "job_id":    job["job_id"],
-        "stats":     stats,
-        "scroll_id": scroll_id,
-        "saved_at":  datetime.now(timezone.utc).isoformat(),
+        "job_id":       job["job_id"],
+        "stats":        stats,
+        "search_after": search_after,
+        "saved_at":     datetime.now(timezone.utc).isoformat(),
     }
     s3.put_object(
         Bucket=S3_BUCKET,
@@ -383,11 +382,18 @@ def _stop_requested(s3) -> bool:
         return False
 
 
-# ── Per-job scroll query ──────────────────────────────────────────────────────
+# ── Per-job page query (search_after — no server-side cursor) ─────────────────
 
-def _build_scroll_query(job: dict) -> dict:
+def _build_page_query(job: dict, search_after: list | None = None) -> dict:
     """
-    Build an OpenSearch scroll query body for this job's time window.
+    Build an OpenSearch search body for this job's time window.
+
+    Uses search_after pagination instead of scroll so there is no server-side
+    cursor to expire.  Sort is [endTime asc, _id asc] — the secondary _id sort
+    guarantees a strict total order even when many docs share the same endTime.
+
+    search_after is the [endTime_value, _id_value] tuple from the last hit of
+    the previous page; omit (or pass None) for the first page.
     """
     ts_start = job.get("ts_start")
     ts_end   = job.get("ts_end")
@@ -401,11 +407,16 @@ def _build_scroll_query(job: dict) -> dict:
     else:
         query = {"range": {"endTime": {"gte": ts_start, "lt": ts_end}}}
 
-    return {
+    body: dict = {
         "query":   query,
         "_source": SCROLL_SOURCE_FIELDS,
-        "sort":    [{"endTime": "asc"}],   # deterministic ordering for resume
+        "sort":    [{"endTime": "asc"}, {"_id": "asc"}],
+        "size":    OS_PAGE_SIZE,
     }
+    if search_after is not None:
+        body["search_after"] = search_after
+
+    return body
 
 
 # ── Core job processor ────────────────────────────────────────────────────────
@@ -443,37 +454,24 @@ def process_job(
 
     # --- Resume from checkpoint if available ---
     ckpt = _load_checkpoint(s3, job["job_id"])
-    resume_scroll_id = None
+    resume_search_after: list | None = None
     if ckpt:
         logger.info("Resuming job {} from checkpoint (stats={})", job["job_id"], ckpt.get("stats"))
         stats = ckpt.get("stats", stats)
-        resume_scroll_id = ckpt.get("scroll_id")
+        resume_search_after = ckpt.get("search_after")
 
-    # ── Start (or resume) scroll ──────────────────────────────────────────────
-    query_body = _build_scroll_query(job)
-
+    # ── First page (search_after — no server-side cursor) ────────────────────
+    search_after = resume_search_after  # None on first page, list[sort_vals] on resume
     try:
-        if resume_scroll_id:
-            # Re-open scroll from checkpoint ID
-            # NOTE: scroll IDs expire; on timeout we restart from scratch
-            try:
-                scroll_resp = os_client.scroll(scroll_id=resume_scroll_id, scroll=SCROLL_TIMEOUT)
-            except Exception:
-                logger.warning("Checkpoint scroll_id expired for {} — restarting from scratch", job["job_id"])
-                resume_scroll_id = None
-
-        if not resume_scroll_id:
-            scroll_resp = os_client.search(
-                index=index_name,
-                scroll=SCROLL_TIMEOUT,
-                size=OS_PAGE_SIZE,
-                body=query_body,
-            )
+        page_resp = os_client.search(
+            index=index_name,
+            body=_build_page_query(job, search_after),
+            request_timeout=30,
+        )
     except Exception as exc:
-        raise RuntimeError(f"Failed to start scroll on {index_name}: {exc}") from exc
+        raise RuntimeError(f"Failed to start search on {index_name}: {exc}") from exc
 
-    scroll_id = scroll_resp["_scroll_id"]
-    hits      = scroll_resp["hits"]["hits"]
+    hits = page_resp["hits"]["hits"]
 
     # Accumulate points between S3 flushes
     pending_records:  list[VectorRecord] = []
@@ -483,237 +481,225 @@ def process_job(
 
     last_kill_check = time.time()
 
-    try:
-        while hits:
-            # ── Kill-switch check ─────────────────────────────────────────────
-            if time.time() - last_kill_check > KILL_CHECK_INTERVAL:
-                if _stop_requested(s3):
-                    logger.warning("STOP flag found in S3 — exiting cleanly")
-                    _save_checkpoint(s3, job, stats, scroll_id)
-                    raise SystemExit(0)
-                last_kill_check = time.time()
+    while hits:
+        # ── Kill-switch check ─────────────────────────────────────────────────
+        if time.time() - last_kill_check > KILL_CHECK_INTERVAL:
+            if _stop_requested(s3):
+                logger.warning("STOP flag found in S3 — exiting cleanly")
+                _save_checkpoint(s3, job, stats, search_after)
+                raise SystemExit(0)
+            last_kill_check = time.time()
 
-            # ── OpenSearch health ─────────────────────────────────────────────
-            if not _check_os_health(os_client):
+        # ── OpenSearch health ─────────────────────────────────────────────────
+        if not _check_os_health(os_client):
+            continue
+
+        # ── Collect IDs and URLs from this page ───────────────────────────────
+        page_docs: list[dict] = []  # [{os_id, qdrant_id, url, hit}]
+        for hit in hits:
+            src         = hit.get("_source", {})
+            raw_id      = src.get("id") or hit.get("_id")
+            gallery_url = src.get("galleryURL", "") or ""
+            if not raw_id:
                 continue
+            qdrant_id = os_id_to_qdrant_id(raw_id)
+            page_docs.append({
+                "os_id":     str(raw_id),
+                "qdrant_id": qdrant_id,
+                "url":       gallery_url.strip(),
+                "hit":       hit,
+            })
+        stats["scrolled"] += len(page_docs)
 
-            # ── Collect IDs and URLs from this page ───────────────────────────
-            page_docs: list[dict] = []  # [{os_id, qdrant_id, gallery_url, hit}]
-            for hit in hits:
-                src         = hit.get("_source", {})
-                raw_id      = src.get("id") or hit.get("_id")
-                gallery_url = src.get("galleryURL", "") or ""
-                if not raw_id:
-                    continue
-                qdrant_id   = os_id_to_qdrant_id(raw_id)
-                page_docs.append({
-                    "os_id":      str(raw_id),
-                    "qdrant_id":  qdrant_id,
-                    "url":        gallery_url.strip(),
-                    "hit":        hit,
-                })
-            stats["scrolled"] += len(page_docs)
+        # ── Batch-check Qdrant — which IDs are already present? ──────────────
+        all_qdrant_ids = [d["qdrant_id"] for d in page_docs]
+        found_ids: set = set()
+        for i in range(0, len(all_qdrant_ids), QDRANT_CHECK_BATCH):
+            batch_ids = all_qdrant_ids[i:i + QDRANT_CHECK_BATCH]
+            try:
+                records = qdrant.retrieve(
+                    collection_name=COLLECTION_NAME,
+                    ids=batch_ids,
+                    with_vectors=False,
+                    with_payload=False,
+                )
+                found_ids.update(r.id for r in records)
+            except Exception as exc:
+                logger.warning("Qdrant retrieve failed (batch {}): {}", i, exc)
+            time.sleep(QDRANT_CHECK_PAUSE)
 
-            # ── Batch-check Qdrant — which IDs are already present? ───────────
-            all_qdrant_ids = [d["qdrant_id"] for d in page_docs]
-            found_ids: set = set()
-            for i in range(0, len(all_qdrant_ids), QDRANT_CHECK_BATCH):
-                batch_ids = all_qdrant_ids[i:i + QDRANT_CHECK_BATCH]
-                try:
-                    records = qdrant.retrieve(
-                        collection_name=COLLECTION_NAME,
-                        ids=batch_ids,
-                        with_vectors=False,
-                        with_payload=False,
-                    )
-                    found_ids.update(r.id for r in records)
-                except Exception as exc:
-                    logger.warning("Qdrant retrieve failed (batch {}): {}", i, exc)
-                time.sleep(QDRANT_CHECK_PAUSE)
+        missing_docs = [d for d in page_docs if d["qdrant_id"] not in found_ids]
+        stats["already_in_qdrant"] += len(page_docs) - len(missing_docs)
+        stats["missing"] += len(missing_docs)
 
-            missing_docs = [d for d in page_docs if d["qdrant_id"] not in found_ids]
-            stats["already_in_qdrant"] += len(page_docs) - len(missing_docs)
-            stats["missing"] += len(missing_docs)
+        if missing_docs and not dry_run:
+            # ── Fetch images for missing docs ─────────────────────────────────
+            url_map = {d["os_id"]: d["url"] for d in missing_docs if d["url"]}
+            fetched: dict[str, bytes] = asyncio.run(fetch_images_async(url_map))
+            stats["images_fetched"] += len(fetched)
+            stats["images_failed"]  += len(url_map) - len(fetched)
 
-            if missing_docs and not dry_run:
-                # ── Fetch images for missing docs ─────────────────────────────
-                url_map = {
-                    d["os_id"]: d["url"]
-                    for d in missing_docs
-                    if d["url"]
-                }
-                fetched: dict[str, bytes] = asyncio.run(fetch_images_async(url_map))
-                stats["images_fetched"] += len(fetched)
-                stats["images_failed"]  += len(url_map) - len(fetched)
+            if fetched:
+                # ── Convert bytes → PIL → CLIP encode (batched) ───────────────
+                from PIL import Image
+                import io
 
-                if fetched:
-                    # ── Convert bytes → PIL → CLIP encode (batched) ───────────
-                    from PIL import Image
-                    import io
+                os_ids_ordered: list[str] = []
+                pil_images: list = []
+                for oid, img_bytes in fetched.items():
+                    try:
+                        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                        os_ids_ordered.append(oid)
+                        pil_images.append(pil_img)
+                    except Exception as exc:
+                        logger.debug("PIL open failed for {}: {}", oid, exc)
+                        stats["images_failed"] += 1
 
-                    os_ids_ordered: list[str] = []
-                    pil_images: list = []
-                    for oid, img_bytes in fetched.items():
+                image_vecs = None
+                if pil_images:
+                    ENCODE_BATCH = 256
+                    all_vecs = []
+                    for b_start in range(0, len(pil_images), ENCODE_BATCH):
+                        b_imgs = pil_images[b_start:b_start + ENCODE_BATCH]
                         try:
-                            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                            os_ids_ordered.append(oid)
-                            pil_images.append(pil_img)
+                            all_vecs.append(image_encoder.encode_batch_pil(b_imgs))
                         except Exception as exc:
-                            logger.debug("PIL open failed for {}: {}", oid, exc)
-                            stats["images_failed"] += 1
+                            logger.error("CLIP encode failed on batch {}: {}", b_start, exc)
+                            stats["errors"] += 1
+                            for _ in b_imgs:
+                                all_vecs.append(None)
+                    image_vecs = all_vecs
 
-                    image_vecs: np.ndarray | None = None
-                    if pil_images:
-                        # Encode in sub-batches of 256 to stay within GPU memory
-                        ENCODE_BATCH = 256
-                        all_vecs = []
-                        for b_start in range(0, len(pil_images), ENCODE_BATCH):
-                            b_imgs = pil_images[b_start:b_start + ENCODE_BATCH]
-                            try:
-                                all_vecs.append(image_encoder.encode_batch_pil(b_imgs))
-                            except Exception as exc:
-                                logger.error("CLIP encode failed on batch {}: {}", b_start, exc)
-                                stats["errors"] += 1
-                                # Fill with None-placeholders so zip stays aligned
-                                for _ in b_imgs:
-                                    all_vecs.append(None)
-                        # Merge or keep as list for indexed access
-                        image_vecs = all_vecs  # list of arrays or Nones, one per sub-batch
+                if image_vecs is not None:
+                    doc_lookup = {d["os_id"]: d for d in missing_docs}
 
-                    if image_vecs is not None:
-                        # Build a lookup from os_id → {hit, qdrant_id}
-                        doc_lookup = {d["os_id"]: d for d in missing_docs}
+                    flat_vecs: list[np.ndarray | None] = []
+                    for v in image_vecs:
+                        if v is None:
+                            flat_vecs.append(None)
+                        elif v.ndim == 1:
+                            flat_vecs.append(v)
+                        else:
+                            for row in v:
+                                flat_vecs.append(row)
 
-                        # Flatten sub-batch arrays back to per-image vectors
-                        flat_vecs: list[np.ndarray | None] = []
-                        for v in image_vecs:
-                            if v is None:
-                                flat_vecs.append(None)
-                            elif v.ndim == 1:
-                                flat_vecs.append(v)
-                            else:
-                                for row in v:
-                                    flat_vecs.append(row)
+                    for i, os_id_str in enumerate(os_ids_ordered):
+                        if i >= len(flat_vecs) or flat_vecs[i] is None:
+                            continue
+                        ivec = flat_vecs[i]
 
-                        for i, os_id_str in enumerate(os_ids_ordered):
-                            if i >= len(flat_vecs) or flat_vecs[i] is None:
-                                continue
-                            ivec = flat_vecs[i]
+                        doc = doc_lookup[os_id_str]
+                        hit = doc["hit"]
+                        src = hit.get("_source", {})
 
-                            doc   = doc_lookup[os_id_str]
-                            hit   = doc["hit"]
-                            src   = hit.get("_source", {})
+                        # ── Text (specifics) vector for eBay only ─────────────
+                        tvec = None
+                        if text_encoder and classification["has_item_specifics"]:
+                            specs_text = format_specifics(src.get("itemSpecifics") or {})
+                            if specs_text:
+                                try:
+                                    tvec = text_encoder.encode(specs_text)
+                                except Exception:
+                                    pass
 
-                            # ── Text (specifics) vector for eBay only ─────────
-                            tvec = None
-                            if text_encoder and classification["has_item_specifics"]:
-                                specs_text = format_specifics(
-                                    src.get("itemSpecifics") or {}
-                                )
-                                if specs_text:
-                                    try:
-                                        tvec = text_encoder.encode(specs_text)
-                                    except Exception:
-                                        pass
+                        # ── Build payload ─────────────────────────────────────
+                        payload = extract_payload(
+                            src,
+                            doc_id=os_id_str,
+                            specifics_source=(
+                                "ebay" if classification["has_item_specifics"] else "none"
+                            ),
+                        )
 
-                            # ── Build payload (pass _source dict + doc_id) ────
-                            payload = extract_payload(
-                                src,   # _source dict, not full hit
-                                doc_id=os_id_str,
-                                specifics_source=(
-                                    "ebay" if classification["has_item_specifics"]
-                                    else "none"
-                                ),
-                            )
+                        # ── VectorRecords for S3 ──────────────────────────────
+                        index_type = classification["index_type"]
+                        partition  = (
+                            index_name if index_type == "ebay-dated"
+                            else index_name[:7]
+                        )
 
-                            # ── VectorRecords for S3 ──────────────────────────
-                            index_type = classification["index_type"]
-                            partition  = (
-                                index_name if index_type == "ebay-dated"
-                                else index_name[:7]  # YYYY-MM for monthly indices
-                            )
+                        img_record = VectorRecord(
+                            os_id=os_id_str,
+                            qdrant_id=str(doc["qdrant_id"]),
+                            index_name=index_name,
+                            index_type=index_type,
+                            vector=ivec.tolist(),
+                            vector_type="image",
+                            model_id=IMAGE_MODEL_ID,
+                            params_hash=IMAGE_PARAMS,
+                            source_url=doc["url"],
+                            specifics_src=(
+                                "ebay" if classification["has_item_specifics"] else "none"
+                            ),
+                        )
+                        pending_records.append(img_record)
 
-                            img_record = VectorRecord(
+                        if tvec is not None:
+                            txt_record = VectorRecord(
                                 os_id=os_id_str,
                                 qdrant_id=str(doc["qdrant_id"]),
                                 index_name=index_name,
                                 index_type=index_type,
-                                vector=ivec.tolist(),
-                                vector_type="image",
-                                model_id=IMAGE_MODEL_ID,
-                                params_hash=IMAGE_PARAMS,
-                                source_url=doc["url"],
-                                specifics_src=(
-                                    "ebay" if classification["has_item_specifics"]
-                                    else "none"
-                                ),
+                                vector=tvec.tolist(),
+                                vector_type="specifics",
+                                model_id=TEXT_MODEL_ID,
+                                params_hash=TEXT_PARAMS,
+                                source_url="",
+                                specifics_src="ebay",
                             )
-                            pending_records.append(img_record)
+                            pending_text_recs.append(txt_record)
 
-                            if tvec is not None:
-                                txt_record = VectorRecord(
-                                    os_id=os_id_str,
-                                    qdrant_id=str(doc["qdrant_id"]),
-                                    index_name=index_name,
-                                    index_type=index_type,
-                                    vector=tvec.tolist(),
-                                    vector_type="specifics",
-                                    model_id=TEXT_MODEL_ID,
-                                    params_hash=TEXT_PARAMS,
-                                    source_url="",
-                                    specifics_src="ebay",
-                                )
-                                pending_text_recs.append(txt_record)
+                        # ── Build Qdrant point ────────────────────────────────
+                        point = build_point(
+                            qdrant_id=doc["qdrant_id"],
+                            payload=payload,
+                            image_vec=ivec,
+                            specifics_vec=tvec,
+                        )
+                        if point:
+                            pending_points.append(point)
 
-                            # ── Build Qdrant point ────────────────────────────
-                            point = build_point(
-                                qdrant_id=doc["qdrant_id"],
-                                payload=payload,
-                                image_vec=ivec,
-                                specifics_vec=tvec,
-                            )
-                            if point:
-                                pending_points.append(point)
+            # ── Flush when shard is full ──────────────────────────────────────
+            if len(pending_points) >= SHARD_FLUSH_SIZE:
+                _flush(
+                    s3, qdrant, vector_store,
+                    pending_records, pending_text_recs, pending_points,
+                    shard_num, stats, dry_run,
+                )
+                shard_num += 1
+                pending_records.clear()
+                pending_text_recs.clear()
+                pending_points.clear()
+                if hits:
+                    search_after = hits[-1].get("sort")
+                _save_checkpoint(s3, job, stats, search_after)
 
-                # ── Flush when shard is full ──────────────────────────────────
-                if len(pending_points) >= SHARD_FLUSH_SIZE:
-                    _flush(
-                        s3, qdrant, vector_store,
-                        pending_records, pending_text_recs, pending_points,
-                        shard_num, stats, dry_run,
-                    )
-                    shard_num += 1
-                    pending_records.clear()
-                    pending_text_recs.clear()
-                    pending_points.clear()
-                    _save_checkpoint(s3, job, stats, scroll_id)
+        # ── Advance search_after to last hit on this page ─────────────────────
+        if hits:
+            search_after = hits[-1].get("sort")
 
-            # ── OS inter-page pause ───────────────────────────────────────────
-            _os_pause()
+        # ── OS inter-page pause ───────────────────────────────────────────────
+        _os_pause()
 
-            # ── Next scroll page ──────────────────────────────────────────────
-            try:
-                scroll_resp = os_client.scroll(scroll_id=scroll_id, scroll=SCROLL_TIMEOUT)
-                scroll_id   = scroll_resp["_scroll_id"]
-                hits        = scroll_resp["hits"]["hits"]
-            except Exception as exc:
-                logger.error("Scroll continuation failed for {}: {}", index_name, exc)
-                break
-
-        # ── Final flush ───────────────────────────────────────────────────────
-        if pending_points and not dry_run:
-            _flush(
-                s3, qdrant, vector_store,
-                pending_records, pending_text_recs, pending_points,
-                shard_num, stats, dry_run,
-            )
-
-    finally:
-        # Always clear the scroll cursor
+        # ── Next page (stateless — no cursor expiry) ──────────────────────────
         try:
-            os_client.clear_scroll(scroll_id=scroll_id)
-        except Exception:
-            pass
+            page_resp = os_client.search(
+                index=index_name,
+                body=_build_page_query(job, search_after),
+                request_timeout=30,
+            )
+            hits = page_resp["hits"]["hits"]
+        except Exception as exc:
+            logger.error("Page fetch failed for {}: {}", index_name, exc)
+            break
+
+    # ── Final flush ───────────────────────────────────────────────────────────
+    if pending_points and not dry_run:
+        _flush(
+            s3, qdrant, vector_store,
+            pending_records, pending_text_recs, pending_points,
+            shard_num, stats, dry_run,
+        )
 
     return stats
 
