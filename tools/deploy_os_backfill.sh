@@ -18,18 +18,18 @@ set -euo pipefail
 
 KEY=~/.ssh/qdrant-test.pem
 WORKERS=(
-  "54.176.253.45"    # worker-0
-  "204.236.180.247"  # worker-1
-  "54.219.84.133"    # worker-2
-  "13.56.115.249"    # worker-3
-  "13.56.212.61"     # worker-4
-  "13.57.218.120"    # worker-5
-  "54.176.134.82"    # worker-6
-  "13.56.151.99"     # worker-7
-  "18.144.47.150"    # worker-8
-  "3.101.102.118"    # worker-9
-  "184.72.25.240"    # worker-10
-  "13.56.139.224"    # worker-11
+  "54.215.57.135"    # worker-0
+  "52.53.33.218"     # worker-1
+  "3.101.66.241"     # worker-2
+  "13.57.215.67"     # worker-3
+  "18.145.69.81"     # worker-4
+  "18.145.116.26"    # worker-5
+  "54.153.95.19"     # worker-6
+  "50.18.237.248"    # worker-7
+  "13.57.176.92"     # worker-8
+  "54.219.76.40"     # worker-9
+  "13.56.140.67"     # worker-10
+  "54.176.9.174"     # worker-11
 )
 REMOTE_DIR="/home/ec2-user/card-oracle-max"
 
