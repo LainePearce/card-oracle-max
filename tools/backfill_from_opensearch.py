@@ -107,8 +107,8 @@ QDRANT_CHECK_BATCH  = 500   # IDs per retrieve call
 QDRANT_CHECK_PAUSE  = 0.10  # seconds between retrieve batches
 QDRANT_UPSERT_BATCH = 100   # points per upsert
 QDRANT_UPSERT_PAUSE = 0.50  # seconds between upsert batches (doubled at peak)
-QDRANT_LATENCY_WARN = 0.200 # p99 latency threshold — pause upserts if exceeded (seconds)
-QDRANT_LATENCY_PAUSE= 300   # pause duration when latency threshold exceeded (seconds)
+QDRANT_LATENCY_WARN = 5.0   # count() threshold — fires only if cluster is genuinely stressed
+QDRANT_LATENCY_PAUSE= 60    # pause duration when threshold exceeded (seconds)
 
 # Image fetching
 IMAGE_CONCURRENCY   = 16
