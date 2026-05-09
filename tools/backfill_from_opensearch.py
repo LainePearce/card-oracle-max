@@ -266,19 +266,26 @@ def _check_os_health(os_client) -> bool:
 
 def _claim_next_job(s3, worker_id: int) -> dict | None:
     """
-    Scan the S3 queue for the highest-priority unclaimed job matching
-    this worker_id. Claim it atomically by copying to active/ then
-    deleting from queue/.
-    Returns the job dict, or None if queue is empty for this worker.
+    Scan the S3 queue for the highest-priority unclaimed job and claim it.
+
+    Workers claim from the full pool (no filtering by worker_id) so that
+    any number of worker processes can drain the queue in parallel.  Each
+    worker adds a small random jitter before claiming to reduce the chance
+    of two workers racing on the same job.  If a race does occur, the
+    worst outcome is duplicate work — Qdrant upserts and S3 parquet writes
+    are both idempotent so no data corruption results.
+
+    Returns the job dict, or None if the queue is empty.
     """
-    # List all queued jobs for this worker
+    import random
+
     prefix = f"{S3_QUEUE_PREFIX}/"
     candidates = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            if not key.endswith(f"-w{worker_id}.json"):
+            if not key.endswith(".json"):
                 continue
             try:
                 body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
@@ -290,8 +297,17 @@ def _claim_next_job(s3, worker_id: int) -> dict | None:
     if not candidates:
         return None
 
-    # Pick lowest priority number (highest urgency)
+    # Pick lowest priority number (highest urgency).
+    # Secondary sort by key name so workers with different orderings still
+    # converge toward the same job — minimising unintentional duplicate work.
     candidates.sort(key=lambda x: (x[0], x[1]))
+
+    # Jitter: spread workers so they don't all race on the same top job.
+    # Worker with higher id waits slightly longer → natural de-collision.
+    jitter = random.uniform(0, min(worker_id * 0.1, 1.0))
+    if jitter > 0:
+        time.sleep(jitter)
+
     _, queue_key, job = candidates[0]
 
     # Claim: copy to active, delete from queue
@@ -310,8 +326,9 @@ def _claim_next_job(s3, worker_id: int) -> dict | None:
         logger.error("Failed to claim job {}: {}", job["job_id"], exc)
         return None
 
-    logger.info("Claimed job {} (priority={}, ~{:,} docs)",
-                job["job_id"], job.get("priority"), job.get("doc_count_estimate", 0))
+    logger.info("Claimed job {} (priority={}, ~{:,} docs, worker={})",
+                job["job_id"], job.get("priority"), job.get("doc_count_estimate", 0),
+                worker_id)
     return job
 
 
@@ -745,6 +762,80 @@ def _flush(
         _qdrant_upsert_pause()
 
 
+# ── Orphan rescue ─────────────────────────────────────────────────────────────
+
+def _rescue_orphaned_jobs(s3) -> None:
+    """
+    On worker startup: scan active/ for jobs whose worker process is
+    no longer alive (i.e. the checkpoint has not been updated for
+    ORPHAN_THRESHOLD_MINUTES).  Move them back to queue/ so any live
+    worker can re-claim them.
+
+    Workers load checkpoints (which store search_after) when they resume
+    a job, so progress is not lost — only the final shard is re-processed.
+    """
+    ORPHAN_THRESHOLD_MINUTES = 90   # job is declared dead after 90 min without a checkpoint update
+
+    now = datetime.now(timezone.utc)
+    rescued = 0
+
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{S3_ACTIVE_PREFIX}/"):
+        for obj in page.get("Contents", []):
+            active_key = obj["Key"]
+            job_id = active_key.split("/")[-1].replace(".json", "")
+
+            # Load checkpoint to find last activity timestamp
+            ckpt_key = f"{S3_CKPT_PREFIX}/{job_id}.json"
+            stale = False
+            try:
+                ckpt_body = s3.get_object(Bucket=S3_BUCKET, Key=ckpt_key)["Body"].read()
+                ckpt = json.loads(ckpt_body)
+                saved_at_str = ckpt.get("saved_at", "")
+                if saved_at_str:
+                    saved_at = datetime.fromisoformat(saved_at_str)
+                    age_minutes = (now - saved_at).total_seconds() / 60
+                    stale = age_minutes > ORPHAN_THRESHOLD_MINUTES
+                else:
+                    stale = True   # no timestamp in checkpoint → treat as stale
+            except Exception:
+                # No checkpoint at all — check how long the job has been active
+                try:
+                    active_body = s3.get_object(Bucket=S3_BUCKET, Key=active_key)["Body"].read()
+                    active_job = json.loads(active_body)
+                    claimed_str = active_job.get("claimed_at", "")
+                    if claimed_str:
+                        claimed_at = datetime.fromisoformat(claimed_str)
+                        age_minutes = (now - claimed_at).total_seconds() / 60
+                        stale = age_minutes > ORPHAN_THRESHOLD_MINUTES
+                    else:
+                        stale = True
+                except Exception:
+                    stale = True   # can't read active file → assume stale
+
+            if not stale:
+                continue
+
+            # Move back to queue
+            try:
+                active_body = s3.get_object(Bucket=S3_BUCKET, Key=active_key)["Body"].read()
+                queue_key = f"{S3_QUEUE_PREFIX}/{job_id}.json"
+                s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=queue_key,
+                    Body=active_body,
+                    ContentType="application/json",
+                )
+                s3.delete_object(Bucket=S3_BUCKET, Key=active_key)
+                logger.info("Rescued orphaned job {} → queue", job_id)
+                rescued += 1
+            except Exception as exc:
+                logger.warning("Could not rescue orphaned job {}: {}", job_id, exc)
+
+    if rescued:
+        logger.info("Rescued {} orphaned job(s) on startup", rescued)
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -786,6 +877,9 @@ def main() -> None:
         logger.warning("TextEncoder failed to load — specifics vectors disabled: {}", exc)
         text_encoder = None
 
+    # ── Rescue orphaned jobs from previous crashed workers ────────────────────
+    _rescue_orphaned_jobs(s3)
+
     # ── Job loop ──────────────────────────────────────────────────────────────
     idle_polls = 0
     while True:
@@ -797,7 +891,7 @@ def main() -> None:
         if job is None:
             idle_polls += 1
             wait = min(30 * idle_polls, 300)
-            logger.info("No jobs in queue for worker {} — waiting {}s...", worker_id, wait)
+            logger.info("Queue empty — worker {} waiting {}s...", worker_id, wait)
             time.sleep(wait)
             continue
 
