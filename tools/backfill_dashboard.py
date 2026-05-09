@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Backfill Dashboard Server
-=========================
-Polls all 12 GPU workers via SSH and S3 checkpoints every 60 seconds,
+Backfill Dashboard Server (v2 — S3 job-queue system)
+=====================================================
+Polls S3 job queues and all 12 EC2 workers via SSH every 60 seconds,
 then serves a live status page at http://localhost:8080
 
+New system layout (S3 bucket: card-oracle-vectors):
+  backfill-v2/queue/{job_id}.json    — pending jobs
+  backfill-v2/active/{job_id}.json   — currently running jobs
+  backfill-v2/complete/{job_id}.json — finished jobs (with stats field)
+  backfill-v2/failed/{job_id}.json   — failed jobs
+  backfill-v2/checkpoints/{job_id}.json — per-job progress checkpoints
+
 Usage:
-    python tools/backfill_dashboard.py [--port 8080]
+    python tools/backfill_dashboard.py [--port 8080] [--once]
 
 Requires:
     ~/.ssh/qdrant-test.pem  (SSH key for EC2 workers)
-    .env with S3_VECTOR_BUCKET + AWS credentials
+    AWS credentials with S3 read access to card-oracle-vectors
 """
 from __future__ import annotations
 
@@ -22,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -96,7 +104,7 @@ def _detect_private_ip() -> str | None:
     except Exception:
         return None
 
-_MY_PRIVATE_IP = _detect_private_ip()
+_MY_PRIVATE_IP  = _detect_private_ip()
 _USE_PRIVATE_IPS = _MY_PRIVATE_IP in WORKER_PRIVATE_IPS
 
 # Resolved SSH targets — private IPs when on EC2, public IPs otherwise
@@ -104,495 +112,234 @@ SSH_TARGETS = WORKER_PRIVATE_IPS if _USE_PRIVATE_IPS else WORKER_IPS
 
 N_WORKERS = len(WORKER_IPS)
 
-PHASES: list[tuple[date, date, str]] = [
-    (date(2026, 3, 15), date(2026, 4, 8),  "2026 Mar–Apr (priority)"),
-    (date(2026, 1, 1),  date(2026, 3, 15), "2026 Jan–Mar"),
-    (date(2025, 10, 1), date(2026, 1, 1),  "2025 Q4"),
-    (date(2025, 7, 1),  date(2025, 10, 1), "2025 Q3"),
-    (date(2025, 4, 1),  date(2025, 7, 1),  "2025 Q2"),
-    (date(2025, 1, 1),  date(2025, 4, 1),  "2025 Q1"),
-]
-
-SSH_KEY   = os.path.expanduser("~/.ssh/qdrant-test.pem")
-S3_BUCKET = os.environ.get("S3_VECTOR_BUCKET", "")
-S3_CHECKPOINT_PREFIX = os.environ.get("S3_CHECKPOINT_PREFIX", "checkpoints")
+SSH_KEY       = os.path.expanduser("~/.ssh/qdrant-test.pem")
+S3_BUCKET     = "card-oracle-vectors"
+S3_JOB_PREFIX = "backfill-v2"
 POLL_INTERVAL = 60  # seconds
 
+# Priority band definitions (open-closed: [start, end))
+# P1: "2025-10-01" ≤ index ≤ "2026-02-28"
+# P2: "2025-08-01" ≤ index ≤ "2025-09-30"
+# P3: "2024-12-01" ≤ index ≤ "2024-12-31"
+# P4: all other eBay dated indices
+# P5: non-eBay indices (end in -gold, -pris, -heritage, -pwcc, -ms)
+PRIORITY_BANDS: list[dict] = [
+    {"p": 1, "label": "P1 — Oct 2025–Feb 2026", "start": "2025-10-01", "end": "2026-03-01"},
+    {"p": 2, "label": "P2 — Aug–Sep 2025",       "start": "2025-08-01", "end": "2025-10-01"},
+    {"p": 3, "label": "P3 — Dec 2024",            "start": "2024-12-01", "end": "2025-01-01"},
+    {"p": 4, "label": "P4 — Other eBay dated",    "start": None,         "end": None},
+    {"p": 5, "label": "P5 — Non-eBay markets",    "start": None,         "end": None},
+]
 
-# ── Date range helpers ─────────────────────────────────────────────────────────
+NON_EBAY_SUFFIXES = ("-gold", "-pris", "-heritage", "-pwcc", "-ms")
 
-def split_range(start: date, end: date, n: int) -> list[tuple[date, date]]:
-    """Mirror of worker_phases.py split_range — identical split logic."""
-    total = (end - start).days
-    base  = total // n
-    extra = total % n
-    ranges: list[tuple[date, date]] = []
-    cur = start
-    for i in range(n):
-        days = base + (1 if i < extra else 0)
-        nxt  = cur + timedelta(days=days)
-        ranges.append((cur, min(nxt, end)))
-        cur = nxt
-    return ranges
-
-
-def build_worker_phase_map() -> dict[tuple[int, int], tuple[date, date]]:
-    """
-    Returns {(worker_idx, phase_num): (slice_start, slice_end)} for all
-    worker × phase combinations.
-    NOTE: phase_num is 1-indexed (matches worker_phases.py enumerate(PHASES, 1)).
-    """
-    mapping: dict[tuple[int, int], tuple[date, date]] = {}
-    for phase_num, (p_start, p_end, _label) in enumerate(PHASES, 1):  # 1-indexed
-        slices = split_range(p_start, p_end, N_WORKERS)
-        for w_idx, (s, e) in enumerate(slices):
-            mapping[(w_idx, phase_num)] = (s, e)
-    return mapping
+# Calendar coverage: eBay dated indices from Jan 2024 to present
+CALENDAR_START = date(2024, 1, 1)
 
 
-WORKER_PHASE_MAP = build_worker_phase_map()
-PHASE_NUMS = list(range(1, len(PHASES) + 1))  # [1, 2, 3, 4, 5, 6]
+# ── Priority classifier ────────────────────────────────────────────────────────
 
-# ── Cleanup task definitions (generated identically to worker_cleanup.py) ───────
-# Monthly windows newest-first, each split evenly across N_WORKERS.
-# All 12 workers work the same month simultaneously before advancing backwards.
-
-_BACKFILL_START = date(2025, 1, 1)
-_BACKFILL_END   = date(2026, 4, 8)
-
-
-def _cleanup_monthly_windows() -> list[tuple[date, date]]:
-    windows: list[tuple[date, date]] = []
-    cur_end = _BACKFILL_END
-    while cur_end > _BACKFILL_START:
-        last_day = cur_end - timedelta(days=1)
-        month_start = date(last_day.year, last_day.month, 1)
-        win_start = max(_BACKFILL_START, month_start)
-        windows.append((win_start, cur_end))
-        cur_end = month_start
-    return windows
+def classify_priority(job_id: str) -> int:
+    """Return 1–5 for a job_id based on priority band rules."""
+    # Strip window suffix (e.g. "2025-10-03-w1" → "2025-10-03")
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})', job_id)
+    if not m:
+        # Non-eBay: job_id ends in a non-eBay suffix or has no date prefix
+        return 5
+    index_date = m.group(1)
+    for band in PRIORITY_BANDS[:3]:  # P1-P3 have explicit ranges
+        if band["start"] <= index_date < band["end"]:
+            return band["p"]
+    return 4  # P4 — other eBay dated
 
 
-def _cleanup_split_range(start: date, end: date, n: int) -> list[tuple[date, date]]:
-    total = (end - start).days
-    base  = total // n
-    extra = total % n
-    slices: list[tuple[date, date]] = []
-    cur = start
-    for i in range(n):
-        days = base + (1 if i < extra else 0)
-        nxt  = cur + timedelta(days=days)
-        slices.append((cur, min(nxt, end)))
-        cur = nxt
-    return slices
+def is_non_ebay_job(job_id: str) -> bool:
+    return not re.match(r'^\d{4}-\d{2}-\d{2}', job_id)
 
 
-def _build_cleanup_tasks() -> list[tuple[date, date, str]]:
-    tasks: list[tuple[date, date, str]] = []
-    for win_start, win_end in _cleanup_monthly_windows():
-        month_tag = win_start.strftime("%Y%m")
-        slices = _cleanup_split_range(win_start, win_end, N_WORKERS)
-        for w_idx, (s, e) in enumerate(slices):
-            if (e - s).days == 0:
-                continue   # skip zero-day slices (month shorter than N_WORKERS)
-            tasks.append((s, e, f"m{month_tag}w{w_idx}"))
-    return tasks
+# ── S3 polling (direct boto3 — no SSH proxy) ───────────────────────────────────
+
+def _s3_client():
+    return boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-west-1"))
 
 
-CLEANUP_TASKS = _build_cleanup_tasks()
-
-# Pre-build a lookup: for any date, which cleanup task covers it?
-_CLEANUP_DATE_MAP: dict[date, str] = {}
-for _cs, _ce, _cid in CLEANUP_TASKS:
-    _d = _cs
-    while _d < _ce:
-        _CLEANUP_DATE_MAP[_d] = _cid
-        _d += timedelta(days=1)
-
-
-# ── Non-eBay task definitions (mirrors worker_nonebay.py) ─────────────────────
-# Workers 6–11 run these tasks. Checkpoint IDs use nonebay-m{YYYYMM}w{N} prefix
-# so they never collide with the eBay cleanup tasks above.
-
-_NONEBAY_START        = date(2025, 1, 1)
-_NONEBAY_END          = date.today() + timedelta(days=1)  # dynamic — includes today
-_NONEBAY_N_WORKERS    = 6   # workers 6–11 (local indices 0–5)
-_NONEBAY_FIRST_WORKER = 6   # global index offset
-
-
-def _nonebay_monthly_windows() -> list[tuple[date, date]]:
-    windows: list[tuple[date, date]] = []
-    cur_end = _NONEBAY_END
-    while cur_end > _NONEBAY_START:
-        last_day = cur_end - timedelta(days=1)
-        month_start = date(last_day.year, last_day.month, 1)
-        win_start = max(_NONEBAY_START, month_start)
-        windows.append((win_start, cur_end))
-        cur_end = month_start
-    return windows
-
-
-def _build_nonebay_tasks() -> list[tuple[date, date, str]]:
-    tasks: list[tuple[date, date, str]] = []
-    for win_start, win_end in _nonebay_monthly_windows():
-        month_tag = win_start.strftime("%Y%m")
-        slices = _cleanup_split_range(win_start, win_end, _NONEBAY_N_WORKERS)
-        for w_idx, (s, e) in enumerate(slices):
-            if (e - s).days == 0:
-                continue
-            tasks.append((s, e, f"nonebay-m{month_tag}w{w_idx}"))
-    return tasks
-
-
-NONEBAY_TASKS = _build_nonebay_tasks()
-
-# Pre-build a lookup: for any date, which non-eBay task covers it?
-_NONEBAY_DATE_MAP: dict[date, str] = {}
-for _ns, _ne, _ncid in NONEBAY_TASKS:
-    _d = _ns
-    while _d < _ne:
-        _NONEBAY_DATE_MAP[_d] = _ncid
-        _d += timedelta(days=1)
-
-
-# ── S3 helpers ────────────────────────────────────────────────────────────────
-# When running on an EC2 instance with an IAM role (e.g. on worker-0 itself)
-# boto3 has direct credentials — no SSH proxy needed.
-# When running locally without AWS creds, we SSH to worker-0 and run boto3 there.
-
-_S3_PROXY_IP = WORKER_PRIVATE_IPS[0] if _USE_PRIVATE_IPS else WORKER_IPS[0]
-
-
-def _fetch_s3_state_direct() -> dict:
-    """
-    Fetch checkpoint state using local boto3 credentials.
-    Used when running on an EC2 instance with an IAM role.
-    Returns the same dict structure as poll_s3_via_ssh().
-    """
-    import boto3
-    from botocore.exceptions import ClientError
-
-    s3     = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-west-1"))
-    bucket = os.environ.get("S3_VECTOR_BUCKET", "")
-    prefix = os.environ.get("S3_CHECKPOINT_PREFIX", "checkpoints")
-
-    result: dict = {}
-
-    # ── Phase checkpoints ──────────────────────────────────────────────────────
-    for w in range(N_WORKERS):
-        result[w] = {}
-        for p in PHASE_NUMS:
-            entry: dict = {"complete": False, "last_completed_date": None}
-            mk = f"{prefix}/backfill-w{w}-phase{p}-complete.json"
-            try:
-                s3.head_object(Bucket=bucket, Key=mk)
-                entry["complete"] = True
-            except ClientError:
-                pass
-            if not entry["complete"]:
-                ck = f"{prefix}/backfill-w{w}-phase{p}.json"
-                try:
-                    data = json.loads(s3.get_object(Bucket=bucket, Key=ck)["Body"].read())
-                    entry["last_completed_date"] = data.get("last_completed_date")
-                except ClientError:
-                    pass
-            result[w][p] = entry
-
-    # ── Cleanup tasks ──────────────────────────────────────────────────────────
-    cleanup: dict = {}
-    for _s, _e, cid in CLEANUP_TASKS:
-        entry = {"complete": False, "claimed": False, "last_completed_date": None}
-        mk = f"{prefix}/{cid}-complete.json"
-        try:
-            s3.head_object(Bucket=bucket, Key=mk)
-            entry["complete"] = True
-        except ClientError:
-            pass
-        if not entry["complete"]:
-            clk = f"{prefix}/{cid}-claimed.json"
-            try:
-                cd = json.loads(s3.get_object(Bucket=bucket, Key=clk)["Body"].read())
-                entry["claimed"]    = True
-                entry["claimed_by"] = cd.get("worker")
-            except ClientError:
-                pass
-            ck = f"{prefix}/{cid}.json"
-            try:
-                data = json.loads(s3.get_object(Bucket=bucket, Key=ck)["Body"].read())
-                entry["last_completed_date"] = data.get("last_completed_date")
-            except ClientError:
-                pass
-        cleanup[cid] = entry
-    result["__cleanup__"] = cleanup
-
-    # ── Daily completion markers ───────────────────────────────────────────────
-    daily: dict = {}
+def _list_keys(s3, prefix: str) -> list[str]:
+    """List all object keys under a prefix."""
+    keys: list[str] = []
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/daily-",
-                                   PaginationConfig={"MaxItems": 400}):
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
-            fname = obj["Key"].split("/")[-1]
-            if fname.endswith("-complete.json"):
-                day = fname.replace("daily-", "").replace("-complete.json", "")
-                if len(day) == 10:
-                    daily[day] = True
-    result["__daily__"] = daily
-
-    # ── Gap-fill completion markers ────────────────────────────────────────────
-    gap_complete: dict = {}
-    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/gap-",
-                                   PaginationConfig={"MaxItems": 200}):
-        for obj in page.get("Contents", []):
-            fname = obj["Key"].split("/")[-1]
-            if fname.endswith("-complete.json"):
-                try:
-                    data = json.loads(s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read())
-                    cid  = fname.replace("-complete.json", "")
-                    gap_complete[cid] = {"start": data.get("start"), "end": data.get("end")}
-                except ClientError:
-                    pass
-    result["__gap_complete__"] = gap_complete
-
-    # ── Non-eBay tasks (nonebay-m{YYYYMM}w{N}) ────────────────────────────────
-    nonebay: dict = {}
-    for _s, _e, cid in NONEBAY_TASKS:
-        entry: dict = {"complete": False, "claimed": False,
-                       "start": str(_s), "end": str(_e)}
-        mk = f"{prefix}/{cid}-complete.json"
-        try:
-            s3.head_object(Bucket=bucket, Key=mk)
-            entry["complete"] = True
-        except ClientError:
-            pass
-        if not entry["complete"]:
-            clk = f"{prefix}/{cid}-claimed.json"
-            try:
-                cd = json.loads(s3.get_object(Bucket=bucket, Key=clk)["Body"].read())
-                entry["claimed"]    = True
-                entry["claimed_by"] = cd.get("worker")
-            except ClientError:
-                pass
-        nonebay[cid] = entry
-    result["__nonebay__"] = nonebay
-
-    return result
+            keys.append(obj["Key"])
+    return keys
 
 
-def _build_s3_proxy_script() -> str:
-    """Build the remote Python script with values baked in (avoids .format() conflicts)."""
-    return (
-        "import json,os,boto3\n"
-        "from botocore.exceptions import ClientError\n"
-        "from dotenv import load_dotenv\n"
-        "load_dotenv('/home/ec2-user/card-oracle-max/.env')\n"
-        "bucket=os.environ.get('S3_VECTOR_BUCKET','')\n"
-        "prefix=os.environ.get('S3_CHECKPOINT_PREFIX','checkpoints')\n"
-        "s3=boto3.client('s3',region_name='us-west-1')\n"
-        "result=dict()\n"
-        f"phase_nums=list(range(1,{len(PHASES)}+1))\n"
-        f"n_workers={N_WORKERS}\n"
-        "for w in range(n_workers):\n"
-        "    result[w]=dict()\n"
-        "    for p in phase_nums:\n"
-        "        entry=dict(complete=False,last_completed_date=None)\n"
-        "        mk=f'{prefix}/backfill-w{w}-phase{p}-complete.json'\n"
-        "        try:\n"
-        "            s3.head_object(Bucket=bucket,Key=mk)\n"
-        "            entry['complete']=True\n"
-        "        except ClientError:\n"
-        "            pass\n"
-        "        if not entry['complete']:\n"
-        "            ck=f'{prefix}/backfill-w{w}-phase{p}.json'\n"
-        "            try:\n"
-        "                data=json.loads(s3.get_object(Bucket=bucket,Key=ck)['Body'].read())\n"
-        "                entry['last_completed_date']=data.get('last_completed_date')\n"
-        "            except ClientError:\n"
-        "                pass\n"
-        "        result[w][p]=entry\n"
-        # ── Cleanup tasks ──────────────────────────────────────────────────────
-        "cleanup={}\n"
-        f"cleanup_cids={json.dumps([cid for _s, _e, cid in CLEANUP_TASKS])}\n"
-        "for cid in cleanup_cids:\n"
-        "    entry=dict(complete=False,claimed=False,last_completed_date=None)\n"
-        "    mk=f'{prefix}/{cid}-complete.json'\n"
-        "    try:\n"
-        "        s3.head_object(Bucket=bucket,Key=mk)\n"
-        "        entry['complete']=True\n"
-        "    except ClientError:\n"
-        "        pass\n"
-        "    if not entry['complete']:\n"
-        "        clk=f'{prefix}/{cid}-claimed.json'\n"
-        "        try:\n"
-        "            cd=json.loads(s3.get_object(Bucket=bucket,Key=clk)['Body'].read())\n"
-        "            entry['claimed']=True\n"
-        "            entry['claimed_by']=cd.get('worker')\n"
-        "        except ClientError:\n"
-        "            pass\n"
-        "        ck=f'{prefix}/{cid}.json'\n"
-        "        try:\n"
-        "            data=json.loads(s3.get_object(Bucket=bucket,Key=ck)['Body'].read())\n"
-        "            entry['last_completed_date']=data.get('last_completed_date')\n"
-        "        except ClientError:\n"
-        "            pass\n"
-        "    cleanup[cid]=entry\n"
-        "result['__cleanup__']=cleanup\n"
-        # ── Daily completion markers ───────────────────────────────────────────
-        "daily={}\n"
-        "paginator=s3.get_paginator('list_objects_v2')\n"
-        "for page in paginator.paginate(Bucket=bucket,Prefix=prefix+'/daily-',PaginationConfig={'MaxItems':400}):\n"
-        "    for obj in page.get('Contents',[]):\n"
-        "        key=obj['Key']\n"
-        "        fname=key.split('/')[-1]\n"
-        "        if fname.endswith('-complete.json'):\n"
-        "            day=fname.replace('daily-','').replace('-complete.json','')\n"
-        "            if len(day)==10:\n"
-        "                daily[day]=True\n"
-        "result['__daily__']=daily\n"
-        # ── Gap-fill completion markers ────────────────────────────────────────
-        "gap_complete={}\n"
-        "for page in paginator.paginate(Bucket=bucket,Prefix=prefix+'/gap-',PaginationConfig={'MaxItems':200}):\n"
-        "    for obj in page.get('Contents',[]):\n"
-        "        key=obj['Key']\n"
-        "        fname=key.split('/')[-1]\n"
-        "        if fname.endswith('-complete.json'):\n"
-        "            try:\n"
-        "                data=json.loads(s3.get_object(Bucket=bucket,Key=key)['Body'].read())\n"
-        "                gap_complete[fname.replace('-complete.json','')]={'start':data.get('start'),'end':data.get('end')}\n"
-        "            except ClientError:\n"
-        "                pass\n"
-        "result['__gap_complete__']=gap_complete\n"
-        # ── Non-eBay tasks ────────────────────────────────────────────────────
-        "nonebay={}\n"
-        f"nonebay_cids={json.dumps([(str(s), str(e), cid) for s, e, cid in NONEBAY_TASKS])}\n"
-        "for s,e,cid in nonebay_cids:\n"
-        "    entry=dict(complete=False,claimed=False,start=s,end=e)\n"
-        "    mk=f'{prefix}/{cid}-complete.json'\n"
-        "    try:\n"
-        "        s3.head_object(Bucket=bucket,Key=mk)\n"
-        "        entry['complete']=True\n"
-        "    except ClientError:\n"
-        "        pass\n"
-        "    if not entry['complete']:\n"
-        "        clk=f'{prefix}/{cid}-claimed.json'\n"
-        "        try:\n"
-        "            cd=json.loads(s3.get_object(Bucket=bucket,Key=clk)['Body'].read())\n"
-        "            entry['claimed']=True\n"
-        "            entry['claimed_by']=cd.get('worker')\n"
-        "        except ClientError:\n"
-        "            pass\n"
-        "    nonebay[cid]=entry\n"
-        "result['__nonebay__']=nonebay\n"
-        "print(json.dumps(result))\n"
-    )
-
-
-def poll_s3_via_ssh() -> dict:
-    """
-    Fetch S3 checkpoint state.
-
-    Strategy:
-      1. If boto3 is available and local credentials work (e.g. EC2 IAM role),
-         query S3 directly — fast, no SSH round-trip.
-      2. Otherwise SSH to worker-0 and run the proxy script there.
-
-    Returns {worker_idx: {phase_num: {complete, last_completed_date}}, ...}
-    """
-    # ── Try direct boto3 first ─────────────────────────────────────────────────
-    if _BOTO3_AVAILABLE and os.environ.get("S3_VECTOR_BUCKET"):
-        try:
-            raw = _fetch_s3_state_direct()
-            # Normalise: separate __xxx__ blocks from numeric worker keys
-            result: dict = {}
-            for k, v in raw.items():
-                if isinstance(k, str) and k.startswith("__"):
-                    result[k] = v
-                else:
-                    result[int(k)] = {int(p): pv for p, pv in v.items()}
-            return result
-        except Exception as e:
-            print(f"[s3-direct] failed ({e}), falling back to SSH proxy", flush=True)
-
-    # ── SSH proxy fallback ─────────────────────────────────────────────────────
-    script = _build_s3_proxy_script()
-    cmd = (
-        "cd /home/ec2-user/card-oracle-max && "
-        "source .venv/bin/activate && "
-        "python3 /tmp/_dashboard_s3_probe.py"
-    )
-    # First upload script, then execute — single SSH call using bash -c with heredoc
-    upload_and_run = (
-        f"cat > /tmp/_dashboard_s3_probe.py << 'PYEOF'\n"
-        f"{script}\n"
-        f"PYEOF\n"
-        f"cd /home/ec2-user/card-oracle-max && "
-        f"source .venv/bin/activate && "
-        f"python3 /tmp/_dashboard_s3_probe.py 2>/dev/null"
-    )
+def _read_json(s3, key: str) -> dict | None:
     try:
-        out = subprocess.check_output(
-            [
-                "ssh", "-i", SSH_KEY,
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=8",
-                "-o", "BatchMode=yes",
-                f"ec2-user@{_S3_PROXY_IP}",
-                upload_and_run,
-            ],
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        ).decode().strip()
-        # Find the JSON line (last line should be the print output)
-        for line in reversed(out.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                raw = json.loads(line)
-                # Separate string-keyed blocks from numeric worker keys
-                result: dict = {}
-                for w, val in raw.items():
-                    if w.startswith("__"):
-                        result[w] = val  # __cleanup__, __daily__, __gap_complete__
-                    else:
-                        result[int(w)] = {int(p): v for p, v in val.items()}
-                return result
-        print(f"[s3-proxy] no JSON in output: {out[:200]}", flush=True)
-        return {}
+        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        return json.loads(body)
+    except Exception:
+        return None
+
+
+def _job_id_from_key(key: str) -> str:
+    """Extract job_id from an S3 key like 'backfill-v2/active/2025-10-03-w1.json'."""
+    return key.split("/")[-1].removesuffix(".json")
+
+
+def poll_s3_state() -> dict:
+    """
+    Fetch job queue state directly from S3.
+
+    Returns:
+      {
+        "queue_count":    int,
+        "active_jobs":    [job_dict, ...],    # full JSON for each active job
+        "complete_count": int,
+        "failed_count":   int,
+        "checkpoints":    {job_id: ckpt_dict},
+        "priority_stats": {1: {total, complete, active, queue, failed}, ...},
+        "date_coverage":  {YYYY-MM-DD: status},  # "complete"|"active"|"queued"|"failed"|"not_in_queue"
+      }
+    """
+    if not _BOTO3_AVAILABLE:
+        return _empty_s3_state()
+
+    try:
+        s3 = _s3_client()
+
+        # ── Count queue keys (don't read each file — there are ~1863) ─────────
+        queue_keys    = _list_keys(s3, f"{S3_JOB_PREFIX}/queue/")
+        active_keys   = _list_keys(s3, f"{S3_JOB_PREFIX}/active/")
+        complete_keys = _list_keys(s3, f"{S3_JOB_PREFIX}/complete/")
+        failed_keys   = _list_keys(s3, f"{S3_JOB_PREFIX}/failed/")
+
+        queue_count    = len([k for k in queue_keys   if k.endswith(".json")])
+        complete_count = len([k for k in complete_keys if k.endswith(".json")])
+        failed_count   = len([k for k in failed_keys  if k.endswith(".json")])
+
+        active_job_keys = [k for k in active_keys if k.endswith(".json")]
+
+        # ── Read active job files + their checkpoints (max 12, fast) ──────────
+        active_jobs: list[dict] = []
+        checkpoints: dict[str, dict] = {}
+
+        def _fetch_active(key: str) -> tuple[dict | None, str, dict | None]:
+            job_id = _job_id_from_key(key)
+            job    = _read_json(s3, key)
+            ckpt_key = f"{S3_JOB_PREFIX}/checkpoints/{job_id}.json"
+            ckpt = _read_json(s3, ckpt_key)
+            return job, job_id, ckpt
+
+        with ThreadPoolExecutor(max_workers=min(len(active_job_keys), 12) or 1) as ex:
+            futures = {ex.submit(_fetch_active, k): k for k in active_job_keys}
+            for fut in as_completed(futures):
+                try:
+                    job, job_id, ckpt = fut.result()
+                    if job:
+                        job["job_id"] = job_id
+                        active_jobs.append(job)
+                    if ckpt:
+                        checkpoints[job_id] = ckpt
+                except Exception:
+                    pass
+
+        # ── Build priority band stats ──────────────────────────────────────────
+        # For non-active states we only have keys, not full JSON, so classify by job_id.
+        priority_stats: dict[int, dict] = {
+            p: {"total": 0, "complete": 0, "active": 0, "queue": 0, "failed": 0}
+            for p in range(1, 6)
+        }
+
+        def _tally(keys: list[str], state: str):
+            for k in keys:
+                if not k.endswith(".json"):
+                    continue
+                jid = _job_id_from_key(k)
+                p = classify_priority(jid)
+                priority_stats[p]["total"]  += 1
+                priority_stats[p][state]    += 1
+
+        _tally(queue_keys,    "queue")
+        _tally(active_keys,   "active")
+        _tally(complete_keys, "complete")
+        _tally(failed_keys,   "failed")
+
+        # ── Build date coverage calendar ───────────────────────────────────────
+        # Status priority: complete > active > queued > failed > not_in_queue
+        date_coverage: dict[str, str] = {}
+
+        def _update_coverage(keys: list[str], status: str, priority: int):
+            STATUS_PRIORITY = {"complete": 4, "active": 3, "queued": 2, "failed": 1}
+            for k in keys:
+                if not k.endswith(".json"):
+                    continue
+                jid = _job_id_from_key(k)
+                m = re.match(r'^(\d{4}-\d{2}-\d{2})', jid)
+                if not m:
+                    continue
+                d = m.group(1)
+                current = date_coverage.get(d)
+                if current is None or STATUS_PRIORITY.get(status, 0) > STATUS_PRIORITY.get(current, 0):
+                    date_coverage[d] = status
+
+        _update_coverage(complete_keys, "complete", 4)
+        _update_coverage(active_keys,   "active",   3)
+        _update_coverage(queue_keys,    "queued",   2)
+        _update_coverage(failed_keys,   "failed",   1)
+
+        # Fill in not_in_queue for every eBay date in range
+        today = date.today()
+        d = CALENDAR_START
+        while d <= today:
+            d_str = d.isoformat()
+            if d_str not in date_coverage:
+                date_coverage[d_str] = "not_in_queue"
+            d += timedelta(days=1)
+
+        active_jobs.sort(key=lambda j: j.get("priority", 9))
+
+        return {
+            "queue_count":    queue_count,
+            "active_jobs":    active_jobs,
+            "complete_count": complete_count,
+            "failed_count":   failed_count,
+            "checkpoints":    checkpoints,
+            "priority_stats": priority_stats,
+            "date_coverage":  date_coverage,
+        }
+
     except Exception as e:
-        print(f"[s3-proxy] error: {e}", flush=True)
-        return {}
+        print(f"[s3-poll] error: {e}", flush=True)
+        return _empty_s3_state()
 
 
-def phase_completion_key(worker_idx: int, phase_num: int) -> str:
-    return f"{S3_CHECKPOINT_PREFIX}/backfill-w{worker_idx}-phase{phase_num}-complete.json"
-
-
-def phase_checkpoint_key(worker_idx: int, phase_num: int) -> str:
-    return f"{S3_CHECKPOINT_PREFIX}/backfill-w{worker_idx}-phase{phase_num}.json"
+def _empty_s3_state() -> dict:
+    return {
+        "queue_count":    0,
+        "active_jobs":    [],
+        "complete_count": 0,
+        "failed_count":   0,
+        "checkpoints":    {},
+        "priority_stats": {p: {"total": 0, "complete": 0, "active": 0, "queue": 0, "failed": 0} for p in range(1, 6)},
+        "date_coverage":  {},
+    }
 
 
 # ── SSH polling ────────────────────────────────────────────────────────────────
 
-_SSH_LOG_RE = re.compile(
-    r"Processed ([\d,]+) rows \| (\d+) rows/s \| skipped (\d+) \| .* ETA ~(-?[\d.]+)min"
-)
+_LOG_LINE_RE = re.compile(r'(\d+:\d+:\d+)\s*\|\s*\w+\s*\|\s*(.+)')
 
 
 def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
-    """SSH into one worker and scrape the latest journald log line."""
+    """SSH into one worker and check os-backfill service status."""
     result: dict[str, Any] = {
         "index":    worker_idx,
         "ip":       WORKER_IPS[worker_idx],  # always show public IP in UI
-        "active":   False,
-        "rows":     0,
-        "rows_s":   0,
-        "skipped":  0,
-        "eta_min":  None,
+        "service":  "unknown",
         "log_line": "",
         "error":    None,
     }
     try:
-        # Build log-file fallback paths for this specific worker index
-        cleanup_log = f"/home/ec2-user/card-oracle-max/logs/cleanup-w{worker_idx}.log"
-        gaps_log    = f"/home/ec2-user/card-oracle-max/logs/gaps-w{worker_idx}.log"
         out = subprocess.check_output(
             [
                 "ssh", "-i", SSH_KEY,
@@ -600,36 +347,18 @@ def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
                 "-o", "ConnectTimeout=6",
                 "-o", "BatchMode=yes",
                 f"ec2-user@{ip}",
-                # Active check: look for python processes running our scripts.
-                # Uses 'ps' + grep rather than pgrep -f to avoid pgrep self-matching
-                # (pgrep -f matches the bash process running this very SSH command
-                # because the command string itself contains the search terms).
-                "ps aux | grep -E '[p]ython.*(worker_phases|worker_cleanup|worker_nonebay|rds_batch_job)' "
-                "| grep -qv grep && echo active || echo inactive; "
-                # Log: try journald (systemd service) first; fall back to nohup log files
-                "LOG=$(sudo journalctl -u backfill --no-pager -n 50 --output=cat 2>/dev/null "
-                "| grep 'Processed' | tail -1); "
-                f'if [ -z "$LOG" ]; then LOG=$(tail -n 100 "{cleanup_log}" "{gaps_log}" 2>/dev/null '
-                "| grep 'Processed' | tail -1); fi; "
-                'echo "$LOG"',
+                "sudo systemctl is-active os-backfill 2>/dev/null || echo inactive; "
+                "sudo journalctl -u os-backfill --no-pager -n 5 --output=cat 2>/dev/null | tail -1",
             ],
             stderr=subprocess.DEVNULL,
             timeout=12,
         ).decode().strip()
 
-        lines = out.splitlines()
-        result["active"] = lines[0].strip() == "active" if lines else False
-
-        log_line = lines[-1] if len(lines) > 1 else ""
-        result["log_line"] = log_line
-
-        m = _SSH_LOG_RE.search(log_line)
-        if m:
-            result["rows"]    = int(m.group(1).replace(",", ""))
-            result["rows_s"]  = int(m.group(2))
-            result["skipped"] = int(m.group(3))
-            eta = float(m.group(4))
-            result["eta_min"] = eta if eta >= 0 else None  # negative = past ETA, show as —
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        if lines:
+            result["service"] = lines[0]   # "active" | "inactive" | "failed" | …
+        if len(lines) > 1:
+            result["log_line"] = lines[-1]
 
     except subprocess.TimeoutExpired:
         result["error"] = "SSH timeout"
@@ -642,11 +371,10 @@ def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
 
 
 def poll_all_workers_ssh() -> list[dict]:
-    results = [None] * N_WORKERS
+    results: list[dict | None] = [None] * N_WORKERS
     threads = []
 
     def _poll(idx: int) -> None:
-        # Use private IP when running on EC2 in same VPC, else public IP
         target_ip = SSH_TARGETS[idx]
         results[idx] = poll_worker_ssh(idx, target_ip)
 
@@ -658,386 +386,210 @@ def poll_all_workers_ssh() -> list[dict]:
     for t in threads:
         t.join(timeout=18)
 
-    return [r or {"index": i, "ip": WORKER_IPS[i], "active": False, "error": "no response"}
-            for i, r in enumerate(results)]
+    return [
+        r or {"index": i, "ip": WORKER_IPS[i], "service": "unknown", "error": "no response"}
+        for i, r in enumerate(results)
+    ]
 
 
-# ── S3 checkpoint polling ─────────────────────────────────────────────────────
+# ── Active job enrichment helpers ──────────────────────────────────────────────
 
-def poll_s3_state() -> dict:
-    """
-    Fetches checkpoint state via SSH proxy to worker-0 (IAM instance profile).
-    Returns normalised {phase_complete, last_completed_date, cleanup_state} dicts.
-    phase_num is 1-indexed throughout (matches worker_phases.py).
-    """
-    raw = poll_s3_via_ssh()
-
-    phase_complete:      dict[int, dict[int, bool]]       = {i: {} for i in range(N_WORKERS)}
-    last_completed_date: dict[int, dict[int, str | None]] = {i: {} for i in range(N_WORKERS)}
-
-    # Extract string-keyed blocks before iterating numeric worker keys
-    cleanup_state:  dict[str, dict] = raw.pop("__cleanup__", {})
-    daily_complete: dict[str, bool] = raw.pop("__daily__", {})
-    gap_complete:   dict[str, dict] = raw.pop("__gap_complete__", {})
-    nonebay_state:  dict[str, dict] = raw.pop("__nonebay__", {})
-
-    for w_idx in range(N_WORKERS):
-        for phase_num in PHASE_NUMS:
-            entry = raw.get(w_idx, {}).get(phase_num, {})
-            phase_complete[w_idx][phase_num]      = entry.get("complete", False)
-            last_completed_date[w_idx][phase_num] = entry.get("last_completed_date")
-
-    return {
-        "phase_complete":      phase_complete,
-        "last_completed_date": last_completed_date,
-        "cleanup_state":       cleanup_state,
-        "daily_complete":      daily_complete,
-        "gap_complete":        gap_complete,
-        "nonebay_state":       nonebay_state,
-    }
+def _age_seconds(ts_iso: str | None) -> float | None:
+    if not ts_iso:
+        return None
+    try:
+        t = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
 
 
-# ── Calendar builder ──────────────────────────────────────────────────────────
-
-def build_calendar(s3_state: dict) -> dict[str, str]:
-    """
-    Returns {date_str: status} for every day from backfill start to today.
-    Status: "complete" | "in_progress" | "scheduled" | "not_started" | "out_of_scope"
-
-    Priority order for status resolution (highest wins):
-      1. daily-complete marker       — written by daily_update.py cron
-      2. gap-fill complete marker    — written by gap_fill_wN.sh
-      3. cleanup task progress       — monthly window cleanup workers
-      4. phase-based checkpoint      — original worker_phases.py logic
-    """
-    phase_complete      = s3_state.get("phase_complete", {})
-    last_completed_date = s3_state.get("last_completed_date", {})
-    cleanup_state       = s3_state.get("cleanup_state", {})
-    daily_complete      = s3_state.get("daily_complete", {})   # {YYYY-MM-DD: True}
-    gap_complete        = s3_state.get("gap_complete", {})     # {gap-id: {start, end}}
-
-    # Build a set of dates confirmed complete by gap-fill markers
-    gap_complete_dates: set[date] = set()
-    for _cid, meta in gap_complete.items():
-        try:
-            gs = date.fromisoformat(meta["start"])
-            ge = date.fromisoformat(meta["end"])
-            d = gs
-            while d < ge:
-                gap_complete_dates.add(d)
-                d += timedelta(days=1)
-        except (KeyError, ValueError):
-            pass
-
-    # Calendar runs from backfill start to today (inclusive)
-    all_start = min(s for s, _e, _l in PHASES)
-    all_end   = date.today() + timedelta(days=1)  # exclusive, so today is included
-
-    calendar: dict[str, str] = {}
-    today = date.today()
-
-    d = all_start
-    while d < all_end:
-        d_str = d.isoformat()
-
-        # ── Layer 4 (base): phase-based checkpoint logic ──────────────────────
-        phase_num_for_day: int | None = None
-        for p_num, (p_start, p_end, _) in enumerate(PHASES, 1):
-            if p_start <= d < p_end:
-                phase_num_for_day = p_num
-                break
-
-        if phase_num_for_day is None:
-            # Date is outside original phase windows (e.g. Apr 8+ covered by daily cron)
-            calendar[d_str] = "not_started"
-        else:
-            worker_for_day: int | None = None
-            for w_idx in range(N_WORKERS):
-                s, e = WORKER_PHASE_MAP.get((w_idx, phase_num_for_day), (None, None))
-                if s and e and s <= d < e:
-                    worker_for_day = w_idx
-                    break
-
-            if worker_for_day is None:
-                calendar[d_str] = "not_started"
-            else:
-                w_complete = phase_complete.get(worker_for_day, {})
-                w_lcd_map  = last_completed_date.get(worker_for_day, {})
-
-                if w_complete.get(phase_num_for_day):
-                    calendar[d_str] = "complete"
-                else:
-                    lcd = w_lcd_map.get(phase_num_for_day)
-                    if lcd:
-                        try:
-                            lcd_date = date.fromisoformat(lcd[:10])
-                            if d <= lcd_date:
-                                calendar[d_str] = "complete"
-                            elif d == lcd_date + timedelta(days=1):
-                                calendar[d_str] = "in_progress"
-                            else:
-                                calendar[d_str] = "scheduled" if phase_num_for_day > 1 else "not_started"
-                        except ValueError:
-                            calendar[d_str] = "not_started"
-                    else:
-                        calendar[d_str] = "scheduled" if phase_num_for_day > 1 else "not_started"
-
-        # ── Layer 3: cleanup task progress ────────────────────────────────────
-        # Cleanup is a re-processing pass on already-ingested data.
-        # Rule: cleanup can UPGRADE a day to "complete" but must NEVER downgrade
-        # a day that is already "complete" (e.g. from phase checkpoint).
-        # A cleanup task being claimed/in-progress does not mean data is missing.
-        cid = _CLEANUP_DATE_MAP.get(d)
-        if cid and cleanup_state:
-            ct = cleanup_state.get(cid, {})
-            has_data = ct.get("complete") or ct.get("claimed") or ct.get("last_completed_date")
-            if has_data:
-                if ct.get("complete"):
-                    # Cleanup fully done — always mark complete
-                    calendar[d_str] = "complete"
-                elif calendar[d_str] != "complete":
-                    # Only show cleanup progress if the day isn't already phase-complete
-                    lcd = ct.get("last_completed_date")
-                    if lcd:
-                        try:
-                            lcd_date = date.fromisoformat(lcd[:10])
-                            calendar[d_str] = "complete" if d <= lcd_date else "in_progress"
-                        except ValueError:
-                            pass
-                    elif ct.get("claimed"):
-                        calendar[d_str] = "in_progress"
-
-        # ── Layer 2: gap-fill completion markers ──────────────────────────────
-        # Written by gap_fill_wN.sh after each date range completes.
-        if d in gap_complete_dates:
-            calendar[d_str] = "complete"
-
-        # ── Layer 1 (highest priority): daily-complete markers ────────────────
-        # Written by daily_update.py — authoritative for recent days.
-        if daily_complete.get(d_str):
-            calendar[d_str] = "complete"
-
-        d += timedelta(days=1)
-
-    return calendar
+def _checkpoint_age_seconds(ckpt: dict | None) -> float | None:
+    if not ckpt:
+        return None
+    return _age_seconds(ckpt.get("saved_at"))
 
 
-def build_nonebay_calendar(s3_state: dict) -> dict[str, str]:
-    """
-    Returns {date_str: status} for every day from NONEBAY_START to today.
-    Status is derived purely from the non-eBay task claim/complete markers.
-
-    Status values:
-      "complete"     — nonebay task for this day is fully complete
-      "in_progress"  — task is claimed but not yet complete
-      "not_started"  — task exists but has no markers yet
-      "out_of_scope" — date predates the non-eBay backfill window
-    """
-    nonebay_state = s3_state.get("nonebay_state", {})
-
-    all_start = _NONEBAY_START
-    all_end   = date.today() + timedelta(days=1)  # inclusive of today
-
-    calendar: dict[str, str] = {}
-    d = all_start
-    while d < all_end:
-        d_str = d.isoformat()
-        cid = _NONEBAY_DATE_MAP.get(d)
-        if cid is None:
-            calendar[d_str] = "out_of_scope"
-        else:
-            ct = nonebay_state.get(cid, {})
-            if ct.get("complete"):
-                calendar[d_str] = "complete"
-            elif ct.get("claimed"):
-                calendar[d_str] = "in_progress"
-            else:
-                calendar[d_str] = "not_started"
-        d += timedelta(days=1)
-
-    return calendar
+def _docs_per_hour(job: dict, ckpt: dict | None) -> float | None:
+    """Compute throughput rate from checkpoint or job stats."""
+    scrolled = 0
+    if ckpt and ckpt.get("stats"):
+        scrolled = ckpt["stats"].get("scrolled", 0)
+    elif job.get("stats"):
+        scrolled = job["stats"].get("scrolled", 0)
+    if not scrolled:
+        return None
+    age_h = (_age_seconds(job.get("claimed_at")) or 0) / 3600
+    if age_h < 0.01:
+        return None
+    return scrolled / age_h
 
 
-# ── Main polling loop ─────────────────────────────────────────────────────────
+def _progress_pct(job: dict, ckpt: dict | None) -> float | None:
+    est = job.get("doc_count_estimate", 0)
+    if not est:
+        return None
+    scrolled = 0
+    if ckpt and ckpt.get("stats"):
+        scrolled = ckpt["stats"].get("scrolled", 0)
+    elif job.get("stats"):
+        scrolled = job["stats"].get("scrolled", 0)
+    return min(100.0, scrolled / est * 100)
 
-# Shared state (protected by _state_lock)
+
+# ── Completion-rate ETA ────────────────────────────────────────────────────────
+
+_prev_complete_count: int | None = None
+_prev_poll_time: float | None    = None
+
+
+def _compute_eta(complete_count: int, queue_count: int, active_count: int) -> str | None:
+    global _prev_complete_count, _prev_poll_time
+
+    now = time.monotonic()
+
+    if _prev_complete_count is not None and _prev_poll_time is not None:
+        delta_complete = complete_count - _prev_complete_count
+        delta_secs     = now - _prev_poll_time
+        if delta_secs > 0 and delta_complete > 0:
+            rate_per_sec    = delta_complete / delta_secs    # jobs/sec
+            remaining       = queue_count + active_count
+            eta_secs        = remaining / rate_per_sec
+            eta_h           = eta_secs / 3600
+            if eta_h < 1:
+                return f"~{int(eta_secs / 60)}m"
+            if eta_h < 24:
+                return f"~{eta_h:.1f}h"
+            return f"~{eta_h/24:.1f}d"
+
+    _prev_complete_count = complete_count
+    _prev_poll_time      = now
+    return None
+
+
+# ── Main polling loop ──────────────────────────────────────────────────────────
+
 _state_lock = threading.Lock()
 _state: dict = {
-    "workers":           [],
-    "calendar":          {},
-    "nonebay_calendar":  {},
-    "phase_summary":     [],
-    "nonebay_summary":   [],
-    "total_rows":        0,
-    "total_skipped":     0,
-    "combined_rps":      0,
-    "workers_active":    0,
-    "workers_in_phase":  {},
-    "updated_at":        None,
-    "next_update_at":    None,
-    "s3_available":      bool(S3_BUCKET),
+    "active_jobs":     [],
+    "workers":         [],
+    "queue_count":     0,
+    "complete_count":  0,
+    "failed_count":    0,
+    "active_count":    0,
+    "progress_pct":    0.0,
+    "eta":             None,
+    "priority_bands":  [],
+    "date_coverage":   {},
+    "s3_available":    _BOTO3_AVAILABLE,
+    "updated_at":      None,
+    "next_update_at":  None,
 }
 
 
-def _determine_worker_phase(w_idx: int, s3_state: dict) -> tuple[int, str]:
-    """Return (phase_num, phase_label) for the worker's currently active phase.
-    phase_num is 1-indexed (matches worker_phases.py)."""
-    phase_complete = s3_state.get("phase_complete", {}).get(w_idx, {})
-    for phase_num, (_, _, label) in enumerate(PHASES, 1):
-        if not phase_complete.get(phase_num, False):
-            return phase_num, label
-    return len(PHASES) + 1, "All complete"
+def _enrich_active_jobs(active_jobs: list[dict], checkpoints: dict) -> list[dict]:
+    enriched = []
+    for job in active_jobs:
+        jid  = job.get("job_id", "")
+        ckpt = checkpoints.get(jid)
+        scrolled = 0
+        if ckpt and ckpt.get("stats"):
+            scrolled = ckpt["stats"].get("scrolled", 0)
+        elif job.get("stats"):
+            scrolled = job["stats"].get("scrolled", 0)
+
+        enriched.append({
+            **job,
+            "_scrolled":        scrolled,
+            "_progress_pct":    _progress_pct(job, ckpt),
+            "_age_secs":        _age_seconds(job.get("claimed_at")),
+            "_ckpt_age_secs":   _checkpoint_age_seconds(ckpt),
+            "_docs_per_hour":   _docs_per_hour(job, ckpt),
+            "_priority":        classify_priority(jid),
+        })
+    return enriched
+
+
+def _build_priority_bands(priority_stats: dict) -> list[dict]:
+    rows = []
+    for band in PRIORITY_BANDS:
+        p   = band["p"]
+        st  = priority_stats.get(p, {})
+        total    = st.get("total", 0)
+        complete = st.get("complete", 0)
+        active   = st.get("active", 0)
+        queue    = st.get("queue", 0)
+        failed   = st.get("failed", 0)
+        pct = round(complete / total * 100, 1) if total else 0.0
+        rows.append({
+            "p":        p,
+            "label":    band["label"],
+            "total":    total,
+            "complete": complete,
+            "active":   active,
+            "queue":    queue,
+            "failed":   failed,
+            "pct":      pct,
+        })
+    return rows
 
 
 def poll_and_update() -> None:
     """Run one full poll cycle and update shared state."""
     now = datetime.now(timezone.utc)
 
-    # Parallel polls
-    ssh_thread  = threading.Thread(target=lambda: _ssh_results.__setitem__(0, poll_all_workers_ssh()), daemon=True)
-    s3_thread   = threading.Thread(target=lambda: _s3_results.__setitem__(0, poll_s3_state()), daemon=True)
-    _ssh_results: dict[int, list] = {}
-    _s3_results:  dict[int, dict] = {}
+    _s3_results:  dict = {}
+    _ssh_results: dict = {}
 
-    ssh_thread.start()
+    s3_thread  = threading.Thread(
+        target=lambda: _s3_results.update(poll_s3_state()), daemon=True
+    )
+    ssh_thread = threading.Thread(
+        target=lambda: _ssh_results.update({"workers": poll_all_workers_ssh()}), daemon=True
+    )
+
     s3_thread.start()
+    ssh_thread.start()
+    s3_thread.join(timeout=45)
     ssh_thread.join(timeout=20)
-    s3_thread.join(timeout=30)
 
-    workers_raw = _ssh_results.get(0, [{"index": i, "ip": WORKER_IPS[i], "active": False, "error": "poll failed"} for i in range(N_WORKERS)])
-    s3_state    = _s3_results.get(0, {"phase_complete": {}, "last_completed_date": {}})
+    s3  = _s3_results if _s3_results else _empty_s3_state()
+    workers = _ssh_results.get("workers", [
+        {"index": i, "ip": WORKER_IPS[i], "service": "unknown", "error": "poll failed"}
+        for i in range(N_WORKERS)
+    ])
 
-    # Build reverse map: worker_idx → current cleanup CID (claimed-but-not-complete)
-    cleanup_state = s3_state.get("cleanup_state", {})
-    worker_cleanup_cid: dict[int, str] = {}
-    for cid, ct in cleanup_state.items():
-        if ct.get("claimed") and not ct.get("complete"):
-            cb = ct.get("claimed_by")
-            if cb is not None:
-                worker_cleanup_cid[int(cb)] = cid
+    queue_count    = s3.get("queue_count", 0)
+    complete_count = s3.get("complete_count", 0)
+    failed_count   = s3.get("failed_count", 0)
+    active_jobs_raw = s3.get("active_jobs", [])
+    active_count   = len(active_jobs_raw)
 
-    # Build reverse map: worker_idx → current non-eBay task CID (workers 6–11)
-    nonebay_state = s3_state.get("nonebay_state", {})
-    worker_nonebay_cid: dict[int, str] = {}
-    for cid, ct in nonebay_state.items():
-        if ct.get("claimed") and not ct.get("complete"):
-            cb = ct.get("claimed_by")
-            if cb is not None:
-                worker_nonebay_cid[int(cb)] = cid
+    total_jobs = queue_count + active_count + complete_count + failed_count
+    progress_pct = round(complete_count / total_jobs * 100, 1) if total_jobs else 0.0
 
-    # Enrich workers with phase info
-    workers = []
-    phase_counts: dict[str, int] = {}
-    total_rows    = 0
-    total_skipped = 0
-    combined_rps  = 0
-    active_count  = 0
+    eta = _compute_eta(complete_count, queue_count, active_count)
 
-    for w in workers_raw:
-        w_idx = w["index"]
-        phase_num, phase_label = _determine_worker_phase(w_idx, s3_state)
-        w["phase_num"]   = phase_num
-        w["phase_label"] = phase_label
-
-        # Attach current cleanup CID if the worker has one claimed
-        w["cleanup_cid"] = worker_cleanup_cid.get(w_idx)
-
-        # Attach current non-eBay task CID (workers 6–11 running worker_nonebay.py)
-        w["nonebay_cid"] = worker_nonebay_cid.get(w_idx)
-
-        # Clamp phase_num to valid range for lookup (1–len(PHASES))
-        lookup_phase = min(phase_num, len(PHASES))
-        slice_start, slice_end = WORKER_PHASE_MAP.get((w_idx, lookup_phase), (None, None))
-
-        # If worker is on a cleanup task, use that task's date range for the slice display
-        if w["cleanup_cid"]:
-            for cs, ce, ccid in CLEANUP_TASKS:
-                if ccid == w["cleanup_cid"]:
-                    slice_start, slice_end = cs, ce
-                    break
-
-        # If worker is on a non-eBay task, use that task's date range
-        if w["nonebay_cid"]:
-            for ns, ne, ncid in NONEBAY_TASKS:
-                if ncid == w["nonebay_cid"]:
-                    slice_start, slice_end = ns, ne
-                    break
-
-        w["slice_start"] = slice_start.isoformat() if slice_start else "—"
-        w["slice_end"]   = slice_end.isoformat()   if slice_end   else "—"
-
-        workers.append(w)
-
-        phase_counts[phase_label] = phase_counts.get(phase_label, 0) + 1
-        total_rows    += w.get("rows", 0)
-        total_skipped += w.get("skipped", 0)
-        combined_rps  += w.get("rows_s", 0)
-        if w.get("active"):
-            active_count += 1
-
-    # Calendars
-    calendar         = build_calendar(s3_state)
-    nonebay_calendar = build_nonebay_calendar(s3_state)
-
-    # Phase summary (phase_num is 1-indexed)
-    phase_summary = []
-    for phase_num, (p_start, p_end, label) in enumerate(PHASES, 1):
-        complete_workers = sum(
-            1 for w_idx in range(N_WORKERS)
-            if s3_state.get("phase_complete", {}).get(w_idx, {}).get(phase_num, False)
-        )
-        total_days   = (p_end - p_start).days
-        complete_days = sum(
-            1 for d_str, st in calendar.items()
-            if st == "complete"
-            and p_start <= date.fromisoformat(d_str) < p_end
-        )
-        phase_summary.append({
-            "label":           label,
-            "start":           p_start.isoformat(),
-            "end":             p_end.isoformat(),
-            "total_days":      total_days,
-            "complete_days":   complete_days,
-            "complete_workers": complete_workers,
-            "pct":             round(complete_days / total_days * 100, 1) if total_days else 0,
-        })
-
-    # Non-eBay monthly summary (workers 6–11)
-    nonebay_summary = []
-    for win_start, win_end in _nonebay_monthly_windows():
-        month_tag = win_start.strftime("%Y%m")
-        month_tasks = [(s, e, cid) for s, e, cid in NONEBAY_TASKS
-                       if cid.startswith(f"nonebay-m{month_tag}")]
-        total_t    = len(month_tasks)
-        complete_t = sum(1 for _s, _e, cid in month_tasks
-                         if nonebay_state.get(cid, {}).get("complete"))
-        claimed_t  = sum(1 for _s, _e, cid in month_tasks
-                         if nonebay_state.get(cid, {}).get("claimed")
-                         and not nonebay_state.get(cid, {}).get("complete"))
-        nonebay_summary.append({
-            "label":          win_start.strftime("%b %Y"),
-            "start":          str(win_start),
-            "end":            str(win_end),
-            "total_tasks":    total_t,
-            "complete_tasks": complete_t,
-            "in_progress":    claimed_t,
-            "pct":            round(complete_t / total_t * 100, 0) if total_t else 0,
-        })
+    active_jobs = _enrich_active_jobs(active_jobs_raw, s3.get("checkpoints", {}))
+    priority_bands = _build_priority_bands(s3.get("priority_stats", {}))
+    date_coverage  = s3.get("date_coverage", {})
 
     with _state_lock:
-        _state["workers"]          = workers
-        _state["calendar"]         = calendar
-        _state["nonebay_calendar"] = nonebay_calendar
-        _state["phase_summary"]    = phase_summary
-        _state["nonebay_summary"]  = nonebay_summary
-        _state["total_rows"]       = total_rows
-        _state["total_skipped"]    = total_skipped
-        _state["combined_rps"]     = combined_rps
-        _state["workers_active"]   = active_count
-        _state["workers_in_phase"] = phase_counts
-        _state["updated_at"]       = now.isoformat()
-        _state["next_update_at"]   = (now + timedelta(seconds=POLL_INTERVAL)).isoformat()
-        _state["s3_available"]     = bool(S3_BUCKET)
+        _state["active_jobs"]    = active_jobs
+        _state["workers"]        = workers
+        _state["queue_count"]    = queue_count
+        _state["complete_count"] = complete_count
+        _state["failed_count"]   = failed_count
+        _state["active_count"]   = active_count
+        _state["progress_pct"]   = progress_pct
+        _state["eta"]            = eta
+        _state["priority_bands"] = priority_bands
+        _state["date_coverage"]  = date_coverage
+        _state["s3_available"]   = _BOTO3_AVAILABLE
+        _state["updated_at"]     = now.isoformat()
+        _state["next_update_at"] = (now + timedelta(seconds=POLL_INTERVAL)).isoformat()
 
 
 def _background_poller() -> None:
@@ -1056,7 +608,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Backfill Dashboard</title>
+<title>Backfill Dashboard v2</title>
 <style>
   :root {
     --bg: #0f1117; --surface: #1a1d27; --surface2: #222636;
@@ -1064,7 +616,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --green: #10b981; --yellow: #f59e0b; --blue: #3b82f6;
     --red: #ef4444; --purple: #8b5cf6; --gray: #374151;
     --green-dim: #064e3b; --yellow-dim: #451a03; --blue-dim: #1e3a5f;
-    --gray-dim: #1f2937; --scheduled-dim: #312e81;
+    --gray-dim: #1f2937; --queued-dim: #312e81; --active-dim: #713f12;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); font-size: 13px; }
@@ -1078,87 +630,116 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .main { padding: 20px 24px; display: grid; gap: 20px; }
 
   /* Summary cards */
-  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
   .card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
   .card .value { font-size: 22px; font-weight: 700; }
   .card .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .card.green .value { color: var(--green); }
   .card.yellow .value { color: var(--yellow); }
-  .card.blue .value { color: var(--blue); }
-  .card.purple .value { color: var(--purple); }
+  .card.blue .value  { color: var(--blue); }
+  .card.purple .value{ color: var(--purple); }
+  .card.red .value   { color: var(--red); }
 
-  /* Phase progress */
+  /* Overall progress bar */
+  .overall-progress { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .overall-progress .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .progress-bar-lg { background: var(--gray-dim); border-radius: 6px; height: 14px; overflow: hidden; }
+  .progress-fill-lg { height: 100%; border-radius: 6px; background: linear-gradient(90deg, var(--green), #059669); transition: width 0.6s ease; }
+  .progress-meta { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--muted); }
+
+  /* Section */
+  .section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
   .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin-bottom: 10px; }
-  .phase-grid { display: grid; gap: 8px; }
-  .phase-row { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; display: grid; grid-template-columns: 100px 1fr 60px; gap: 12px; align-items: center; }
-  .phase-label { font-weight: 600; font-size: 12px; }
-  .progress-bar { background: var(--gray-dim); border-radius: 4px; height: 8px; overflow: hidden; }
-  .progress-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; background: var(--green); }
-  .progress-fill.partial { background: linear-gradient(90deg, var(--green), var(--yellow)); }
-  .progress-fill.zero { background: var(--gray); }
-  .phase-pct { font-size: 12px; font-weight: 700; text-align: right; color: var(--green); }
-  .phase-pct.zero { color: var(--muted); }
 
-  /* Worker table */
-  .worker-table { width: 100%; border-collapse: collapse; }
-  .worker-table th { background: var(--surface2); padding: 8px 10px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); border-bottom: 1px solid var(--border); }
-  .worker-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  /* Priority bands */
+  .band-grid { display: grid; gap: 8px; }
+  .band-row { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; display: grid; grid-template-columns: 180px 1fr 55px; gap: 12px; align-items: center; }
+  .band-label { font-weight: 600; font-size: 12px; }
+  .progress-bar { background: var(--gray-dim); border-radius: 4px; height: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+  .fill-green  { background: var(--green); }
+  .fill-yellow { background: linear-gradient(90deg, var(--green), var(--yellow)); }
+  .fill-gray   { background: var(--gray); }
+  .band-pct { font-size: 12px; font-weight: 700; text-align: right; color: var(--green); }
+  .band-pct.zero { color: var(--muted); }
+  .band-sub { font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+  /* Active jobs table */
+  .jobs-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .jobs-table th { background: var(--surface2); padding: 7px 9px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .jobs-table td { padding: 6px 9px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .jobs-table tr:last-child td { border-bottom: none; }
+  .jobs-table tr:hover td { background: var(--surface2); }
+  .mini-bar { display: flex; align-items: center; gap: 6px; }
+  .mini-bar-bg { background: var(--gray-dim); border-radius: 3px; height: 6px; width: 60px; overflow: hidden; flex-shrink: 0; }
+  .mini-bar-fill { height: 100%; border-radius: 3px; background: var(--green); }
+  .mini-pct { font-size: 10px; color: var(--muted); }
+  .badge { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 20px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+  .badge.p1 { background: #450a0a; color: var(--red); }
+  .badge.p2 { background: #451a03; color: #fb923c; }
+  .badge.p3 { background: #1a2e05; color: #86efac; }
+  .badge.p4 { background: var(--blue-dim); color: #93c5fd; }
+  .badge.p5 { background: var(--queued-dim); color: #c4b5fd; }
+  .mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+  .muted { color: var(--muted); }
+  .err  { color: var(--red); font-size: 11px; }
+  .age-warn { color: var(--yellow); }
+  .age-stale { color: var(--red); }
+
+  /* Worker fleet table */
+  .worker-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .worker-table th { background: var(--surface2); padding: 7px 9px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .worker-table td { padding: 6px 9px; border-bottom: 1px solid var(--border); vertical-align: middle; }
   .worker-table tr:last-child td { border-bottom: none; }
   .worker-table tr:hover td { background: var(--surface2); }
-  .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; }
-  .badge.active { background: #064e3b; color: var(--green); }
-  .badge.inactive { background: #450a0a; color: var(--red); }
-  .badge.phase { background: var(--blue-dim); color: #93c5fd; }
-  .badge.phase2 { background: var(--scheduled-dim); color: #c4b5fd; }
-  .badge.done { background: var(--green-dim); color: var(--green); }
-  .rps { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: var(--yellow); }
-  .rows { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-  .eta { color: var(--muted); font-size: 11px; }
+  .svc-active   { color: var(--green); font-weight: 700; }
+  .svc-inactive { color: var(--red); }
+  .svc-unknown  { color: var(--muted); font-style: italic; }
   .ip { font-family: monospace; font-size: 11px; color: var(--muted); }
-  .err { color: var(--red); font-size: 11px; }
-  .slice-range { font-size: 10px; color: var(--muted); font-family: monospace; }
+  .log-preview { font-size: 10px; color: var(--muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: monospace; }
 
   /* Calendar */
   .calendar-section { overflow-x: auto; }
-  .calendar-grid { display: flex; flex-wrap: wrap; gap: 16px; }
-  .month-block { min-width: 200px; }
-  .month-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 6px; }
+  .calendar-grid { display: flex; flex-wrap: wrap; gap: 14px; }
+  .month-block { min-width: 196px; }
+  .month-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 5px; }
   .days-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
   .day-label { font-size: 9px; color: var(--muted); text-align: center; padding: 1px; }
   .day-cell { width: 100%; padding-bottom: 100%; border-radius: 3px; position: relative; cursor: default; }
-  .day-cell:hover::after { content: attr(data-date); position: absolute; bottom: calc(100% + 4px); left: 50%; transform: translateX(-50%); background: #000; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; z-index: 10; pointer-events: none; }
-  .day-cell.complete     { background: var(--green); }
-  .day-cell.in_progress  { background: var(--yellow); animation: pulse 1.5s infinite; }
-  .day-cell.not_started  { background: var(--gray-dim); }
-  .day-cell.scheduled    { background: var(--scheduled-dim); opacity: 0.7; }
-  .day-cell.out_of_scope { background: transparent; }
-  .day-cell.empty        { background: transparent; }
+  .day-cell:hover::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 4px); left: 50%; transform: translateX(-50%); background: #000; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; z-index: 10; pointer-events: none; }
+  .day-cell.complete    { background: var(--green); }
+  .day-cell.active      { background: var(--yellow); animation: pulse 1.5s infinite; }
+  .day-cell.queued      { background: var(--queued-dim); opacity: 0.85; }
+  .day-cell.failed      { background: var(--red); opacity: 0.8; }
+  .day-cell.not_in_queue{ background: var(--gray-dim); opacity: 0.4; }
+  .day-cell.empty       { background: transparent; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
   /* Legend */
-  .legend { display: flex; gap: 16px; flex-wrap: wrap; }
-  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
   .legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
-  .legend-dot.complete    { background: var(--green); }
-  .legend-dot.in_progress { background: var(--yellow); }
-  .legend-dot.scheduled   { background: var(--scheduled-dim); }
-  .legend-dot.not_started { background: var(--gray-dim); }
+  .legend-dot.complete     { background: var(--green); }
+  .legend-dot.active       { background: var(--yellow); }
+  .legend-dot.queued       { background: var(--queued-dim); }
+  .legend-dot.failed       { background: var(--red); }
+  .legend-dot.not_in_queue { background: var(--gray-dim); opacity: 0.5; }
 
-  .section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+  @media (max-width: 1000px) { .two-col { grid-template-columns: 1fr; } }
 
-  .loading { color: var(--muted); font-style: italic; }
-  .error-banner { background: #450a0a; border: 1px solid var(--red); color: var(--red); border-radius: 8px; padding: 10px 14px; font-size: 12px; }
+  .loading { color: var(--muted); font-style: italic; font-size: 12px; }
 </style>
 </head>
 <body>
 
 <header>
   <div>
-    <h1>Card Oracle — <span>Backfill Dashboard</span></h1>
-    <div style="color:var(--muted);font-size:11px;margin-top:2px">Qdrant vector store population · 12 × g4dn.xlarge · us-west-1</div>
+    <h1>Card Oracle — <span>Backfill Dashboard v2</span></h1>
+    <div style="color:var(--muted);font-size:11px;margin-top:2px">
+      S3 job-queue system · card-oracle-vectors/backfill-v2 · 12 × EC2 workers · us-west-1
+    </div>
   </div>
   <div class="header-meta">
     <div>Updated: <span id="updated-at">—</span></div>
@@ -1168,76 +749,87 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="main">
 
-  <!-- Summary cards -->
+  <!-- Summary cards row -->
   <div class="summary-grid" id="summary-cards">
-    <div class="card blue"><div class="label">Active Workers</div><div class="value" id="s-active">—</div><div class="sub">of 12 total</div></div>
-    <div class="card yellow"><div class="label">Combined Throughput</div><div class="value" id="s-rps">—</div><div class="sub">rows / second</div></div>
-    <div class="card green"><div class="label">Total Rows Loaded</div><div class="value" id="s-rows">—</div><div class="sub">into Qdrant</div></div>
-    <div class="card purple"><div class="label">Rows/Day (est.)</div><div class="value" id="s-daily">—</div><div class="sub">at current rate</div></div>
-    <div class="card"><div class="label">Images Skipped</div><div class="value" id="s-skipped" style="color:var(--red)">—</div><div class="sub">404 / timeout</div></div>
-    <div class="card"><div class="label">S3 Checkpoints</div><div class="value" id="s-s3" style="font-size:14px">—</div><div class="sub">availability</div></div>
+    <div class="card yellow"><div class="label">Active Jobs</div><div class="value" id="s-active">—</div><div class="sub">currently running</div></div>
+    <div class="card blue"><div class="label">Queue Remaining</div><div class="value" id="s-queue">—</div><div class="sub">pending jobs</div></div>
+    <div class="card green"><div class="label">Complete</div><div class="value" id="s-complete">—</div><div class="sub">jobs finished</div></div>
+    <div class="card red"><div class="label">Failed</div><div class="value" id="s-failed">—</div><div class="sub">jobs failed</div></div>
+    <div class="card purple"><div class="label">ETA</div><div class="value" id="s-eta" style="font-size:18px">—</div><div class="sub">estimated finish</div></div>
   </div>
 
-  <!-- Phase progress + worker table -->
+  <!-- Overall progress bar -->
+  <div class="overall-progress">
+    <div class="label">Overall Progress</div>
+    <div class="progress-bar-lg"><div class="progress-fill-lg" id="overall-bar" style="width:0%"></div></div>
+    <div class="progress-meta">
+      <span id="overall-label">—</span>
+      <span id="overall-pct" style="font-weight:700;color:var(--green)">0%</span>
+    </div>
+  </div>
+
+  <!-- Priority bands + worker fleet -->
   <div class="two-col">
 
     <div class="section">
-      <div class="section-title">eBay Phase Progress (w0–w5)</div>
-      <div class="phase-grid" id="phase-grid"><div class="loading">Loading…</div></div>
-      <div style="margin-top:14px">
-        <div class="section-title">Non-eBay Backfill Progress (w6–w11)</div>
-        <div class="phase-grid" id="nonebay-grid"><div class="loading">Loading…</div></div>
-      </div>
+      <div class="section-title">Priority Band Progress</div>
+      <div class="band-grid" id="band-grid"><div class="loading">Loading…</div></div>
     </div>
 
     <div class="section">
-      <div class="section-title">Worker Fleet</div>
+      <div class="section-title">Worker Fleet (SSH)</div>
       <div style="overflow-x:auto">
         <table class="worker-table">
           <thead><tr>
-            <th>#</th><th>Status</th><th>Task</th><th>Slice</th><th>Rows</th><th>r/s</th><th>ETA</th>
+            <th>#</th><th>IP</th><th>Service</th><th>Last log line</th>
           </tr></thead>
-          <tbody id="worker-tbody"><tr><td colspan="7" class="loading">Loading…</td></tr></tbody>
+          <tbody id="worker-tbody"><tr><td colspan="4" class="loading">Loading…</td></tr></tbody>
         </table>
       </div>
     </div>
 
   </div>
 
-  <!-- eBay calendar -->
+  <!-- Active jobs table -->
+  <div class="section">
+    <div class="section-title">Active Jobs</div>
+    <div style="overflow-x:auto">
+      <table class="jobs-table">
+        <thead><tr>
+          <th>Job ID</th>
+          <th>Index</th>
+          <th>P</th>
+          <th>Estimate</th>
+          <th>Scrolled</th>
+          <th>Progress</th>
+          <th>Age</th>
+          <th>Checkpoint age</th>
+          <th>Rate (docs/hr)</th>
+        </tr></thead>
+        <tbody id="jobs-tbody"><tr><td colspan="9" class="loading">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Date coverage calendar -->
   <div class="section calendar-section">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <div>
-        <div class="section-title" style="margin:0">eBay Vector Coverage</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">Jan 2025 – present · workers w0–w5</div>
+        <div class="section-title" style="margin:0">eBay Date Coverage</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Jan 2024 – present · newest first</div>
       </div>
       <div class="legend">
         <div class="legend-item"><div class="legend-dot complete"></div>Complete</div>
-        <div class="legend-item"><div class="legend-dot in_progress"></div>In progress</div>
-        <div class="legend-item"><div class="legend-dot scheduled"></div>Scheduled</div>
-        <div class="legend-item"><div class="legend-dot not_started"></div>Not started</div>
+        <div class="legend-item"><div class="legend-dot active"></div>Active</div>
+        <div class="legend-item"><div class="legend-dot queued"></div>Queued</div>
+        <div class="legend-item"><div class="legend-dot failed"></div>Failed</div>
+        <div class="legend-item"><div class="legend-dot not_in_queue"></div>Not queued</div>
       </div>
     </div>
     <div class="calendar-grid" id="calendar-grid"><div class="loading">Loading…</div></div>
   </div>
 
-  <!-- Non-eBay calendar -->
-  <div class="section calendar-section">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-      <div>
-        <div class="section-title" style="margin:0">Non-eBay Vector Coverage</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">Jan 2025 – present · workers w6–w11 · Fanatics/PWCC · Pristine · Goldin · MySlabs · Heritage</div>
-      </div>
-      <div class="legend">
-        <div class="legend-item"><div class="legend-dot complete"></div>Complete</div>
-        <div class="legend-item"><div class="legend-dot in_progress"></div>In progress</div>
-        <div class="legend-item"><div class="legend-dot not_started"></div>Not started</div>
-      </div>
-    </div>
-    <div class="calendar-grid" id="nonebay-calendar-grid"><div class="loading">Loading…</div></div>
-  </div>
-
-</div>
+</div><!-- .main -->
 
 <script>
 const API_URL = '/api/status';
@@ -1245,16 +837,25 @@ let countdownTimer = null;
 let nextUpdateTime = null;
 
 function fmt(n) {
+  if (n === null || n === undefined) return '—';
+  n = +n;
   if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
-  return n.toString();
+  return Math.round(n).toString();
 }
 
-function fmtEta(min) {
-  if (min === null || min === undefined) return '—';
-  if (min < 60)   return Math.round(min) + 'm';
-  if (min < 1440) return (min/60).toFixed(1) + 'h';
-  return (min/1440).toFixed(1) + 'd';
+function fmtAge(secs) {
+  if (secs === null || secs === undefined) return '—';
+  if (secs < 60)   return Math.round(secs) + 's';
+  if (secs < 3600) return Math.round(secs / 60) + 'm';
+  return (secs / 3600).toFixed(1) + 'h';
+}
+
+function ageClass(secs, warnSecs, staleSecs) {
+  if (secs === null || secs === undefined) return '';
+  if (secs >= staleSecs) return 'age-stale';
+  if (secs >= warnSecs)  return 'age-warn';
+  return '';
 }
 
 function fmtTime(iso) {
@@ -1263,144 +864,164 @@ function fmtTime(iso) {
   return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 }
 
-function phaseColor(phase_num) {
-  return ['badge phase','badge phase2','badge phase','badge phase2','badge phase'][phase_num] || 'badge';
+function pBadge(p) {
+  return `<span class="badge p${p}">P${p}</span>`;
 }
 
+function svcClass(svc) {
+  if (!svc || svc === 'unknown') return 'svc-unknown';
+  if (svc === 'active') return 'svc-active';
+  return 'svc-inactive';
+}
+
+// ── Summary cards ────────────────────────────────────────────────
 function renderSummary(data) {
-  document.getElementById('s-active').textContent  = data.workers_active;
-  document.getElementById('s-rps').textContent     = data.combined_rps;
-  document.getElementById('s-rows').textContent    = fmt(data.total_rows);
-  document.getElementById('s-daily').textContent   = fmt(data.combined_rps * 86400);
-  document.getElementById('s-skipped').textContent = fmt(data.total_skipped);
-  document.getElementById('s-s3').textContent      = data.s3_available ? '✓ Connected' : '✗ No bucket';
+  document.getElementById('s-active').textContent   = data.active_count ?? '—';
+  document.getElementById('s-queue').textContent    = fmt(data.queue_count);
+  document.getElementById('s-complete').textContent = fmt(data.complete_count);
+  document.getElementById('s-failed').textContent   = fmt(data.failed_count);
+  document.getElementById('s-eta').textContent      = data.eta || '—';
   document.getElementById('updated-at').textContent = fmtTime(data.updated_at);
+
+  const pct = data.progress_pct ?? 0;
+  document.getElementById('overall-bar').style.width = pct + '%';
+  document.getElementById('overall-pct').textContent = pct.toFixed(1) + '%';
+  const total = (data.complete_count||0) + (data.active_count||0) + (data.queue_count||0) + (data.failed_count||0);
+  document.getElementById('overall-label').textContent =
+    `${fmt(data.complete_count)} of ${fmt(total)} jobs complete`;
 }
 
-function renderPhaseGrid(gridId, rows, workerCount) {
-  const el = document.getElementById(gridId);
-  if (!rows || rows.length === 0) { el.innerHTML = '<div style="color:var(--muted);font-size:11px">No data</div>'; return; }
-  el.innerHTML = rows.map(p => {
-    const pct  = p.pct;
-    const cls  = pct === 0 ? 'zero' : pct < 100 ? 'partial' : '';
+// ── Priority bands ───────────────────────────────────────────────
+function renderBands(bands) {
+  const el = document.getElementById('band-grid');
+  if (!bands || !bands.length) { el.innerHTML = '<div class="loading">No data</div>'; return; }
+  el.innerHTML = bands.map(b => {
+    const pct  = b.pct ?? 0;
+    const cls  = pct === 0 ? 'fill-gray' : pct < 100 ? 'fill-yellow' : 'fill-green';
     const pcls = pct === 0 ? 'zero' : '';
-    // For non-eBay rows use task count instead of days
-    const subtitle = p.total_tasks !== undefined
-      ? `${p.complete_tasks}/${p.total_tasks} tasks${p.in_progress > 0 ? ' · ' + p.in_progress + ' active' : ''}`
-      : `${p.complete_days}/${p.total_days} days · ${p.complete_workers}/${workerCount} workers done`;
-    return `<div class="phase-row">
-      <div class="phase-label">${p.label}</div>
+    const sub  = b.total === 0
+      ? 'no jobs'
+      : `${b.complete}/${b.total} complete · ${b.active} active · ${b.queue} queued${b.failed ? ' · ' + b.failed + ' failed' : ''}`;
+    return `<div class="band-row">
+      <div class="band-label">${b.label}</div>
       <div>
         <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
-        <div style="font-size:10px;color:var(--muted);margin-top:3px">${subtitle}</div>
+        <div class="band-sub">${sub}</div>
       </div>
-      <div class="phase-pct ${pcls}">${pct}%</div>
+      <div class="band-pct ${pcls}">${pct}%</div>
     </div>`;
   }).join('');
 }
 
-function renderPhases(phases) {
-  renderPhaseGrid('phase-grid', phases, 12);
-}
+// ── Active jobs table ────────────────────────────────────────────
+function renderJobs(jobs) {
+  const tbody = document.getElementById('jobs-tbody');
+  if (!jobs || !jobs.length) {
+    tbody.innerHTML = '<tr><td colspan="9" class="muted" style="text-align:center;padding:16px">No active jobs</td></tr>';
+    return;
+  }
+  tbody.innerHTML = jobs.map(j => {
+    const est      = j.doc_count_estimate ?? 0;
+    const scrolled = j._scrolled ?? 0;
+    const pct      = j._progress_pct ?? null;
+    const ageS     = j._age_secs;
+    const ckptS    = j._ckpt_age_secs;
+    const rate     = j._docs_per_hour;
+    const p        = j._priority ?? j.priority ?? '?';
 
-function renderWorkers(workers) {
-  const tbody = document.getElementById('worker-tbody');
-  tbody.innerHTML = workers.map(w => {
-    const statusBadge = w.active
-      ? '<span class="badge active">● active</span>'
-      : '<span class="badge inactive">○ down</span>';
+    // Mini progress bar
+    const barFill = pct !== null
+      ? `<div class="mini-bar"><div class="mini-bar-bg"><div class="mini-bar-fill" style="width:${Math.min(100,pct)}%"></div></div><span class="mini-pct">${pct.toFixed(1)}%</span></div>`
+      : '<span class="muted">—</span>';
 
-    const isNonEbayWorker = w.index >= 6;  // workers 6–11 run worker_nonebay.py
-    const allOrigDone = w.phase_num > 6;   // all 6 original phases complete
-    const onCleanup   = !isNonEbayWorker && allOrigDone && w.cleanup_cid;
-    const onNonEbay   = isNonEbayWorker;
+    const ckptCell = ckptS === null
+      ? '<span class="muted">no ckpt</span>'
+      : `<span class="${ageClass(ckptS, 300, 900)}">${fmtAge(ckptS)}</span>`;
 
-    let taskBadge;
-    if (onNonEbay) {
-      if (w.nonebay_cid) {
-        taskBadge = `<span class="badge active">✦ non-eBay · ${w.nonebay_cid}</span>`;
-      } else if (w.active) {
-        taskBadge = '<span class="badge active">✦ non-eBay</span>';
-      } else {
-        taskBadge = '<span class="badge phase">✦ non-eBay</span>';
-      }
-    } else if (!isNonEbayWorker && allOrigDone && !w.cleanup_cid && !w.active) {
-      taskBadge = '<span class="badge done">✓ eBay done</span>';
-    } else if (onCleanup) {
-      taskBadge = `<span class="badge active">↻ cleanup · ${w.cleanup_cid}</span>`;
-    } else if (!isNonEbayWorker && allOrigDone && w.active) {
-      taskBadge = '<span class="badge active">↻ eBay cleanup</span>';
-    } else {
-      taskBadge = `<span class="${phaseColor(w.phase_num)}">P${w.phase_num} · ${w.phase_label}</span>`;
-    }
-
-    const rowsCell  = `<span class="rows">${fmt(w.rows || 0)}</span>`;
-    const rpsCell   = w.rows_s ? `<span class="rps">${w.rows_s}</span>` : '<span class="muted">—</span>';
-    const etaCell   = `<span class="eta">${fmtEta(w.eta_min)}</span>`;
-    const sliceCell = `<span class="slice-range">${w.slice_start}→${w.slice_end}</span>`;
+    const rateCell = rate !== null ? fmt(rate) : '<span class="muted">—</span>';
 
     return `<tr>
-      <td><b>w${w.index}</b><br><span class="ip">${w.ip}</span></td>
-      <td>${statusBadge}${w.error ? `<div class="err">${w.error}</div>` : ''}</td>
-      <td>${taskBadge}</td>
-      <td>${sliceCell}</td>
-      <td>${rowsCell}</td>
-      <td>${rpsCell}</td>
-      <td>${etaCell}</td>
+      <td class="mono">${j.job_id ?? '—'}</td>
+      <td class="mono" style="font-size:11px">${j.index_name ?? '—'}</td>
+      <td>${pBadge(p)}</td>
+      <td class="mono">${fmt(est)}</td>
+      <td class="mono">${fmt(scrolled)}</td>
+      <td>${barFill}</td>
+      <td class="${ageClass(ageS, 3600, 14400)}">${fmtAge(ageS)}</td>
+      <td>${ckptCell}</td>
+      <td class="mono">${rateCell}</td>
     </tr>`;
   }).join('');
 }
 
-function renderCalendar(calendar, gridId) {
-  gridId = gridId || 'calendar-grid';
+// ── Worker fleet ─────────────────────────────────────────────────
+function renderWorkers(workers) {
+  const tbody = document.getElementById('worker-tbody');
+  if (!workers || !workers.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="loading">Loading…</td></tr>';
+    return;
+  }
+  tbody.innerHTML = workers.map(w => {
+    const svc    = w.service ?? 'unknown';
+    const svcTxt = svc === 'active' ? '● active' : svc === 'inactive' ? '○ inactive' : svc;
+    const log    = w.log_line || (w.error ? `ERROR: ${w.error}` : '—');
+    return `<tr>
+      <td><b>w${w.index}</b></td>
+      <td class="ip">${w.ip}</td>
+      <td class="${svcClass(svc)}">${svcTxt}</td>
+      <td class="log-preview" title="${log.replace(/"/g,'&quot;')}">${log}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Calendar ─────────────────────────────────────────────────────
+function renderCalendar(coverage) {
+  const grid = document.getElementById('calendar-grid');
+  if (!coverage || !Object.keys(coverage).length) {
+    grid.innerHTML = '<div class="loading">No data</div>';
+    return;
+  }
+
+  // Group dates by YYYY-MM
   const months = {};
-  for (const [d, status] of Object.entries(calendar)) {
-    const [y, m] = d.split('-');
-    const key = `${y}-${m}`;
+  for (const [d, status] of Object.entries(coverage)) {
+    const key = d.slice(0, 7);
     if (!months[key]) months[key] = {};
     months[key][d] = status;
   }
 
   const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const DAY_NAMES   = ['Mo','Tu','We','Th','Fr','Sa','Su'];
-
   const sortedMonths = Object.keys(months).sort().reverse(); // newest first
-  const grid = document.getElementById(gridId);
 
   grid.innerHTML = sortedMonths.map(key => {
     const [y, m] = key.split('-').map(Number);
     const label  = `${MONTH_NAMES[m-1]} ${y}`;
     const dayMap = months[key];
 
-    // Day of week for 1st of month (Mon=0)
-    const firstDow = (new Date(y, m-1, 1).getDay() + 6) % 7;
+    const firstDow   = (new Date(y, m-1, 1).getDay() + 6) % 7; // Mon=0
     const daysInMonth = new Date(y, m, 0).getDate();
 
-    // Header row
     const headerCells = DAY_NAMES.map(d => `<div class="day-label">${d}</div>`).join('');
+    const emptyCells  = Array(firstDow).fill('<div class="day-cell empty"></div>').join('');
 
-    // Empty cells before first day
-    const emptyCells = Array(firstDow).fill('<div class="day-cell empty"></div>').join('');
-
-    // Day cells
     const dayCells = [];
-    for (let d = 1; d <= daysInMonth; d++) {
-      const dateStr = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-      const status  = dayMap[dateStr] || 'out_of_scope';
-      dayCells.push(`<div class="day-cell ${status}" data-date="${dateStr} (${status})"></div>`);
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateStr = `${y}-${String(m).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+      const status  = dayMap[dateStr] || 'not_in_queue';
+      dayCells.push(`<div class="day-cell ${status}" data-tip="${dateStr} · ${status}"></div>`);
     }
 
     return `<div class="month-block">
       <div class="month-name">${label}</div>
       <div class="days-grid">
-        ${headerCells}
-        ${emptyCells}
-        ${dayCells.join('')}
+        ${headerCells}${emptyCells}${dayCells.join('')}
       </div>
     </div>`;
   }).join('');
 }
 
+// ── Countdown ────────────────────────────────────────────────────
 function startCountdown() {
   if (countdownTimer) clearInterval(countdownTimer);
   countdownTimer = setInterval(() => {
@@ -1410,6 +1031,7 @@ function startCountdown() {
   }, 1000);
 }
 
+// ── Main fetch ───────────────────────────────────────────────────
 async function fetchAndRender() {
   try {
     const resp = await fetch(API_URL);
@@ -1419,17 +1041,15 @@ async function fetchAndRender() {
     nextUpdateTime = data.next_update_at ? new Date(data.next_update_at).getTime() : Date.now() + 60000;
 
     renderSummary(data);
-    renderPhases(data.phase_summary || []);
-    renderPhaseGrid('nonebay-grid', data.nonebay_summary || [], 6);
+    renderBands(data.priority_bands || []);
+    renderJobs(data.active_jobs || []);
     renderWorkers(data.workers || []);
-    renderCalendar(data.calendar || {}, 'calendar-grid');
-    renderCalendar(data.nonebay_calendar || {}, 'nonebay-calendar-grid');
+    renderCalendar(data.date_coverage || {});
   } catch(e) {
     console.error('Fetch error:', e);
   }
 }
 
-// Initial load + polling
 fetchAndRender();
 startCountdown();
 setInterval(fetchAndRender, 60000);
@@ -1441,12 +1061,12 @@ setInterval(fetchAndRender, 60000);
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Multi-threaded HTTP server — each request in its own thread."""
-    daemon_threads    = True   # threads die with the process
+    daemon_threads     = True
     allow_reuse_address = True
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    timeout = 10  # seconds to wait for request headers before dropping connection
+    timeout = 10
 
     def log_message(self, fmt, *args):  # suppress access logs
         pass
@@ -1481,7 +1101,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Backfill dashboard server")
+    parser = argparse.ArgumentParser(description="Backfill dashboard server (v2 — S3 job-queue system)")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
         "--once",
@@ -1490,23 +1110,24 @@ def main():
     )
     args = parser.parse_args()
 
+    if not _BOTO3_AVAILABLE:
+        print("[dashboard] WARNING: boto3 not installed — S3 polling disabled", flush=True)
+
     if args.once:
         poll_and_update()
         with _state_lock:
             print(json.dumps(_state, default=str, indent=2))
         return
 
-    print(f"[dashboard] Doing initial poll (this may take ~15 seconds)…", flush=True)
+    print("[dashboard] Doing initial poll (this may take ~20 seconds)…", flush=True)
     poll_and_update()
-    print(f"[dashboard] Initial poll complete.", flush=True)
+    print("[dashboard] Initial poll complete.", flush=True)
 
     poller = threading.Thread(target=_background_poller, daemon=True)
     poller.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print(f"[dashboard] Serving at http://localhost:{args.port}", flush=True)
-    if not S3_BUCKET:
-        print("[dashboard] WARNING: S3_VECTOR_BUCKET not set — calendar will use SSH data only", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
