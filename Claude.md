@@ -2844,3 +2844,242 @@ Estimated storage costs (us-west-1, S3 Standard):
 - Qdrant Documentation: https://qdrant.tech/documentation/
 - OpenCLIP: https://github.com/mlfoundations/open_clip
 - sentence-transformers/all-MiniLM-L6-v2: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+
+---
+
+## 20. Backfill Operations (S3 Job-Queue System)
+
+> **Last Updated:** May 2026  
+> **Status:** Active — 12 GPU workers running, ~1,800 jobs remaining in queue
+
+This section documents the **operational backfill infrastructure** that populates Qdrant from the extant OpenSearch cluster. It covers the S3 job-queue system, worker fleet management, dashboard, and known operational patterns.
+
+---
+
+### 20.1 System Overview
+
+The backfill uses a **dynamic S3 job queue** (not static worker-index assignment). Any worker can claim any job. Jobs are split by the `seed_backfill_queue.py` script into per-date-index windows; workers claim them atomically and process independently.
+
+```
+S3 bucket: card-oracle-vectors
+
+backfill-v2/
+├── queue/{job_id}.json        — pending jobs (workers claim from here)
+├── active/{job_id}.json       — currently running (claimed by a worker)
+├── complete/{job_id}.json     — finished jobs (with stats)
+├── failed/{job_id}.json       — failed jobs (with error)
+└── checkpoints/{job_id}.json  — per-job progress (search_after cursor + stats)
+```
+
+**Job ID format:** `{index_name}-w{window_id}` — e.g. `2025-10-15-w2`
+
+Each index is split into `NUM_WORKERS=3` time-window shards at queue-seed time, giving roughly equal doc counts per job. Workers resume from checkpoint if interrupted (via `search_after` cursor — no scroll TTL expiry).
+
+---
+
+### 20.2 Worker Fleet
+
+| Parameter | Value |
+|-----------|-------|
+| Instance type | `g4dn.xlarge` (T4 GPU, 16GB VRAM, 4 vCPU, 16GB RAM) |
+| Count | 12 |
+| Region | `us-west-1` |
+| Systemd service | `os-backfill.service` |
+| Worker script | `tools/backfill_from_opensearch.py` |
+| Managed by | `infra/terraform/gpu-worker/` |
+
+**Current worker IPs (as of May 2026 — verify with `terraform output worker_public_ips`):**
+
+```
+w0:  54.215.57.135    w4:  18.145.69.81     w8:  13.57.176.92
+w1:  52.53.33.218     w5:  18.145.116.26    w9:  54.219.76.40
+w2:  3.101.66.241     w6:  54.153.95.19     w10: 13.56.140.67
+w3:  13.57.215.67     w7:  50.18.237.248    w11: 54.176.9.174
+```
+
+> **Note:** IPs are not Elastic — they change if instances are stopped/started or Terraform re-applies. Always run `terraform output worker_public_ips` after any infra change, then update `WORKER_IPS` in `tools/backfill_dashboard.py` and `WORKERS` in `tools/deploy_os_backfill.sh`.
+
+---
+
+### 20.3 Key Tuning Parameters (`tools/backfill_from_opensearch.py`)
+
+```python
+# OpenSearch paging
+OS_PAGE_SIZE    = 1_000   # docs per search_after page
+OS_PAGE_PAUSE   = 0.05    # seconds between pages (conservative: 0.30)
+
+# Qdrant
+QDRANT_UPSERT_BATCH = 500   # points per upsert call (conservative: 100)
+QDRANT_UPSERT_PAUSE = 0.05  # seconds between upsert batches (conservative: 0.50)
+QDRANT_CHECK_PAUSE  = 0.0   # no pause between retrieve batches
+QDRANT_LATENCY_WARN = 5.0   # backs off 60s if Qdrant count() exceeds this
+
+# Image fetching
+IMAGE_CONCURRENCY = 64      # async concurrent downloads (conservative: 16)
+
+# Orphan rescue
+ORPHAN_THRESHOLD_MINUTES = 20  # job declared dead after 20 min without checkpoint
+                                # (checkpoints written every 5,000 docs; at 150K/hr = ~2 min)
+```
+
+**Throughput achieved:** ~150–250K docs/hr per worker after tuning (was ~55K/hr).
+
+**Key optimisation that mattered most:** Text encoding was previously called per-document (`text_encoder.encode()` in a loop). Changed to collect all specs texts for a page and call `text_encoder.encode_batch()` once — single batched MiniLM inference instead of N sequential calls.
+
+---
+
+### 20.4 Operational Commands
+
+```bash
+# ── Local dev setup ───────────────────────────────────────────────
+cd ~/Desktop/Code/card-oracle-max
+source .venv-local/bin/activate
+
+# AWS auth (SSO — expires after ~8 hours)
+aws sso login --profile card-oracle
+export AWS_PROFILE=card-oracle
+
+# ── Deploy / restart all 12 workers ──────────────────────────────
+bash tools/deploy_os_backfill.sh
+
+# Deploy specific workers only (e.g. workers 3, 4, 5)
+bash tools/deploy_os_backfill.sh 3 4 5
+
+# ── Monitor a worker ─────────────────────────────────────────────
+ssh -i ~/.ssh/qdrant-test.pem ec2-user@54.215.57.135 'sudo journalctl -fu os-backfill'
+
+# ── Dashboard ────────────────────────────────────────────────────
+# Remote (always on, auto-restart):
+open http://54.215.57.135:8080
+
+# Local (requires AWS_PROFILE=card-oracle):
+python tools/backfill_dashboard.py
+
+# ── Queue management ─────────────────────────────────────────────
+# Check queue / active / complete counts
+aws s3 ls s3://card-oracle-vectors/backfill-v2/queue/    | wc -l
+aws s3 ls s3://card-oracle-vectors/backfill-v2/active/   | wc -l
+aws s3 ls s3://card-oracle-vectors/backfill-v2/complete/ | wc -l
+
+# Manually rescue a specific orphaned job
+aws s3 cp s3://card-oracle-vectors/backfill-v2/active/JOB_ID.json \
+          s3://card-oracle-vectors/backfill-v2/queue/JOB_ID.json
+aws s3 rm  s3://card-oracle-vectors/backfill-v2/active/JOB_ID.json
+
+# Seed queue for missing index ranges
+python tools/seed_backfill_queue.py --priority 1 2   # P1+P2 only
+python tools/seed_backfill_queue.py --dry-run         # preview without writing
+
+# Re-queue truncated jobs (scroll-cursor bug — pre-May 2026 runs only)
+python tools/requeue_truncated_jobs.py --dry-run
+python tools/requeue_truncated_jobs.py
+
+# ── Infra ─────────────────────────────────────────────────────────
+cd infra/terraform/gpu-worker
+terraform plan    # check before applying
+terraform apply   # scale workers / update SG rules
+terraform output worker_public_ips   # get current IPs after apply
+```
+
+---
+
+### 20.5 Dashboard
+
+The backfill dashboard runs permanently on **worker-0** as `os-dashboard.service`.
+
+| | |
+|-|-|
+| **URL** | http://54.215.57.135:8080 |
+| **Script** | `tools/backfill_dashboard.py` |
+| **Service** | `os-dashboard.service` on worker-0 |
+| **Restart** | `ssh -i ~/.ssh/qdrant-test.pem ec2-user@54.215.57.135 'sudo systemctl restart os-dashboard'` |
+| **Logs** | `ssh -i ~/.ssh/qdrant-test.pem ec2-user@54.215.57.135 'sudo journalctl -fu os-dashboard'` |
+
+The dashboard polls S3 directly (no SSH proxy needed for queue/progress data) and uses private IPs for the per-worker SSH status poll. It auto-detects EC2 vs local via IMDSv2.
+
+**Dashboard sections:**
+- Summary cards: active / queued / complete / failed / ETA
+- Priority band progress bars (P1–P5)
+- Active jobs table: progress %, checkpoint age, docs/hr, staleness warnings
+- Worker fleet table: `systemctl is-active os-backfill` per worker + last log line
+- Date coverage calendar: 5 states (complete / active / queued / failed / not_in_queue)
+
+---
+
+### 20.6 Job Claim Mechanism (Race-Free)
+
+The S3 queue uses **`IfNoneMatch='*'`** on the `active/` write for atomic claims. Only one worker wins when multiple workers race on the same top-priority job; losers catch `PreconditionFailed` and fall through to their next candidate.
+
+```python
+# tools/backfill_from_opensearch.py → _claim_next_job()
+s3.put_object(
+    Bucket=S3_BUCKET,
+    Key=active_key,
+    Body=...,
+    IfNoneMatch="*",   # atomic: fails if another worker already claimed this job
+)
+```
+
+Prior to this fix (May 2026), multiple workers would process the same job simultaneously — visible in logs as multiple workers completing the same `job_id`.
+
+---
+
+### 20.7 Orphan Rescue
+
+A job is **orphaned** when its worker crashes or is restarted mid-job (e.g. `systemctl restart os-backfill` during a deploy). The active/ file stays behind with no live worker.
+
+**Auto-rescue logic** (`_rescue_orphaned_jobs()`):
+- Threshold: **20 minutes** since last checkpoint write (was 90 min — too slow)
+- Triggers: on startup, on every idle poll, and every 5 job completions
+- Action: moves `active/{job_id}.json` → `queue/{job_id}.json`
+- Workers resume from the `search_after` cursor in the checkpoint — no re-work
+
+**Rule of thumb:** active job count should never exceed worker count (12). If it does, there are orphans. They self-rescue within 20 minutes. For immediate relief:
+```bash
+# Rescue all stale active jobs at once (run locally with AWS_PROFILE=card-oracle)
+for job in $(aws s3 ls s3://card-oracle-vectors/backfill-v2/active/ | awk '{print $4}' | sed 's/.json//'); do
+  aws s3 cp s3://card-oracle-vectors/backfill-v2/active/${job}.json \
+            s3://card-oracle-vectors/backfill-v2/queue/${job}.json --quiet
+  aws s3 rm  s3://card-oracle-vectors/backfill-v2/active/${job}.json --quiet
+  echo "rescued $job"
+done
+```
+
+---
+
+### 20.8 Priority Bands
+
+Jobs are prioritised by index date / marketplace. Workers always claim the lowest priority number first.
+
+| Priority | Indices | Rationale |
+|----------|---------|-----------|
+| P1 | Oct 2025 – Feb 2026 eBay | 2–10% Qdrant coverage, highest volume, most recent |
+| P2 | Aug–Sep 2025 eBay | ~10% coverage |
+| P3 | Dec 2024 eBay | 0% coverage, older |
+| P4 | All other eBay date indices | Gap fill |
+| P5 | Non-eBay (-gold, -pris, -heritage, -pwcc, -ms) | After eBay gaps filled |
+
+---
+
+### 20.9 Security Group Rules (gpu-worker SG)
+
+| Port | Protocol | Source | Purpose |
+|------|----------|--------|---------|
+| 22 | TCP | `my_ips` (operator CIDRs) | SSH from dev machine |
+| 22 | TCP | self (SG) | Intra-fleet SSH for dashboard polling |
+| 8080 | TCP | `my_ips` | Backfill dashboard (worker-0 only) |
+| all | all | 0.0.0.0/0 (egress) | OpenSearch, S3, Qdrant, image CDN, pip |
+
+Managed in `infra/terraform/gpu-worker/security_groups.tf`.
+
+---
+
+### 20.10 Tools Reference
+
+| Script | Purpose |
+|--------|---------|
+| `tools/backfill_from_opensearch.py` | Worker process — claims jobs, scrolls OS, embeds, upserts to Qdrant |
+| `tools/backfill_dashboard.py` | Web dashboard server (S3 + SSH polling) |
+| `tools/deploy_os_backfill.sh` | Rsync + systemd deploy to all 12 workers in parallel |
+| `tools/seed_backfill_queue.py` | Seed S3 queue from OS index list (idempotent) |
+| `tools/requeue_truncated_jobs.py` | Re-queue jobs truncated by old scroll-cursor expiry bug |
