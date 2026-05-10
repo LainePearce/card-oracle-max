@@ -99,26 +99,26 @@ S3_CKPT_PREFIX  = "backfill-v2/checkpoints"
 STOP_KEY        = "backfill-v2/STOP"
 
 # OpenSearch paging
-OS_PAGE_SIZE    = 500
-OS_PAGE_PAUSE   = 0.30    # seconds between scroll pages (doubled at peak)
+OS_PAGE_SIZE    = 1_000   # doubled from 500 — halves round-trip count
+OS_PAGE_PAUSE   = 0.05    # seconds between scroll pages (was 0.30 — cluster handles it fine)
 
 # Qdrant
 QDRANT_CHECK_BATCH  = 500   # IDs per retrieve call
-QDRANT_CHECK_PAUSE  = 0.10  # seconds between retrieve batches
-QDRANT_UPSERT_BATCH = 100   # points per upsert
-QDRANT_UPSERT_PAUSE = 0.50  # seconds between upsert batches (doubled at peak)
+QDRANT_CHECK_PAUSE  = 0.0   # no pause needed between retrieve batches
+QDRANT_UPSERT_BATCH = 500   # points per upsert (was 100 — 5× fewer round trips)
+QDRANT_UPSERT_PAUSE = 0.05  # seconds between upsert batches (was 0.50 — cluster guarded by latency check)
 QDRANT_LATENCY_WARN = 5.0   # count() threshold — fires only if cluster is genuinely stressed
 QDRANT_LATENCY_PAUSE= 60    # pause duration when threshold exceeded (seconds)
 
 # Image fetching
-IMAGE_CONCURRENCY   = 16
+IMAGE_CONCURRENCY   = 64    # concurrent async downloads (was 16)
 IMAGE_TIMEOUT       = 3.0   # seconds per image attempt
 IMAGE_RETRY_PAUSE   = 2.0   # seconds before retrying with fallback URL
 
 # Flush a parquet shard + update checkpoint every N hits
 SHARD_FLUSH_SIZE = 5_000
 
-# Peak hours (UTC) — all pauses doubled during this window
+# Peak hours (UTC) — pauses during this window (kept for OS health, reduced impact now)
 PEAK_START_UTC = 9
 PEAK_END_UTC   = 15
 
@@ -612,24 +612,35 @@ def process_job(
                             for row in v:
                                 flat_vecs.append(row)
 
+                    # ── Batch text encoding — one encode_batch() call for all docs ──
+                    # Collect specs texts in os_ids_ordered position order so results
+                    # align with flat_vecs without an extra lookup.
+                    text_vecs: list[np.ndarray | None] = [None] * len(os_ids_ordered)
+                    if text_encoder and classification["has_item_specifics"]:
+                        specs_texts: list[str | None] = []
+                        for oid in os_ids_ordered:
+                            d = doc_lookup.get(oid)
+                            if d is None:
+                                specs_texts.append(None)
+                                continue
+                            src_hit = d["hit"].get("_source", {})
+                            specs_texts.append(
+                                format_specifics(src_hit.get("itemSpecifics") or {}) or None
+                            )
+                        try:
+                            text_vecs = text_encoder.encode_batch(specs_texts)
+                        except Exception as exc:
+                            logger.warning("encode_batch failed, falling back to None: {}", exc)
+
                     for i, os_id_str in enumerate(os_ids_ordered):
                         if i >= len(flat_vecs) or flat_vecs[i] is None:
                             continue
                         ivec = flat_vecs[i]
+                        tvec = text_vecs[i] if i < len(text_vecs) else None
 
                         doc = doc_lookup[os_id_str]
                         hit = doc["hit"]
                         src = hit.get("_source", {})
-
-                        # ── Text (specifics) vector for eBay only ─────────────
-                        tvec = None
-                        if text_encoder and classification["has_item_specifics"]:
-                            specs_text = format_specifics(src.get("itemSpecifics") or {})
-                            if specs_text:
-                                try:
-                                    tvec = text_encoder.encode(specs_text)
-                                except Exception:
-                                    pass
 
                         # ── Build payload ─────────────────────────────────────
                         payload = extract_payload(
