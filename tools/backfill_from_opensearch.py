@@ -797,7 +797,11 @@ def _rescue_orphaned_jobs(s3) -> None:
     Workers load checkpoints (which store search_after) when they resume
     a job, so progress is not lost — only the final shard is re-processed.
     """
-    ORPHAN_THRESHOLD_MINUTES = 90   # job is declared dead after 90 min without a checkpoint update
+    ORPHAN_THRESHOLD_MINUTES = 20   # job is declared dead after 20 min without a checkpoint update
+    # Rationale: checkpoints are written every 5,000 docs; at ~150K docs/hr that's
+    # every ~2 min.  Even at a conservative 30K docs/hr it's every ~10 min.
+    # 20 min gives 2× headroom for slow pages / Qdrant backpressure without
+    # letting orphans sit idle for 1.5 hours as the old 90-min threshold did.
 
     now = datetime.now(timezone.utc)
     rescued = 0
@@ -914,14 +918,16 @@ def main() -> None:
             break
 
         # Periodically re-scan for orphans left by other crashed workers.
-        # Runs every RESCUE_EVERY_N_JOBS completions so we don't rely solely
-        # on the startup scan (which misses jobs orphaned after deploy restarts).
+        # Triggers on every idle poll (worker has no job = low-cost moment to scan)
+        # and every RESCUE_EVERY_N_JOBS completions during busy periods.
         if jobs_since_rescue >= RESCUE_EVERY_N_JOBS:
             _rescue_orphaned_jobs(s3)
             jobs_since_rescue = 0
 
         job = _claim_next_job(s3, worker_id)
         if job is None:
+            _rescue_orphaned_jobs(s3)   # idle worker: good time to scan for orphans
+            jobs_since_rescue = 0
             idle_polls += 1
             wait = min(30 * idle_polls, 300)
             logger.info("Queue empty — worker {} waiting {}s...", worker_id, wait)
