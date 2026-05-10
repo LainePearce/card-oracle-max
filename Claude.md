@@ -278,7 +278,7 @@ COLLECTION_CONFIG = {
 
 ### 4.2 Payload Schema
 
-Every point stored in Qdrant must carry this payload. The fields are sourced directly from the OpenSearch index mapping (see Section 18). Keep payload **minimal** — the full source document remains in OpenSearch (read-only); payload exists only for Qdrant-side filtering and boosting. OpenSearch `mget` is used to enrich search results with full document data after Qdrant returns candidate IDs.
+Every point stored in Qdrant must carry this payload. The fields are sourced directly from the OpenSearch index mapping (see Section 16). Keep payload **minimal** — the full source document remains in OpenSearch (read-only); payload exists only for Qdrant-side filtering and boosting. OpenSearch `mget` is used to enrich search results with full document data after Qdrant returns candidate IDs.
 
 ```python
 # src/schema/collection.py — payload field definitions
@@ -1361,7 +1361,7 @@ AWS_BATCH_JOB_DEFINITION=clip-embedding-job
 
 # ── S3 Vector Store ───────────────────────────────────────────────
 # Single bucket for all vectors. Key structure encodes all metadata.
-# See Section 16 for full naming convention.
+# See Section 18 for full naming convention.
 S3_VECTOR_BUCKET=your-vector-store-bucket
 
 # Root prefix within the bucket (useful if bucket is shared with other data)
@@ -1532,7 +1532,7 @@ S3 is the **primary durable store for all generated vectors**. Qdrant is a query
 - If a new embedding model is introduced, the old vectors remain in S3 as a versioned baseline for comparison.
 - Vectors are written to S3 **before** being loaded into Qdrant. A vector that exists in Qdrant but not S3 is a pipeline bug.
 
-See **Section 16** for the full S3 vector store specification: bucket structure, key naming convention, file format, write/read APIs, and the repopulation procedure.
+See **Section 18** for the full S3 vector store specification: bucket structure, key naming convention, file format, write/read APIs, and the repopulation procedure.
 
 **Format:** Parquet (columnar, compressed with Snappy). Parquet allows efficient reads of only the `os_id` and `vector` columns during Qdrant load without deserialising the full file. It also supports predicate pushdown for targeted repopulation (e.g. re-load only eBay image vectors for a given date range).
 
@@ -1560,7 +1560,7 @@ This avoids full re-index and allows progressive validation. See `src/schema/col
 
 ### 13.6 Why itemSpecifics Inference Is Deferred to Stage 2
 
-The non-eBay marketplace inference pipeline (Section 17.8) is deliberately excluded from Stage 1. The reason is scope control: the comparative experiment in Stage 1 evaluates the vector search capability of Qdrant versus OpenSearch on a like-for-like basis. Introducing inferred specifics of variable quality during Stage 1 would add a confounding variable to the experiment — it would be impossible to determine whether recall differences were due to the search system or the quality of the inferred specifics.
+The non-eBay marketplace inference pipeline (Section 16.8) is deliberately excluded from Stage 1. The reason is scope control: the comparative experiment in Stage 1 evaluates the vector search capability of Qdrant versus OpenSearch on a like-for-like basis. Introducing inferred specifics of variable quality during Stage 1 would add a confounding variable to the experiment — it would be impossible to determine whether recall differences were due to the search system or the quality of the inferred specifics.
 
 In Stage 1, non-eBay marketplace documents are ingested into Qdrant with:
 - `specifics_source = "none"` (no itemSpecifics available, no inference attempted)
@@ -1663,11 +1663,11 @@ curl -X POST "http://qdrant-host:6333/collections/cards/snapshots" \
 
 ---
 
-## 18. OpenSearch Index Mapping (Source of Truth)
+## 16. OpenSearch Index Mapping (Source of Truth)
 
 The production OpenSearch cluster is **live and accessible** at the endpoint below. It uses **per-date indices** named `YYYY-MM-DD` and holds the full sold listing dataset including `imageVector` and `textVector` fields used for KNN search. This cluster is the **control system** in the experiment and the **source of data** for the Qdrant backfill.
 
-### 17.0 Live Cluster Endpoint
+### 16.0 Live Cluster Endpoint
 
 ```
 Host:     https://search-es130point-vector-h3eaau7mwcpyhgynkthfcwzeje.aos.us-west-1.on.aws
@@ -1720,11 +1720,11 @@ def get_opensearch_client() -> OpenSearch:
 
 > **CRITICAL — READ-ONLY:** The extant OpenSearch cluster is a **read-only data source** for this project. No code in this repository may create, update, or delete any index, mapping, document, or setting on this cluster under any circumstances — including during development, testing, or experiment runs. The cluster is managed by an upstream pipeline that is entirely outside the scope of this codebase. Any accidental write to this cluster risks corrupting production data.
 
-### 17.1 Index Taxonomy
+### 16.1 Index Taxonomy
 
 The cluster contains indices from **six different marketplaces**, each with a distinct naming convention and data completeness profile. Understanding this taxonomy is essential for the scroll reader, payload extraction, and the itemSpecifics inference pipeline.
 
-#### 17.1.1 eBay Indices — `YYYY-MM-DD`
+#### 16.1.1 eBay Indices — `YYYY-MM-DD`
 
 ```
 Format:   YYYY-MM-DD  (e.g. 2024-03-15)
@@ -1736,7 +1736,7 @@ Includes: Full itemSpecifics object with all structured fields
 
 These are the **highest quality indices**. itemSpecifics are provided directly by eBay sellers and cover all card identity fields (`set`, `cardNumber`, `player`, `grade`, etc.). They are the ground truth for card identification and the primary training data for the itemSpecifics inference model used on other marketplace indices.
 
-#### 17.1.2 Non-eBay Marketplace Indices
+#### 16.1.2 Non-eBay Marketplace Indices
 
 All non-eBay indices use a suffix appended to a base identifier. None of these indices include an `itemSpecifics` field in their mapping — structured card attributes must be inferred from the `title` field.
 
@@ -1750,7 +1750,7 @@ All non-eBay indices use a suffix appended to a base identifier. None of these i
 
 > **Index name format:** The base identifier for non-eBay indices is not date-based. Use `_cat/indices` on the live cluster to discover the exact current index names for each suffix.
 
-#### 17.1.3 Index Discovery
+#### 16.1.3 Index Discovery
 
 ```python
 # src/ingestion/opensearch_reader.py — index discovery helpers
@@ -1807,7 +1807,7 @@ def discover_indices(client: OpenSearch) -> list[dict]:
 
 ---
 
-### 17.2 Index Settings
+### 16.2 Index Settings
 
 ```json
 {
@@ -1831,7 +1831,7 @@ def discover_indices(client: OpenSearch) -> list[dict]:
 
 > **Note — `knn: true`:** This setting enables the OpenSearch k-NN plugin. The live cluster actively serves KNN queries against `imageVector` and `textVector` — this is the current production search path and the control condition in the experiment. After migration, new indices created for document-only storage should set `knn: false`.
 
-### 17.3 Source Exclusions and Vector Behaviour and Vector Behaviour
+### 16.3 Source Exclusions and Vector Behaviour
 
 ```json
 "_source": {
@@ -1839,7 +1839,7 @@ def discover_indices(client: OpenSearch) -> list[dict]:
 }
 ```
 
-`imageVector` and `textVector` are stored in the Lucene index for KNN traversal but **excluded from `_source`**. This applies to **all index types** (eBay dated and marketplace suffix). Non-eBay indices additionally lack `itemSpecifics` in `_source` — see Section 17.1.2. This has two distinct implications:
+`imageVector` and `textVector` are stored in the Lucene index for KNN traversal but **excluded from `_source`**. This applies to **all index types** (eBay dated and marketplace suffix). Non-eBay indices additionally lack `itemSpecifics` in `_source` — see Section 16.1.2. This has two distinct implications:
 
 **For KNN search (what the live cluster DOES support):**
 - `imageVector` and `textVector` ARE used internally by the k-NN plugin to perform HNSW graph traversal.
@@ -1851,7 +1851,7 @@ def discover_indices(client: OpenSearch) -> list[dict]:
 - During Qdrant backfill, embeddings must be **re-generated** from `galleryURL` (image via CLIP) and `itemSpecifics` (text via MiniLM). They cannot be copied directly from OpenSearch.
 - This project never writes to OpenSearch. Qdrant owns all vectors. OpenSearch is treated as an immutable read-only data source throughout.
 
-### 17.4 Top-Level Fields
+### 16.4 Top-Level Fields
 
 | OS Field | OS Type | Qdrant Payload | Notes |
 |----------|---------|----------------|-------|
@@ -1872,9 +1872,9 @@ def discover_indices(client: OpenSearch) -> list[dict]:
 | `BestOfferPrice` | `double` | **OpenSearch only** | |
 | `BestOfferCurrency` | `keyword` | **OpenSearch only** | |
 
-### 17.5 itemSpecifics Fields (eBay Indices Only)
+### 16.5 itemSpecifics Fields (eBay Indices Only)
 
-> These fields are present **only in `YYYY-MM-DD` eBay indices**. Non-eBay marketplace indices (`-gold`, `-pris`, `-heritage`, `-pwcc`, `-ms`) do not include `itemSpecifics` in their mapping. For those indices, structured specifics must be inferred — see Section 17.8.
+> These fields are present **only in `YYYY-MM-DD` eBay indices**. Non-eBay marketplace indices (`-gold`, `-pris`, `-heritage`, `-pwcc`, `-ms`) do not include `itemSpecifics` in their mapping. For those indices, structured specifics must be inferred — see Section 16.8.
 
 All `itemSpecifics` fields use `lowercase_normalizer` — values are lowercased and ASCII-folded at index time. All values written to Qdrant payload must be lowercased to match.
 
@@ -1897,7 +1897,7 @@ All `itemSpecifics` fields use `lowercase_normalizer` — values are lowercased 
 | `autographed` | `boolean` | `autographed` | Auto / signed card |
 | `team` | `keyword` | `team` | Team name (sports cards) |
 
-### 17.6 Card Identity Logic
+### 16.6 Card Identity Logic
 
 Card identification uses a **hierarchical specificity model** based on `itemSpecifics` fields:
 
@@ -1920,7 +1920,7 @@ Level 4 — Irrelevant (relevance score 0):
 
 This hierarchy drives both the **ground truth relevance annotations** for nDCG and the **Qdrant score boost policy** for catalogue cards.
 
-### 17.7 Qdrant Filter Patterns
+### 16.7 Qdrant Filter Patterns
 
 ```python
 # src/search/qdrant_search.py — filter builder
@@ -1984,7 +1984,7 @@ EXAMPLE_FILTERS = {
 
 ---
 
-### 17.8 Non-eBay Marketplace Indices — itemSpecifics Inference (Stage 2 Only)
+### 16.8 Non-eBay Marketplace Indices — itemSpecifics Inference (Stage 2 Only)
 
 > **This section describes Stage 2 functionality.** The inference pipeline is designed here for planning purposes but is **not implemented or activated in Stage 1**. In Stage 1, non-eBay documents are loaded into Qdrant with `specifics_source = "none"` and no specifics vector. See Section 13.6 for the rationale.
 >
@@ -2313,11 +2313,11 @@ async def process_hit(os_hit: dict, index_name: str, clients: dict) -> PointStru
 
 ---
 
-## 19. Stage 2 Planning Notes (Do Not Build Until Stage 1 Approved)
+## 17. Stage 2 Planning Notes (Do Not Build Until Stage 1 Approved)
 
 This section captures the design intent for Stage 2 so that decisions are documented while the context is fresh. It is reference material only — no code in `src/` should implement any of this.
 
-### 18.1 New OpenSearch Index Design Principles
+### 17.1 New OpenSearch Index Design Principles
 
 The new OpenSearch cluster will differ from the extant cluster in the following ways:
 
@@ -2329,9 +2329,9 @@ The new OpenSearch cluster will differ from the extant cluster in the following 
 | Managed by | Upstream pipeline (external) | This codebase (Stage 2 writer) |
 | Populated from | External data feeds | Extant cluster via scroll migration |
 
-The exact index structure for the new cluster will be defined in `stage2/docs/new_os_index_design.md` during Stage 2 planning. The extant mapping (Section 17) is the starting point, but the new mapping should be simplified and consolidated.
+The exact index structure for the new cluster will be defined in `stage2/docs/new_os_index_design.md` during Stage 2 planning. The extant mapping (Section 16) is the starting point, but the new mapping should be simplified and consolidated.
 
-### 18.2 Migration Pipeline Design
+### 17.2 Migration Pipeline Design
 
 The Stage 2 migration pipeline scrolls the extant cluster and writes to both the new OpenSearch cluster and Qdrant simultaneously:
 
@@ -2346,7 +2346,7 @@ for each index in extant cluster:
 
 Idempotency is critical — the migration must be re-runnable without creating duplicates.
 
-### 18.3 Stage 2 Success Gate
+### 17.3 Stage 2 Success Gate
 
 Stage 2 begins only when all of the following are confirmed:
 
@@ -2361,7 +2361,7 @@ Stage 2 begins only when all of the following are confirmed:
 
 ---
 
-## 16. S3 Vector Store
+## 18. S3 Vector Store
 
 S3 is the **primary durable store for all generated vectors**. Every vector produced by the embedding pipeline is written to S3 before being loaded into Qdrant. Qdrant is treated as a **queryable index** built from S3, not a source of truth. The S3 store supports:
 
@@ -2372,7 +2372,7 @@ S3 is the **primary durable store for all generated vectors**. Every vector prod
 
 ---
 
-### 16.1 Bucket Structure
+### 18.1 Bucket Structure
 
 All vectors use a **single S3 bucket** with a structured key namespace. The key encodes all metadata needed to identify, filter, and reload vectors without reading the file contents.
 
@@ -2410,7 +2410,7 @@ checkpoints/job-20260315-143022-ebay-2024-01.json
 
 ---
 
-### 16.2 Key Component Definitions
+### 18.2 Key Component Definitions
 
 | Component | Description | Values / Examples |
 |-----------|-------------|-------------------|
@@ -2426,7 +2426,7 @@ checkpoints/job-20260315-143022-ebay-2024-01.json
 
 ---
 
-### 16.3 Parameter Hash Convention
+### 18.3 Parameter Hash Convention
 
 The `{params_hash}` component is a **human-readable short descriptor** (not a hash digest) that captures the parameters that affect vector values. If any parameter changes, a new prefix is used — the old vectors remain in S3 for comparison.
 
@@ -2472,7 +2472,7 @@ def build_params_hash(vector_type: str, model_id: str) -> str:
 
 ---
 
-### 16.4 Parquet File Schema
+### 18.4 Parquet File Schema
 
 Each `.parquet` file within a shard contains the following columns:
 
@@ -2500,7 +2500,7 @@ COMPRESSION  = "snappy"
 
 ---
 
-### 16.5 Vector Store API
+### 18.5 Vector Store API
 
 ```python
 # src/embeddings/vector_store.py
@@ -2694,7 +2694,7 @@ class S3VectorStore:
 
 ---
 
-### 16.6 Pipeline Write Order (Mandatory)
+### 18.6 Pipeline Write Order (Mandatory)
 
 The pipeline always writes to S3 **before** upserting to Qdrant. This order is enforced by the pipeline and must not be changed:
 
@@ -2734,7 +2734,7 @@ async def process_and_store(
 
 ---
 
-### 16.7 Repopulation Procedure
+### 18.7 Repopulation Procedure
 
 Use this procedure whenever Qdrant needs to be rebuilt (node loss, collection reset, parameter change, or new cluster provisioning):
 
@@ -2795,7 +2795,7 @@ def repopulate_qdrant(
 
 ---
 
-### 16.8 Model Versioning and Future Embeddings
+### 18.8 Model Versioning and Future Embeddings
 
 When a new embedding model or parameter set is introduced, create a new key prefix. The old vectors remain in S3:
 
@@ -2812,7 +2812,7 @@ This means:
 
 ---
 
-### 16.9 S3 Bucket Configuration Recommendations
+### 18.9 S3 Bucket Configuration Recommendations
 
 ```
 Bucket settings:
@@ -2833,7 +2833,7 @@ Estimated storage costs (us-west-1, S3 Standard):
 
 ---
 
-## 17. References
+## 19. References
 
 - Malkov, Y.A. and Yashunin, D.A. (2020) 'Efficient and robust approximate nearest neighbor search using HNSW', *IEEE TPAMI*, 42(4), pp. 824–836.
 - Cormack, G.V. et al. (2009) 'Reciprocal rank fusion outperforms Condorcet', *ACM SIGIR*, pp. 758–759.
