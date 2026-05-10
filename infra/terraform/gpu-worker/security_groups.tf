@@ -1,6 +1,6 @@
 resource "aws_security_group" "gpu_worker" {
   name_prefix = "${var.name_prefix}-sg-"
-  description = "GPU worker - SSH from operator IP, all outbound"
+  description = "GPU worker - SSH + dashboard from operator IP, all outbound"
 
   # SSH
   ingress {
@@ -9,6 +9,24 @@ resource "aws_security_group" "gpu_worker" {
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = var.my_ips
+  }
+
+  # Backfill dashboard (worker-0 only, but rule applied fleet-wide for simplicity)
+  ingress {
+    description = "Backfill dashboard from operator"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = var.my_ips
+  }
+
+  # Intra-fleet SSH: workers can reach each other for dashboard SSH polling
+  ingress {
+    description = "Intra-fleet SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    self        = true
   }
 
   # All outbound (needed for: OpenSearch, S3, Qdrant, image downloads, pip)
