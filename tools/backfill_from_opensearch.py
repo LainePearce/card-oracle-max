@@ -269,15 +269,16 @@ def _claim_next_job(s3, worker_id: int) -> dict | None:
     Scan the S3 queue for the highest-priority unclaimed job and claim it.
 
     Workers claim from the full pool (no filtering by worker_id) so that
-    any number of worker processes can drain the queue in parallel.  Each
-    worker adds a small random jitter before claiming to reduce the chance
-    of two workers racing on the same job.  If a race does occur, the
-    worst outcome is duplicate work — Qdrant upserts and S3 parquet writes
-    are both idempotent so no data corruption results.
+    any number of worker processes can drain the queue in parallel.
+
+    Atomic claim uses S3 conditional write (IfNoneMatch='*') so that only
+    one worker wins the race even when all 12 workers pick the same top job.
+    The losing workers catch PreconditionFailed and try their next candidate.
 
     Returns the job dict, or None if the queue is empty.
     """
     import random
+    from botocore.exceptions import ClientError
 
     prefix = f"{S3_QUEUE_PREFIX}/"
     candidates = []
@@ -298,38 +299,49 @@ def _claim_next_job(s3, worker_id: int) -> dict | None:
         return None
 
     # Pick lowest priority number (highest urgency).
-    # Secondary sort by key name so workers with different orderings still
-    # converge toward the same job — minimising unintentional duplicate work.
+    # Secondary sort by key name for deterministic ordering.
     candidates.sort(key=lambda x: (x[0], x[1]))
 
-    # Jitter: spread workers so they don't all race on the same top job.
-    # Worker with higher id waits slightly longer → natural de-collision.
-    jitter = random.uniform(0, min(worker_id * 0.1, 1.0))
-    if jitter > 0:
-        time.sleep(jitter)
+    # Try each candidate in priority order until one is claimed atomically.
+    for _, queue_key, job in candidates:
+        active_key = f"{S3_ACTIVE_PREFIX}/{job['job_id']}.json"
+        job["claimed_at"] = datetime.now(timezone.utc).isoformat()
+        job["worker_pid"] = os.getpid()
 
-    _, queue_key, job = candidates[0]
+        try:
+            # IfNoneMatch='*' — atomic claim: fails if another worker already
+            # wrote to this active key, preventing duplicate processing.
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=active_key,
+                Body=json.dumps(job, indent=2).encode(),
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                # Another worker won the race on this job — try the next candidate.
+                logger.debug("Job {} already claimed by another worker, skipping",
+                             job["job_id"])
+                continue
+            logger.error("Failed to claim job {}: {}", job["job_id"], exc)
+            return None
 
-    # Claim: copy to active, delete from queue
-    active_key = f"{S3_ACTIVE_PREFIX}/{job['job_id']}.json"
-    job["claimed_at"] = datetime.now(timezone.utc).isoformat()
-    job["worker_pid"] = os.getpid()
-    try:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=active_key,
-            Body=json.dumps(job, indent=2).encode(),
-            ContentType="application/json",
-        )
-        s3.delete_object(Bucket=S3_BUCKET, Key=queue_key)
-    except Exception as exc:
-        logger.error("Failed to claim job {}: {}", job["job_id"], exc)
-        return None
+        # Won the claim — remove from queue.
+        try:
+            s3.delete_object(Bucket=S3_BUCKET, Key=queue_key)
+        except Exception as exc:
+            logger.warning("Claimed {} but could not delete queue key: {}", job["job_id"], exc)
 
-    logger.info("Claimed job {} (priority={}, ~{:,} docs, worker={})",
-                job["job_id"], job.get("priority"), job.get("doc_count_estimate", 0),
-                worker_id)
-    return job
+        logger.info("Claimed job {} (priority={}, ~{:,} docs, worker={})",
+                    job["job_id"], job.get("priority"), job.get("doc_count_estimate", 0),
+                    worker_id)
+        return job
+
+    # All candidates were claimed by other workers between our list and claim.
+    logger.debug("All candidates claimed before we could — will retry next cycle")
+    return None
 
 
 def _mark_complete(s3, job: dict, stats: dict) -> None:
