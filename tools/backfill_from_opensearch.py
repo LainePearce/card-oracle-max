@@ -894,10 +894,20 @@ def main() -> None:
 
     # ── Job loop ──────────────────────────────────────────────────────────────
     idle_polls = 0
+    jobs_since_rescue = 0
+    RESCUE_EVERY_N_JOBS = 5   # re-scan for orphans after every 5 completed jobs
+
     while True:
         if _stop_requested(s3):
             logger.info("STOP flag found — worker {} exiting cleanly", worker_id)
             break
+
+        # Periodically re-scan for orphans left by other crashed workers.
+        # Runs every RESCUE_EVERY_N_JOBS completions so we don't rely solely
+        # on the startup scan (which misses jobs orphaned after deploy restarts).
+        if jobs_since_rescue >= RESCUE_EVERY_N_JOBS:
+            _rescue_orphaned_jobs(s3)
+            jobs_since_rescue = 0
 
         job = _claim_next_job(s3, worker_id)
         if job is None:
@@ -921,6 +931,7 @@ def main() -> None:
                 dry_run=args.dry_run,
             )
             _mark_complete(s3, job, stats)
+            jobs_since_rescue += 1
 
         except SystemExit:
             logger.info("Worker {} shut down via kill switch", worker_id)
@@ -929,6 +940,7 @@ def main() -> None:
         except Exception as exc:
             logger.exception("Job {} failed: {}", job["job_id"], exc)
             _mark_failed(s3, job, str(exc))
+            jobs_since_rescue += 1
             time.sleep(30)   # brief pause before claiming next job after failure
 
 
