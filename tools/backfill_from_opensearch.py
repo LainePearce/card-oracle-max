@@ -473,6 +473,25 @@ def process_job(
         "upserted": 0,
         "errors": 0,
     }
+    # Per-stage wall-clock accumulation. Per-page deltas are logged each loop
+    # iteration; the cumulative dict is attached to stats so it lands in
+    # backfill-v2/complete/{job_id}.json for offline analysis.
+    # Note: "os_page" time for iteration N is the fetch of page N+1 (next page
+    # is fetched at the end of each iteration). Page 1's fetch is included in
+    # iteration 1's accumulator before the per-page snapshot is taken.
+    timings = {
+        "os_page":      0.0,
+        "qdrant_dedup": 0.0,
+        "img_fetch":    0.0,
+        "pil_decode":   0.0,
+        "clip_encode":  0.0,
+        "text_encode":  0.0,
+        "build_pts":    0.0,
+        "flush_s3":     0.0,
+        "flush_qdrant": 0.0,
+        "os_pause":     0.0,
+    }
+    page_idx = 0
 
     index_name = job["index_name"]
     classification = {
@@ -491,6 +510,7 @@ def process_job(
 
     # ── First page (search_after — no server-side cursor) ────────────────────
     search_after = resume_search_after  # None on first page, list[sort_vals] on resume
+    t_os = time.perf_counter()
     try:
         page_resp = os_client.search(
             index=index_name,
@@ -499,6 +519,7 @@ def process_job(
         )
     except Exception as exc:
         raise RuntimeError(f"Failed to start search on {index_name}: {exc}") from exc
+    timings["os_page"] += time.perf_counter() - t_os
 
     hits = page_resp["hits"]["hits"]
 
@@ -511,6 +532,10 @@ def process_job(
     last_kill_check = time.time()
 
     while hits:
+        page_idx += 1
+        page_start_timings = dict(timings)   # snapshot for per-page deltas
+        page_fetched = 0                     # images successfully fetched this page
+
         # ── Kill-switch check ─────────────────────────────────────────────────
         if time.time() - last_kill_check > KILL_CHECK_INTERVAL:
             if _stop_requested(s3):
@@ -543,6 +568,7 @@ def process_job(
         # ── Batch-check Qdrant — which IDs are already present? ──────────────
         all_qdrant_ids = [d["qdrant_id"] for d in page_docs]
         found_ids: set = set()
+        t_dedup = time.perf_counter()
         for i in range(0, len(all_qdrant_ids), QDRANT_CHECK_BATCH):
             batch_ids = all_qdrant_ids[i:i + QDRANT_CHECK_BATCH]
             try:
@@ -556,6 +582,7 @@ def process_job(
             except Exception as exc:
                 logger.warning("Qdrant retrieve failed (batch {}): {}", i, exc)
             time.sleep(QDRANT_CHECK_PAUSE)
+        timings["qdrant_dedup"] += time.perf_counter() - t_dedup
 
         missing_docs = [d for d in page_docs if d["qdrant_id"] not in found_ids]
         stats["already_in_qdrant"] += len(page_docs) - len(missing_docs)
@@ -564,7 +591,10 @@ def process_job(
         if missing_docs and not dry_run:
             # ── Fetch images for missing docs ─────────────────────────────────
             url_map = {d["os_id"]: d["url"] for d in missing_docs if d["url"]}
+            t_fetch = time.perf_counter()
             fetched: dict[str, bytes] = asyncio.run(fetch_images_async(url_map))
+            timings["img_fetch"] += time.perf_counter() - t_fetch
+            page_fetched = len(fetched)
             stats["images_fetched"] += len(fetched)
             stats["images_failed"]  += len(url_map) - len(fetched)
 
@@ -575,6 +605,7 @@ def process_job(
 
                 os_ids_ordered: list[str] = []
                 pil_images: list = []
+                t_pil = time.perf_counter()
                 for oid, img_bytes in fetched.items():
                     try:
                         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -583,11 +614,13 @@ def process_job(
                     except Exception as exc:
                         logger.debug("PIL open failed for {}: {}", oid, exc)
                         stats["images_failed"] += 1
+                timings["pil_decode"] += time.perf_counter() - t_pil
 
                 image_vecs = None
                 if pil_images:
                     ENCODE_BATCH = 256
                     all_vecs = []
+                    t_clip = time.perf_counter()
                     for b_start in range(0, len(pil_images), ENCODE_BATCH):
                         b_imgs = pil_images[b_start:b_start + ENCODE_BATCH]
                         try:
@@ -597,6 +630,7 @@ def process_job(
                             stats["errors"] += 1
                             for _ in b_imgs:
                                 all_vecs.append(None)
+                    timings["clip_encode"] += time.perf_counter() - t_clip
                     image_vecs = all_vecs
 
                 if image_vecs is not None:
@@ -627,11 +661,14 @@ def process_job(
                             specs_texts.append(
                                 format_specifics(src_hit.get("itemSpecifics") or {}) or None
                             )
+                        t_text = time.perf_counter()
                         try:
                             text_vecs = text_encoder.encode_batch(specs_texts)
                         except Exception as exc:
                             logger.warning("encode_batch failed, falling back to None: {}", exc)
+                        timings["text_encode"] += time.perf_counter() - t_text
 
+                    t_build = time.perf_counter()
                     for i, os_id_str in enumerate(os_ids_ordered):
                         if i >= len(flat_vecs) or flat_vecs[i] is None:
                             continue
@@ -698,6 +735,7 @@ def process_job(
                         )
                         if point:
                             pending_points.append(point)
+                    timings["build_pts"] += time.perf_counter() - t_build
 
             # ── Flush when shard is full ──────────────────────────────────────
             if len(pending_points) >= SHARD_FLUSH_SIZE:
@@ -705,6 +743,7 @@ def process_job(
                     s3, qdrant, vector_store,
                     pending_records, pending_text_recs, pending_points,
                     shard_num, stats, dry_run,
+                    timings=timings,
                 )
                 shard_num += 1
                 pending_records.clear()
@@ -719,9 +758,12 @@ def process_job(
             search_after = hits[-1].get("sort")
 
         # ── OS inter-page pause ───────────────────────────────────────────────
+        t_pause = time.perf_counter()
         _os_pause()
+        timings["os_pause"] += time.perf_counter() - t_pause
 
         # ── Next page (stateless — no cursor expiry) ──────────────────────────
+        t_os = time.perf_counter()
         try:
             page_resp = os_client.search(
                 index=index_name,
@@ -732,6 +774,21 @@ def process_job(
         except Exception as exc:
             logger.error("Page fetch failed for {}: {}", index_name, exc)
             break
+        timings["os_page"] += time.perf_counter() - t_os
+
+        # ── Per-page timing summary ───────────────────────────────────────────
+        d = {k: timings[k] - page_start_timings[k] for k in timings}
+        page_total = sum(d.values())
+        logger.info(
+            "page #{} | docs={} missing={} fetched={} | total={:.2f}s "
+            "os={:.2f} dedup={:.2f} fetch={:.2f} pil={:.2f} clip={:.2f} "
+            "text={:.2f} build={:.2f} s3={:.2f} qup={:.2f} pause={:.2f}",
+            page_idx, len(page_docs), len(missing_docs),
+            page_fetched, page_total,
+            d["os_page"], d["qdrant_dedup"], d["img_fetch"],
+            d["pil_decode"], d["clip_encode"], d["text_encode"],
+            d["build_pts"], d["flush_s3"], d["flush_qdrant"], d["os_pause"],
+        )
 
     # ── Final flush ───────────────────────────────────────────────────────────
     if pending_points and not dry_run:
@@ -739,7 +796,19 @@ def process_job(
             s3, qdrant, vector_store,
             pending_records, pending_text_recs, pending_points,
             shard_num, stats, dry_run,
+            timings=timings,
         )
+
+    # ── Cumulative timing summary ─────────────────────────────────────────────
+    total = sum(timings.values()) or 1.0   # avoid div/0 on empty job
+    logger.info(
+        "TIMINGS job={} pages={} total={:.1f}s | "
+        + " ".join(f"{k}={{:.1f}}s({{:.0%}})" for k in timings),
+        job["job_id"], page_idx, total,
+        *[v for k in timings for v in (timings[k], timings[k] / total)],
+    )
+    stats["timings"] = {k: round(v, 3) for k, v in timings.items()}
+    stats["pages"]   = page_idx
 
     return stats
 
@@ -754,12 +823,14 @@ def _flush(
     shard_num:    int,
     stats:        dict,
     dry_run:      bool,
+    timings:      dict | None = None,
 ) -> None:
     """Write S3 parquet shards then upsert to Qdrant."""
     if not points or dry_run:
         return
 
     # ── S3 first (mandatory) ──────────────────────────────────────────────────
+    t_s3 = time.perf_counter()
     try:
         if img_records:
             vector_store.write_shard(img_records, shard_num)
@@ -769,9 +840,14 @@ def _flush(
     except Exception as exc:
         logger.error("S3 write failed — skipping Qdrant upsert for this batch: {}", exc)
         stats["errors"] += 1
+        if timings is not None:
+            timings["flush_s3"] += time.perf_counter() - t_s3
         return   # do NOT proceed to Qdrant if S3 failed
+    if timings is not None:
+        timings["flush_s3"] += time.perf_counter() - t_s3
 
     # ── Qdrant upsert ─────────────────────────────────────────────────────────
+    t_q = time.perf_counter()
     _check_qdrant_latency(qdrant)
 
     for i in range(0, len(points), QDRANT_UPSERT_BATCH):
@@ -783,6 +859,8 @@ def _flush(
             logger.error("Qdrant upsert failed (batch {}/{}): {}", i, len(points), exc)
             stats["errors"] += 1
         _qdrant_upsert_pause()
+    if timings is not None:
+        timings["flush_qdrant"] += time.perf_counter() - t_q
 
 
 # ── Orphan rescue ─────────────────────────────────────────────────────────────
