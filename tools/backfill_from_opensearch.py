@@ -130,6 +130,12 @@ PEAK_END_UTC   = 15
 # How often to check kill switch (seconds)
 KILL_CHECK_INTERVAL = 60
 
+# How often (seconds) a worker re-scans for orphaned jobs left by other crashed
+# workers, regardless of how many jobs it has completed. Without a wall-clock
+# trigger a fleet that stays continuously busy on long jobs (with a non-empty
+# queue, so no idle polls) would never re-scan and orphans would pile up.
+RESCUE_INTERVAL_SECONDS = 600
+
 # ── eBay image URL fallback ───────────────────────────────────────────────────
 
 _L1200_RE = re.compile(r"(l1200)(\.[a-zA-Z]+)$")
@@ -914,13 +920,15 @@ def _flush(
 
 def _rescue_orphaned_jobs(s3) -> None:
     """
-    On worker startup: scan active/ for jobs whose worker process is
-    no longer alive (i.e. the checkpoint has not been updated for
-    ORPHAN_THRESHOLD_MINUTES).  Move them back to queue/ so any live
-    worker can re-claim them.
+    Scan active/ for jobs whose worker process is no longer alive (i.e. the
+    checkpoint has not been updated for ORPHAN_THRESHOLD_MINUTES) and move them
+    back to queue/ so any live worker can re-claim them.
 
-    Workers load checkpoints (which store search_after) when they resume
-    a job, so progress is not lost — only the final shard is re-processed.
+    Called from main() on startup, on idle polls, after every RESCUE_EVERY_N_JOBS
+    completed jobs, and at least every RESCUE_INTERVAL_SECONDS of wall clock.
+
+    Workers load checkpoints (which store search_after) when they resume a job,
+    so progress is not lost — only the final shard is re-processed.
     """
     ORPHAN_THRESHOLD_MINUTES = 20   # job is declared dead after 20 min without a checkpoint update
     # Rationale: checkpoints are written every 5,000 docs; at ~150K docs/hr that's
@@ -1035,24 +1043,30 @@ def main() -> None:
     # ── Job loop ──────────────────────────────────────────────────────────────
     idle_polls = 0
     jobs_since_rescue = 0
-    RESCUE_EVERY_N_JOBS = 5   # re-scan for orphans after every 5 completed jobs
+    last_rescue_time = time.time()   # _rescue_orphaned_jobs() just ran on startup
+    RESCUE_EVERY_N_JOBS = 5          # re-scan for orphans after every N completed jobs
 
     while True:
         if _stop_requested(s3):
             logger.info("STOP flag found — worker {} exiting cleanly", worker_id)
             break
 
-        # Periodically re-scan for orphans left by other crashed workers.
-        # Triggers on every idle poll (worker has no job = low-cost moment to scan)
-        # and every RESCUE_EVERY_N_JOBS completions during busy periods.
-        if jobs_since_rescue >= RESCUE_EVERY_N_JOBS:
+        # Re-scan for orphans left by other crashed workers. Fires on:
+        #   - every RESCUE_EVERY_N_JOBS completed jobs (short-job fleets), and
+        #   - every RESCUE_INTERVAL_SECONDS of wall clock (long-job fleets that
+        #     stay busy with a non-empty queue, so no idle poll ever triggers it).
+        # (Idle workers also rescan directly in the job==None branch below.)
+        if (jobs_since_rescue >= RESCUE_EVERY_N_JOBS
+                or time.time() - last_rescue_time >= RESCUE_INTERVAL_SECONDS):
             _rescue_orphaned_jobs(s3)
             jobs_since_rescue = 0
+            last_rescue_time = time.time()
 
         job = _claim_next_job(s3, worker_id)
         if job is None:
             _rescue_orphaned_jobs(s3)   # idle worker: good time to scan for orphans
             jobs_since_rescue = 0
+            last_rescue_time = time.time()
             idle_polls += 1
             wait = min(30 * idle_polls, 300)
             logger.info("Queue empty — worker {} waiting {}s...", worker_id, wait)

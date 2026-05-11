@@ -3029,19 +3029,34 @@ Prior to this fix (May 2026), multiple workers would process the same job simult
 A job is **orphaned** when its worker crashes or is restarted mid-job (e.g. `systemctl restart os-backfill` during a deploy). The active/ file stays behind with no live worker.
 
 **Auto-rescue logic** (`_rescue_orphaned_jobs()`):
-- Threshold: **20 minutes** since last checkpoint write (was 90 min — too slow)
-- Triggers: on startup, on every idle poll, and every 5 job completions
+- Threshold: **20 minutes** since last checkpoint write (was 90 min — too slow). Falls back to `claimed_at` age when a job has no checkpoint yet (<5k docs processed).
+- Triggers: on startup, on every idle poll, after every 5 job completions, **and at least every `RESCUE_INTERVAL_SECONDS` (600s) of wall clock** — the wall-clock trigger covers a fleet that stays continuously busy on long jobs with a non-empty queue (no idle polls, <5 completions), which otherwise never re-scans.
 - Action: moves `active/{job_id}.json` → `queue/{job_id}.json`
 - Workers resume from the `search_after` cursor in the checkpoint — no re-work
 
-**Rule of thumb:** active job count should never exceed worker count (12). If it does, there are orphans. They self-rescue within 20 minutes. For immediate relief:
+> **Known gap:** the wall-clock trigger only fires *between* jobs (the main loop doesn't run during `process_job`). If all 12 workers start a long job simultaneously, no rescue happens until the first one finishes. Better than the old "indefinitely", but if you ever see a whole generation of workers claim long jobs at once, run the manual rescue below.
+
+**Rule of thumb:** active job count should never exceed worker count (12). If it does, there are orphans. For immediate relief, rescue **only the stale ones** — do NOT blindly re-queue every active job, that yanks in-progress jobs away from live workers and causes duplicate processing:
 ```bash
-# Rescue all stale active jobs at once (run locally with AWS_PROFILE=card-oracle)
-for job in $(aws s3 ls s3://card-oracle-vectors/backfill-v2/active/ | awk '{print $4}' | sed 's/.json//'); do
-  aws s3 cp s3://card-oracle-vectors/backfill-v2/active/${job}.json \
-            s3://card-oracle-vectors/backfill-v2/queue/${job}.json --quiet
-  aws s3 rm  s3://card-oracle-vectors/backfill-v2/active/${job}.json --quiet
-  echo "rescued $job"
+# Rescue only STALE active jobs (last activity > 20 min ago). Run locally with
+# AWS_PROFILE=card-oracle. Mirrors _rescue_orphaned_jobs() — will not touch a job
+# a live worker is still checkpointing.
+now=$(date -u +%s); thresh=1200
+aws s3 ls s3://card-oracle-vectors/backfill-v2/active/ | awk '{print $4}' | sed 's/\.json$//' | while read -r job; do
+  ts=$(aws s3 cp s3://card-oracle-vectors/backfill-v2/checkpoints/${job}.json - 2>/dev/null \
+         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("saved_at",""))' 2>/dev/null)
+  [ -z "$ts" ] && ts=$(aws s3 cp s3://card-oracle-vectors/backfill-v2/active/${job}.json - 2>/dev/null \
+         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("claimed_at",""))' 2>/dev/null)
+  [ -z "$ts" ] && { echo "skip $job — no timestamp"; continue; }
+  age=$(( now - $(date -u -d "$ts" +%s) ))
+  if [ "$age" -gt "$thresh" ]; then
+    aws s3 cp s3://card-oracle-vectors/backfill-v2/active/${job}.json \
+              s3://card-oracle-vectors/backfill-v2/queue/${job}.json --quiet \
+      && aws s3 rm s3://card-oracle-vectors/backfill-v2/active/${job}.json --quiet \
+      && echo "rescued $job (idle ${age}s)"
+  else
+    echo "keep $job (idle ${age}s — worker likely alive)"
+  fi
 done
 ```
 
