@@ -16,7 +16,9 @@ Rate-limiting safeguards
   OpenSearch : 500 docs/page, 300 ms inter-page pause (halved at peak hours)
   Qdrant     : 100-point upsert batches, 500 ms pause (doubled at peak hours)
                Pauses 5 min if Qdrant p99 latency > 200 ms
-  eBay CDN   : 16 concurrent async image fetches per worker
+  eBay CDN   : up to 64 concurrent async image fetches per worker,
+               capped at 24 concurrent connections per host (i.ebayimg.com),
+               over one persistent aiohttp session for the worker's lifetime
   Kill switch: workers exit cleanly if s3://BUCKET/backfill-v2/STOP exists
   Peak hours : 09:00–15:00 UTC — all OS/Qdrant pauses doubled
 
@@ -112,6 +114,9 @@ QDRANT_LATENCY_PAUSE= 60    # pause duration when threshold exceeded (seconds)
 
 # Image fetching
 IMAGE_CONCURRENCY   = 64    # concurrent async downloads (was 16)
+IMAGE_PER_HOST      = 24    # max concurrent connections to one host (eBay CDN).
+                            # Was effectively 4 via limit_per_host — the real cap,
+                            # since every galleryURL is on i.ebayimg.com.
 IMAGE_TIMEOUT       = 3.0   # seconds per image attempt
 IMAGE_RETRY_PAUSE   = 2.0   # seconds before retrying with fallback URL
 
@@ -168,13 +173,62 @@ async def _fetch_one(session: aiohttp.ClientSession, url: str) -> bytes | None:
     return None
 
 
-async def fetch_images_async(
+# ── Persistent HTTP session for image fetching ────────────────────────────────
+# Created once per worker process and reused across every page and job. The old
+# code did asyncio.run(...) per page, which built a fresh event loop, TCPConnector
+# (DNS cache, connection pool) and ClientSession every page and tore them down —
+# so ttl_dns_cache never survived a page and TLS sessions were re-handshaked
+# constantly. We keep one loop + session for the worker's lifetime instead.
+
+_HTTP: dict = {}   # {"loop": event_loop, "session": ClientSession}
+
+
+async def _make_session() -> aiohttp.ClientSession:
+    connector = aiohttp.TCPConnector(
+        limit=IMAGE_CONCURRENCY * 2,
+        limit_per_host=IMAGE_PER_HOST,
+        ttl_dns_cache=600,            # now actually survives between pages
+        enable_cleanup_closed=True,   # reap half-closed TLS sockets
+    )
+    return aiohttp.ClientSession(connector=connector)
+
+
+def _get_http() -> tuple[asyncio.AbstractEventLoop, aiohttp.ClientSession]:
+    """Lazily create (and memoise) the worker's event loop + HTTP session."""
+    if "loop" not in _HTTP:
+        loop = asyncio.new_event_loop()
+        _HTTP["loop"]    = loop
+        _HTTP["session"] = loop.run_until_complete(_make_session())
+    return _HTTP["loop"], _HTTP["session"]
+
+
+def _close_http() -> None:
+    """Close the persistent session + loop. Called once at worker shutdown."""
+    if "loop" in _HTTP:
+        try:
+            _HTTP["loop"].run_until_complete(_HTTP["session"].close())
+            _HTTP["loop"].close()
+        except Exception as exc:
+            logger.debug("Error closing HTTP session: {}", exc)
+        _HTTP.clear()
+
+
+def fetch_images(url_map: dict[str, str]) -> dict[str, bytes]:
+    """
+    Fetch images for all URLs concurrently using the persistent session.
+    Returns {doc_id_str: image_bytes} for successful fetches only.
+    Synchronous wrapper — drives the worker's long-lived event loop.
+    """
+    if not url_map:
+        return {}
+    loop, session = _get_http()
+    return loop.run_until_complete(_fetch_all(session, url_map))
+
+
+async def _fetch_all(
+    session: aiohttp.ClientSession,
     url_map: dict[str, str],   # {doc_id_str: galleryURL}
 ) -> dict[str, bytes]:
-    """
-    Fetch images for all URLs concurrently.
-    Returns {doc_id_str: image_bytes} for successful fetches only.
-    """
     sem = asyncio.Semaphore(IMAGE_CONCURRENCY)
     results: dict[str, bytes] = {}
 
@@ -184,14 +238,7 @@ async def fetch_images_async(
             if data is not None:
                 results[doc_id] = data
 
-    connector = aiohttp.TCPConnector(
-        limit=IMAGE_CONCURRENCY * 2,
-        limit_per_host=4,
-        ttl_dns_cache=300,
-    )
-    async with aiohttp.ClientSession(connector=connector) as session:
-        await asyncio.gather(*[_worker(k, v) for k, v in url_map.items()])
-
+    await asyncio.gather(*[_worker(k, v) for k, v in url_map.items()])
     return results
 
 
@@ -592,7 +639,7 @@ def process_job(
             # ── Fetch images for missing docs ─────────────────────────────────
             url_map = {d["os_id"]: d["url"] for d in missing_docs if d["url"]}
             t_fetch = time.perf_counter()
-            fetched: dict[str, bytes] = asyncio.run(fetch_images_async(url_map))
+            fetched: dict[str, bytes] = fetch_images(url_map)
             timings["img_fetch"] += time.perf_counter() - t_fetch
             page_fetched = len(fetched)
             stats["images_fetched"] += len(fetched)
@@ -1037,6 +1084,10 @@ def main() -> None:
             _mark_failed(s3, job, str(exc))
             jobs_since_rescue += 1
             time.sleep(30)   # brief pause before claiming next job after failure
+
+    # ── Clean shutdown ────────────────────────────────────────────────────────
+    _close_http()
+    logger.info("Worker {} stopped", worker_id)
 
 
 if __name__ == "__main__":
