@@ -27,7 +27,11 @@ KEY=~/.ssh/qdrant-test.pem
 # print a post-quantum key-exchange warning on the ssh channel. rsync uses that
 # channel as its protocol pipe and wedges on any extraneous output, so without
 # this the rsync step hangs forever with only the warning in the log.
-SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o LogLevel=ERROR"
+# ServerAlive window is 30s × 10 = 5 min: tolerant of a freshly-booted,
+# user-data-loaded instance that's slow to service SSH (60s was far too tight
+# and killed rsync against still-initialising boxes), while a genuinely dead
+# IP still bails — ConnectTimeout=10 handles the can't-connect-at-all case.
+SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o LogLevel=ERROR"
 
 WORKERS=(
   "54.67.55.75"      # worker-0
