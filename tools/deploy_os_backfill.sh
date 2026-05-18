@@ -64,12 +64,18 @@ deploy_worker() {
   echo "[worker-${idx}] deploying to ${ip}..."
 
   # 1. Sync latest code (skip .env — credentials already written by Terraform user_data)
-  rsync -az --delete \
+  #    -v so the log shows files flowing (deploy was opaque without it).
+  #    Exclude data/ (multi-GB local datasets — workers read OpenSearch/S3, never
+  #    local data/) and models/ (gitignored; weights pulled at runtime by
+  #    open-clip / sentence-transformers). These dominated transfer time.
+  rsync -avz --delete \
     --exclude='.git' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='.venv' \
     --exclude='.env' \
+    --exclude='data' \
+    --exclude='models' \
     --exclude='experiment/results' \
     --exclude='logs' \
     --exclude='*.log' \
@@ -85,8 +91,10 @@ deploy_worker() {
       python3.11 -m venv .venv
     fi
     source .venv/bin/activate
-    pip install --quiet --upgrade pip
-    pip install --quiet -r requirements.txt
+    pip install --upgrade pip
+    # No --quiet: the torch cold-install is ~15-20 min; without output the log
+    # is silent the whole time and indistinguishable from a hang.
+    pip install -r requirements.txt
 REMOTE
 
   # 3. Write / update the os-backfill systemd service
