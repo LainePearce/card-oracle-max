@@ -168,10 +168,18 @@ if [ $failed -eq 0 ]; then
   # the LIVE fleet (public from WORKERS, private collected per host) so the
   # on-w0 dashboard's intra-fleet SSH poll survives terraform recreates with
   # zero manual IP edits, then installs/starts os-dashboard.service.
+  # BEST-EFFORT and NON-FATAL: the 12 workers are already deployed and started
+  # by this point ("All … started" above). Dashboard setup must never flip the
+  # deploy to failed — right after a deploy the boxes are loading CLIP onto the
+  # GPU and an SSH banner-exchange can transiently time out under that load.
+  # So: disable errexit here, retry the worker-0 step, and only warn on failure.
   dash=0; for t in "${TARGETS[@]}"; do [ "$t" = "0" ] && dash=1; done
   if [ "$dash" = "1" ]; then
+    set +e
     W0="${WORKERS[0]}"
-    echo "Setting up os-dashboard.service on worker-0 (${W0})..."
+    echo "Setting up os-dashboard.service on worker-0 (${W0})... (best-effort)"
+
+    # Collect private IPs; a failed host just gets an empty entry (tolerated).
     pub=""; priv=""
     for idx in "${!WORKERS[@]}"; do
       p=$(ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${WORKERS[$idx]}" \
@@ -181,12 +189,14 @@ if [ $failed -eq 0 ]; then
     done
     pub="[${pub%,}]"; priv="[${priv%,}]"
 
-    ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${W0}" bash <<REMOTE
-      set -e
-      cat > ${REMOTE_DIR}/worker_ips.json <<JSON
+    dash_ok=0
+    for attempt in 1 2 3; do
+      ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${W0}" bash <<REMOTE >/dev/null 2>&1
+        set -e
+        cat > ${REMOTE_DIR}/worker_ips.json <<JSON
 {"public": ${pub}, "private": ${priv}}
 JSON
-      sudo tee /etc/systemd/system/os-dashboard.service > /dev/null <<SVCEOF
+        sudo tee /etc/systemd/system/os-dashboard.service > /dev/null <<SVCEOF
 [Unit]
 Description=Card Oracle backfill dashboard (worker-0)
 After=network-online.target
@@ -206,11 +216,22 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-      sudo systemctl daemon-reload
-      sudo systemctl enable os-dashboard >/dev/null 2>&1 || true
-      sudo systemctl restart os-dashboard
+        sudo systemctl daemon-reload
+        sudo systemctl enable os-dashboard >/dev/null 2>&1 || true
+        sudo systemctl restart os-dashboard
 REMOTE
-    echo "  ✓ os-dashboard.service running → http://${W0}:8080"
+      if [ $? -eq 0 ]; then dash_ok=1; break; fi
+      echo "  dashboard setup attempt ${attempt} failed (box likely busy) — retrying in 20s..."
+      sleep 20
+    done
+    if [ "$dash_ok" = "1" ]; then
+      echo "  ✓ os-dashboard.service running → http://${W0}:8080"
+    else
+      echo "  ⚠ dashboard setup failed after 3 tries — WORKERS ARE FINE, this is non-fatal."
+      echo "    Re-run just the dashboard later:  bash tools/deploy_os_backfill.sh 0"
+      echo "    Or use the local dashboard:        python tools/backfill_dashboard.py"
+    fi
+    set -e
   else
     echo "(worker-0 not in targets — skipping os-dashboard setup)"
   fi
