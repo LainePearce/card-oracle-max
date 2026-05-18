@@ -17,6 +17,13 @@
 set -euo pipefail
 
 KEY=~/.ssh/qdrant-test.pem
+
+# Shared SSH options. ConnectTimeout + BatchMode fail fast on a stale/dead IP
+# instead of hanging the parallel deploy forever; ServerAliveInterval kills a
+# session that blackholes *after* connecting (e.g. recycled instance now at
+# this IP). Without these one unreachable worker stalls the whole `wait`.
+SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
 WORKERS=(
   "54.215.57.135"    # worker-0
   "52.53.33.218"     # worker-1
@@ -57,11 +64,11 @@ deploy_worker() {
     --exclude='experiment/results' \
     --exclude='logs' \
     --exclude='*.log' \
-    -e "ssh -i ${KEY} -o StrictHostKeyChecking=no" \
+    -e "ssh -i ${KEY} ${SSH_OPTS}" \
     ./ "ec2-user@${ip}:${REMOTE_DIR}/" >> "${log}" 2>&1
 
   # 2. Ensure venv exists and deps are current
-  ssh -i "${KEY}" -o StrictHostKeyChecking=no "ec2-user@${ip}" bash <<REMOTE >> "${log}" 2>&1
+  ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${ip}" bash <<REMOTE >> "${log}" 2>&1
     set -e
     cd ${REMOTE_DIR}
     if [ ! -f .venv/bin/python ]; then
@@ -75,7 +82,7 @@ REMOTE
 
   # 3. Write / update the os-backfill systemd service
   #    Restarts automatically on failure so spot interruptions recover cleanly.
-  ssh -i "${KEY}" -o StrictHostKeyChecking=no "ec2-user@${ip}" bash <<REMOTE >> "${log}" 2>&1
+  ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${ip}" bash <<REMOTE >> "${log}" 2>&1
     set -e
     sudo tee /etc/systemd/system/os-backfill.service > /dev/null <<SVCEOF
 [Unit]
@@ -103,7 +110,7 @@ SVCEOF
 REMOTE
 
   # 4. Start (or restart) the service
-  ssh -i "${KEY}" -o StrictHostKeyChecking=no "ec2-user@${ip}" \
+  ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${ip}" \
     "sudo systemctl restart os-backfill" >> "${log}" 2>&1
 
   echo "[worker-${idx}] ✓ started. Tail: sudo journalctl -fu os-backfill  (${ip})"
