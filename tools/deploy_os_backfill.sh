@@ -65,9 +65,12 @@ deploy_worker() {
 
   # 1. Sync latest code (skip .env — credentials already written by Terraform user_data)
   #    -v so the log shows files flowing (deploy was opaque without it).
-  #    Exclude data/ (multi-GB local datasets — workers read OpenSearch/S3, never
-  #    local data/) and models/ (gitignored; weights pulled at runtime by
-  #    open-clip / sentence-transformers). These dominated transfer time.
+  #    Excludes mirror the large local-only / gitignored cruft the worker never
+  #    needs. The killers historically:
+  #      data/        — multi-GB local datasets (worker reads OpenSearch/S3)
+  #      models/      — gitignored; weights pulled at runtime by open-clip / s-t
+  #      .terraform/  — ~600 MB AWS provider binary PER terraform module dir
+  #                     (×5 dirs ≈ 3 GB; 22k+ files). Worker never runs terraform.
   rsync -avz --delete \
     --exclude='.git' \
     --exclude='__pycache__' \
@@ -76,6 +79,10 @@ deploy_worker() {
     --exclude='.env' \
     --exclude='data' \
     --exclude='models' \
+    --exclude='.terraform' \
+    --exclude='*.tfstate' \
+    --exclude='*.tfstate.backup' \
+    --exclude='.terraform.lock.hcl' \
     --exclude='experiment/results' \
     --exclude='logs' \
     --exclude='*.log' \
