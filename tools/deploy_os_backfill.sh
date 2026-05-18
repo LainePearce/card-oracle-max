@@ -22,7 +22,12 @@ KEY=~/.ssh/qdrant-test.pem
 # instead of hanging the parallel deploy forever; ServerAliveInterval kills a
 # session that blackholes *after* connecting (e.g. recycled instance now at
 # this IP). Without these one unreachable worker stalls the whole `wait`.
-SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+#
+# LogLevel=ERROR is REQUIRED, not cosmetic: newer OpenSSH clients (recent macOS)
+# print a post-quantum key-exchange warning on the ssh channel. rsync uses that
+# channel as its protocol pipe and wedges on any extraneous output, so without
+# this the rsync step hangs forever with only the warning in the log.
+SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o LogLevel=ERROR"
 
 WORKERS=(
   "54.67.55.75"      # worker-0
