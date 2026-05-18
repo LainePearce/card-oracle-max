@@ -1,3 +1,7 @@
+# Generated per-deploy from the live fleet (deploy_os_backfill.sh) — never commit
+# (committing it reintroduces the stale-IP snowflake this is meant to kill)
+worker_ips.json
+
 # Python
 __pycache__/
 *.py[cod]

@@ -83,6 +83,20 @@ WORKER_PRIVATE_IPS = [
     "172.31.21.49",     # w11
 ]
 
+# deploy_os_backfill.sh writes worker_ips.json at the repo root, generated from
+# the live fleet (public IPs from the deploy + private IPs collected per worker).
+# When present it overrides the hardcoded fallbacks above, so a terraform
+# recreate needs zero manual IP edits. Absent (e.g. local dev checkout) → the
+# hardcoded lists are used.
+_IP_FILE = Path(__file__).resolve().parent.parent / "worker_ips.json"
+try:
+    _ips = json.loads(_IP_FILE.read_text())
+    if _ips.get("public"):
+        WORKER_IPS = _ips["public"]
+    WORKER_PRIVATE_IPS = _ips.get("private") or WORKER_IPS
+except (OSError, ValueError):
+    pass  # keep hardcoded fallbacks
+
 # Detect if we're running on an EC2 instance in the same VPC.
 # If so, use private IPs for SSH — faster and avoids SG public-IP restrictions.
 def _detect_private_ip() -> str | None:

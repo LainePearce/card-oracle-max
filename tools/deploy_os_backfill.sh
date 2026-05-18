@@ -162,13 +162,67 @@ echo ""
 if [ $failed -eq 0 ]; then
   echo "All ${#TARGETS[@]} worker(s) started."
   echo ""
+
+  # ── Dashboard on worker-0 (reproducible — no longer a hand-set-up snowflake) ──
+  # Only when worker-0 was part of this deploy. Generates worker_ips.json from
+  # the LIVE fleet (public from WORKERS, private collected per host) so the
+  # on-w0 dashboard's intra-fleet SSH poll survives terraform recreates with
+  # zero manual IP edits, then installs/starts os-dashboard.service.
+  dash=0; for t in "${TARGETS[@]}"; do [ "$t" = "0" ] && dash=1; done
+  if [ "$dash" = "1" ]; then
+    W0="${WORKERS[0]}"
+    echo "Setting up os-dashboard.service on worker-0 (${W0})..."
+    pub=""; priv=""
+    for idx in "${!WORKERS[@]}"; do
+      p=$(ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${WORKERS[$idx]}" \
+            "hostname -I | awk '{print \$1}'" 2>/dev/null)
+      pub="${pub}\"${WORKERS[$idx]}\","
+      priv="${priv}\"${p}\","
+    done
+    pub="[${pub%,}]"; priv="[${priv%,}]"
+
+    ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${W0}" bash <<REMOTE
+      set -e
+      cat > ${REMOTE_DIR}/worker_ips.json <<JSON
+{"public": ${pub}, "private": ${priv}}
+JSON
+      sudo tee /etc/systemd/system/os-dashboard.service > /dev/null <<SVCEOF
+[Unit]
+Description=Card Oracle backfill dashboard (worker-0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=${REMOTE_DIR}
+Environment=PATH=${REMOTE_DIR}/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=${REMOTE_DIR}/.venv/bin/python tools/backfill_dashboard.py --port 8080
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+      sudo systemctl daemon-reload
+      sudo systemctl enable os-dashboard >/dev/null 2>&1 || true
+      sudo systemctl restart os-dashboard
+REMOTE
+    echo "  ✓ os-dashboard.service running → http://${W0}:8080"
+  else
+    echo "(worker-0 not in targets — skipping os-dashboard setup)"
+  fi
+  echo ""
   echo "Monitor:"
   for idx in "${TARGETS[@]}"; do
     echo "  ssh -i ${KEY} ec2-user@${WORKERS[$idx]} 'sudo journalctl -fu os-backfill'  # worker-${idx}"
   done
   echo ""
-  echo "Queue status:"
-  echo "  python tools/backfill_dashboard.py"
+  echo "Dashboard:"
+  echo "  http://${WORKERS[0]}:8080            # on worker-0 (os-dashboard.service)"
+  echo "  python tools/backfill_dashboard.py   # or run locally"
 else
   echo "Some workers failed — see logs above."
   exit 1
