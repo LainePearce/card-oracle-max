@@ -25,18 +25,18 @@ KEY=~/.ssh/qdrant-test.pem
 SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
 WORKERS=(
-  "54.215.57.135"    # worker-0
-  "52.53.33.218"     # worker-1
-  "3.101.66.241"     # worker-2
-  "13.57.215.67"     # worker-3
-  "18.145.69.81"     # worker-4
-  "18.145.116.26"    # worker-5
-  "54.153.95.19"     # worker-6
-  "50.18.237.248"    # worker-7
-  "13.57.176.92"     # worker-8
-  "54.219.76.40"     # worker-9
-  "13.56.140.67"     # worker-10
-  "54.176.9.174"     # worker-11
+  "54.67.55.75"      # worker-0
+  "18.145.23.246"    # worker-1
+  "54.183.190.110"   # worker-2
+  "13.56.247.223"    # worker-3
+  "3.101.89.26"      # worker-4
+  "18.144.49.65"     # worker-5
+  "54.241.68.12"     # worker-6
+  "52.53.243.136"    # worker-7
+  "54.67.142.178"    # worker-8
+  "54.241.54.87"     # worker-9
+  "18.144.255.159"   # worker-10
+  "54.183.184.64"    # worker-11
 )
 REMOTE_DIR="/home/ec2-user/card-oracle-max"
 
