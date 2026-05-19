@@ -23,7 +23,9 @@ Usage:
 from __future__ import annotations
 
 import io
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import httpx
@@ -38,6 +40,14 @@ EMBEDDING_DIM = 768   # ViT-L/14 output dim (512 is for ViT-B/32)
 BATCH_SIZE    = 256
 USE_FP16      = True
 NORMALISE     = True
+
+# Per-image preprocessing (pad-to-square + CLIP resize/crop/normalise) is CPU
+# bound and was the dominant backfill cost — done serially the GPU sat ~70-80%
+# idle (~19 img/s on a T4 that can do 100+). It parallelises cleanly: PIL and
+# the torchvision transform release the GIL on their C paths, so a thread pool
+# scales near-linearly with vCPUs. Output is order- and value-identical to the
+# serial path. Capped so it doesn't oversubscribe larger instances.
+PREPROCESS_WORKERS = min(8, (os.cpu_count() or 4))
 
 # HTTP settings for image download
 DOWNLOAD_TIMEOUT   = 15   # seconds
@@ -70,6 +80,7 @@ class ImageEncoder:
         self._model      = None
         self._preprocess = None
         self._torch      = None
+        self._pp_pool    = None   # lazily-created preprocessing thread pool
 
     # ── Lazy initialisation ───────────────────────────────────────────────────
 
@@ -224,10 +235,17 @@ class ImageEncoder:
         """
         self._load()
 
-        tensors = []
-        for img in images:
-            img = self._pad_to_square(img)
-            tensors.append(self._preprocess(img))
+        if self._pp_pool is None:
+            self._pp_pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
+
+        def _prep(img):
+            # Exact same ops in the same per-image order as the serial path —
+            # only the across-images iteration is concurrent.
+            return self._preprocess(self._pad_to_square(img))
+
+        # executor.map preserves input order, so tensors[i] still corresponds
+        # to images[i] (callers rely on positional alignment).
+        tensors = list(self._pp_pool.map(_prep, images))
 
         batch = self._torch.stack(tensors).to(self._device)
 
