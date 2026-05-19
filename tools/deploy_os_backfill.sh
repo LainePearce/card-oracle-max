@@ -131,6 +131,9 @@ StandardError=journal
 WantedBy=multi-user.target
 SVCEOF
     sudo systemctl daemon-reload
+    # enable: WantedBy alone does nothing without the wants/ symlink, so the
+    # service never survived a reboot / spot-stop before this. enable creates it.
+    sudo systemctl enable os-backfill
 REMOTE
 
   # 4. Start (or restart) the service
