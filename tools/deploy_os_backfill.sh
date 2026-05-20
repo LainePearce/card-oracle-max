@@ -135,12 +135,10 @@ CPUWeight=40
 MemoryHigh=12G
 MemoryMax=13G
 MemorySwapMax=0
-# Recycle every 45 min. The worker has a slow memory leak (RSS climbs over a
-# process's lifetime — not yet root-caused; see per-page rss= in the logs).
-# systemd stops the unit at RuntimeMaxSec (counts as a failure → Restart picks
-# it up); the worker resumes from its S3 checkpoint, so the leak can never grow
-# beyond ~45 min before a fresh process resets it. Mitigation, not a fix.
-RuntimeMaxSec=2700
+# No RuntimeMaxSec recycle: the per-page rss= trace showed a flat ~4 GB
+# sawtooth (no leak), and a 45-min recycle killed workers mid-job (jobs run
+# ~1.3 h) — jobs never completed. MemoryMax above is the real safety net: a
+# genuine runaway gets OOM-killed + resumed from checkpoint, no recycle needed.
 Restart=on-failure
 RestartSec=30
 # Exit cleanly when queue is empty (exit 0) → no restart
