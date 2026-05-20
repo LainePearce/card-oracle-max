@@ -101,7 +101,9 @@ S3_CKPT_PREFIX  = "backfill-v2/checkpoints"
 STOP_KEY        = "backfill-v2/STOP"
 
 # OpenSearch paging
-OS_PAGE_SIZE    = 1_000   # doubled from 500 — halves round-trip count
+OS_PAGE_SIZE    = 250     # cut 1000→250: a whole page of decoded images is held
+                          # in RAM at once; 1000 drove the 16GB box into swap.
+                          # os/dedup are ~0.1s/page so the extra round-trips are free.
 OS_PAGE_PAUSE   = 0.05    # seconds between scroll pages (was 0.30 — cluster handles it fine)
 
 # Qdrant

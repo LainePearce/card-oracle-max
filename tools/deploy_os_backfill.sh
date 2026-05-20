@@ -126,6 +126,15 @@ ExecStart=${REMOTE_DIR}/.venv/bin/python tools/backfill_from_opensearch.py
 # Niced, the worker still gets ~all idle CPU but instantly yields to sshd.
 Nice=15
 CPUWeight=40
+# Memory limits: the worker holds a whole OS page of decoded images in RAM and
+# was driving the 16 GB box into swap — swap-thrash makes the box unreachable
+# (sshd can't fault its pages back; CPU looks idle ~26%). MemorySwapMax=0 +
+# MemoryMax cap the worker's cgroup so it gets OOM-killed cleanly (then
+# Restart=on-failure resumes it from checkpoint) instead of swap-killing the
+# whole host. MemoryHigh applies reclaim pressure before the hard cap.
+MemoryHigh=12G
+MemoryMax=13G
+MemorySwapMax=0
 Restart=on-failure
 RestartSec=30
 # Exit cleanly when queue is empty (exit 0) → no restart
