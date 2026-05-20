@@ -120,6 +120,12 @@ User=ec2-user
 WorkingDirectory=${REMOTE_DIR}
 Environment=PATH=${REMOTE_DIR}/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=${REMOTE_DIR}/.venv/bin/python tools/backfill_from_opensearch.py
+# Nice + reduced CPU weight: the backfill saturates all vCPUs (image decode,
+# CLIP preprocessing). Without this it starves sshd — SSH banner-exchange
+# times out and the box becomes unmanageable, forcing a reboot to deploy.
+# Niced, the worker still gets ~all idle CPU but instantly yields to sshd.
+Nice=15
+CPUWeight=40
 Restart=on-failure
 RestartSec=30
 # Exit cleanly when queue is empty (exit 0) → no restart
