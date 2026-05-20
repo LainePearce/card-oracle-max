@@ -221,6 +221,22 @@ def _close_http() -> None:
         _HTTP.clear()
 
 
+def _rss_mb() -> float:
+    """Current resident set size of this process in MB (Linux /proc/self/status).
+
+    Logged per page so the memory-growth rate is visible — the data needed to
+    localise the slow leak that drives workers into the cgroup memory cap.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB → MB
+    except Exception:
+        pass
+    return 0.0
+
+
 def fetch_images(url_map: dict[str, str]) -> dict[str, bytes]:
     """
     Fetch images for all URLs concurrently using the persistent session.
@@ -835,11 +851,11 @@ def process_job(
         d = {k: timings[k] - page_start_timings[k] for k in timings}
         page_total = sum(d.values())
         logger.info(
-            "page #{} | docs={} missing={} fetched={} | total={:.2f}s "
+            "page #{} | docs={} missing={} fetched={} | rss={:.0f}MB total={:.2f}s "
             "os={:.2f} dedup={:.2f} fetch={:.2f} pil={:.2f} clip={:.2f} "
             "text={:.2f} build={:.2f} s3={:.2f} qup={:.2f} pause={:.2f}",
             page_idx, len(page_docs), len(missing_docs),
-            page_fetched, page_total,
+            page_fetched, _rss_mb(), page_total,
             d["os_page"], d["qdrant_dedup"], d["img_fetch"],
             d["pil_decode"], d["clip_encode"], d["text_encode"],
             d["build_pts"], d["flush_s3"], d["flush_qdrant"], d["os_pause"],
