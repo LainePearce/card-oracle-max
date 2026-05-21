@@ -122,6 +122,14 @@ IMAGE_PER_HOST      = 24    # max concurrent connections to one host (eBay CDN).
 IMAGE_TIMEOUT       = 3.0   # seconds per image attempt
 IMAGE_RETRY_PAUSE   = 2.0   # seconds before retrying with fallback URL
 
+# Downscale cap for decoded images. A whole page (250) of images is held in RAM
+# at once; some marketplace scans are 6000px+ (≈140 MB decoded each), which
+# ballooned RSS past the cgroup cap and froze workers. CLIP resizes to 224 px
+# anyway, so capping the long edge here is lossless for the embedding. Set
+# above the eBay l1200 size so normal images are untouched — only the
+# pathological large scans get shrunk.
+MAX_IMAGE_PX = 2048
+
 # Flush a parquet shard + update checkpoint every N hits
 SHARD_FLUSH_SIZE = 5_000
 
@@ -680,6 +688,11 @@ def process_job(
                 for oid, img_bytes in fetched.items():
                     try:
                         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                        # Cap the long edge: an oversized scan held 250-at-a-time
+                        # balloons RSS. thumbnail() only ever shrinks, so normal
+                        # images are untouched; lossless for a 224px CLIP input.
+                        if max(pil_img.size) > MAX_IMAGE_PX:
+                            pil_img.thumbnail((MAX_IMAGE_PX, MAX_IMAGE_PX))
                         os_ids_ordered.append(oid)
                         pil_images.append(pil_img)
                     except Exception as exc:
