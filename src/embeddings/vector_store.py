@@ -35,6 +35,7 @@ class VectorRecord:
     vector_type:   str            # "image" | "specifics"
     model_id:      str
     params_hash:   str
+    job_id:        str  = ""       # owning backfill job — keeps S3 shard keys unique
     source_url:    str  = ""
     specifics_src: str  = "ebay"
 
@@ -72,8 +73,12 @@ class S3VectorStore:
             partition.lower(),
         ])
 
-    def shard_key(self, prefix: str, shard_num: int) -> str:
-        return f"{prefix}/{shard_num:04d}.parquet"
+    def shard_key(self, prefix: str, job_id: str, shard_num: int) -> str:
+        # job_id in the key prevents shards from different jobs/windows that
+        # share an {index_type}/{partition} from overwriting each other.
+        # shard_num restarts at 0 per job, so without this every job's 0000
+        # .parquet (etc.) collided — non-eBay catastrophically (partition="all").
+        return f"{prefix}/{job_id.lower()}/{shard_num:04d}.parquet"
 
     @staticmethod
     def partition_for_index(index_name: str, index_type: str) -> str:
@@ -94,11 +99,16 @@ class S3VectorStore:
             raise ValueError("Cannot write empty shard")
 
         r0     = records[0]
+        if not r0.job_id:
+            raise ValueError(
+                "VectorRecord.job_id is required — S3 shard keys must be "
+                "job-unique or shards from different jobs overwrite each other"
+            )
         part   = self.partition_for_index(r0.index_name, r0.index_type)
         prefix = self.key_prefix(
             r0.vector_type, r0.model_id, r0.params_hash, r0.index_type, part
         )
-        key = self.shard_key(prefix, shard_num)
+        key = self.shard_key(prefix, r0.job_id, shard_num)
 
         now = datetime.now(timezone.utc)
         table = pa.table({
