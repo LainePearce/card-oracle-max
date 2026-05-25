@@ -19,7 +19,9 @@ fi
 
 SSH_USER="ec2-user"
 # Optional: path to .pem for the EC2 key pair (must match terraform key_pair_name), e.g. ~/.ssh/qdrant-test.pem
-SSH_ARGS=( -o StrictHostKeyChecking=no -o ConnectTimeout=10 )
+# LogLevel=ERROR suppresses the macOS-OpenSSH post-quantum KEX warning that
+# otherwise corrupts the rsync channel (same fix as deploy_os_backfill.sh).
+SSH_ARGS=( -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR )
 [[ -n "${DAILY_WORKER_SSH_KEY:-}" ]] && SSH_ARGS+=( -i "$DAILY_WORKER_SSH_KEY" )
 # rsync -e must be one argv; paths without spaces are fine with *
 RSYNC_RSH="ssh ${SSH_ARGS[*]}"
@@ -29,6 +31,13 @@ REMOTE_DIR="/home/ec2-user/card-oracle-max"
 echo "=== Deploying daily worker to $WORKER_IP ==="
 
 # --- 1. Sync code ---
+# Excludes mirror tools/deploy_os_backfill.sh — the daily worker needs the same
+# small set of code (src/, tools/, requirements.txt) and none of the large
+# local-only artifacts. The killers historically:
+#   data/        — multi-GB local datasets (worker reads RDS/OS at runtime)
+#   models/      — gitignored; weights pulled at runtime by open-clip / s-t
+#   .terraform/  — ~600 MB AWS provider binary PER terraform module dir,
+#                  shipped to the remote for no reason. Biggest single saving.
 echo "[1/5] Syncing code..."
 rsync -av --progress \
     -e "$RSYNC_RSH" \
@@ -37,8 +46,15 @@ rsync -av --progress \
     --exclude='*.pyc' \
     --exclude='.venv' \
     --exclude='.env' \
+    --exclude='data' \
+    --exclude='models' \
+    --exclude='.terraform' \
+    --exclude='*.tfstate' \
+    --exclude='*.tfstate.backup' \
+    --exclude='.terraform.lock.hcl' \
     --exclude='logs/' \
     --exclude='experiment/results/' \
+    --exclude='*.log' \
     ./ "$REMOTE:$REMOTE_DIR/"
 
 # --- 2. Create / update virtualenv ---
