@@ -37,17 +37,31 @@ from src.embeddings.vector_store import S3VectorStore
 from src.ingestion.qdrant_writer import get_qdrant_client, COLLECTION_NAME
 
 
+DEFAULTS = {
+    # vector_type → (model_id, params_hash) — must match the worker's
+    # IMAGE_MODEL_ID/IMAGE_PARAMS and TEXT_MODEL_ID/TEXT_PARAMS constants.
+    "image":     ("clip-vit-l-14", "v2-fp16-224px-sqpad"),
+    "specifics": ("minilm-l6-v2",  "v1-mean-256tok"),
+}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Repopulate Qdrant from S3 vectors.")
     p.add_argument("--vector-type", choices=["image", "specifics"], required=True)
-    p.add_argument("--model",       default="clip-vit-l-14")
-    p.add_argument("--params",      default="v2-fp16-224px-sqpad")
+    p.add_argument("--model",       default=None,
+                   help="Override the model_id; defaults are vector-type aware.")
+    p.add_argument("--params",      default=None,
+                   help="Override the params_hash; defaults are vector-type aware.")
     p.add_argument("--collection",  default=COLLECTION_NAME)
     p.add_argument("--batch-size",  type=int, default=1000,
                    help="Points per Qdrant upsert call.")
     p.add_argument("--progress-every", type=int, default=30,
                    help="Seconds between progress lines (default 30).")
     args = p.parse_args()
+
+    default_model, default_params = DEFAULTS[args.vector_type]
+    if args.model  is None: args.model  = default_model
+    if args.params is None: args.params = default_params
 
     store = S3VectorStore(
         bucket=os.environ["S3_VECTOR_BUCKET"],
