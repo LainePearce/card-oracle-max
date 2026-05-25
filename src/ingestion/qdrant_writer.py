@@ -45,29 +45,37 @@ COLLECTION_NAME = os.environ.get("QDRANT_COLLECTION", "cards")
 
 def get_qdrant_client() -> QdrantClient:
     """
-    Build a QdrantClient from environment variables.
+    Build a QdrantClient using REST (port 6333) — gRPC is force-disabled.
 
-    Required env vars:
-        QDRANT_HOST         hostname or IP  (default: localhost)
-        QDRANT_PORT         HTTP port       (default: 6333)
-    Optional:
-        QDRANT_API_KEY      API key
-        QDRANT_USE_GRPC     "true" to prefer gRPC (default: false)
-        QDRANT_COLLECTION   collection name (default: cards)
+    Env vars:
+        QDRANT_HOST         hostname or IP   (default: localhost)
+        QDRANT_API_KEY      API key          (optional)
+        QDRANT_COLLECTION   collection name  (default: cards)
+
+    Why REST is forced (do NOT re-enable gRPC without addressing this first):
+      The production Qdrant cluster runs server version 1.8.2 while this
+      project's pinned qdrant-client is 1.18.0. Across that 10-minor-version
+      gap the gRPC wire format diverged: PointStruct named-vector upserts
+      from this client are silently no-op'd by the 1.8.2 server (wait=False
+      hides the InvalidArgument). The result was ~6 weeks of daily-update
+      and historical-backfill writes that "completed" without ever landing.
+      REST works correctly across the version gap. Restore gRPC ONLY after
+      either upgrading the server to ≥1.17 or downgrading the client to 1.9.x.
+
+    QDRANT_PORT and QDRANT_USE_GRPC env vars are intentionally ignored — the
+    function hardcodes the working path so a stray .env change can't reopen
+    the silent-failure bug.
     """
-    host     = os.environ.get("QDRANT_HOST", "localhost")
-    port     = int(os.environ.get("QDRANT_PORT", 6333))
-    api_key  = os.environ.get("QDRANT_API_KEY") or None
-    use_grpc = os.environ.get("QDRANT_USE_GRPC", "false").lower() in ("true", "1")
+    host    = os.environ.get("QDRANT_HOST", "localhost")
+    api_key = os.environ.get("QDRANT_API_KEY") or None
 
-    # Always use an explicit URL so the client does not assume HTTPS on remote hosts.
-    url = f"http://{host}:{port}"
-    logger.debug("Connecting to Qdrant at {} (grpc={})", url, use_grpc)
+    url = f"http://{host}:6333"
+    logger.debug("Connecting to Qdrant at {} (REST forced; gRPC disabled — see docstring)", url)
 
     return QdrantClient(
         url=url,
         api_key=api_key,
-        prefer_grpc=use_grpc,
+        prefer_grpc=False,
         timeout=60,
     )
 
