@@ -516,11 +516,17 @@ def run(args: argparse.Namespace) -> None:
             }.get(classification.get("index_type", "unknown"), "unknown")
 
             # --- S3 records ---
+            # job_id makes S3 shard keys unique — different runs of this job
+            # can't overwrite each other's parquet shards. daily-update.py
+            # always passes --checkpoint-id daily-YYYY-MM-DD; fall back to the
+            # date range for ad-hoc invocations so the require check in
+            # write_shard doesn't trip.
             common = dict(
                 os_id=doc_id,
                 qdrant_id=str(qdrant_id),
                 index_name=idx_name,
                 index_type=index_type_slug,
+                job_id=args.checkpoint_id or f"rds-{args.start_date}-{args.end_date}",
             )
 
             if image_vec is not None:
