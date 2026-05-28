@@ -105,6 +105,13 @@ def main() -> None:
     p.add_argument("--params",      default=None,
                    help="Override the params_hash; defaults are vector-type aware.")
     p.add_argument("--collection",  default=COLLECTION_NAME)
+    p.add_argument("--index-type",  default=None,
+                   help="Filter S3 shards to this index_type (e.g. 'ebay-dated'). "
+                        "Required when --partition is set.")
+    p.add_argument("--partition",   default=None,
+                   help="Filter S3 shards to a single partition (e.g. '2026-05-28' "
+                        "for an ebay-dated index). Use with --index-type. Per-day "
+                        "Qdrant push: orchestrator calls with --partition <date>.")
     p.add_argument("--batch-size",  type=int, default=500,
                    help="Points per Qdrant update_vectors call (default 500). "
                         "Smaller is more failure-localised under wait=True.")
@@ -118,11 +125,17 @@ def main() -> None:
                    help="Skip the set_payload(has_image=True) merge — vectors only.")
     args = p.parse_args()
 
+    if args.partition and not args.index_type:
+        p.error("--partition requires --index-type")
+
     default_model, default_params = DEFAULTS[args.vector_type]
     if args.model  is None: args.model  = default_model
     if args.params is None: args.params = default_params
 
-    job_id = f"{CHECKPOINT_JOB_PREFIX}_{args.vector_type}"
+    # Per-partition checkpoints don't collide with whole-collection ones.
+    scope_suffix = f"_{args.index_type}_{args.partition}" \
+                   if args.partition else ""
+    job_id = f"{CHECKPOINT_JOB_PREFIX}_{args.vector_type}{scope_suffix}"
     payload_flag = PAYLOAD_FLAG_BY_TYPE[args.vector_type]
 
     store  = S3VectorStore(
@@ -148,7 +161,11 @@ def main() -> None:
         print(f"[repopulate] no checkpoint — starting from scratch", flush=True)
 
     # ── Enumerate shards ──────────────────────────────────────────────────
-    keys = store.list_shards(args.vector_type, args.model, args.params)
+    keys = store.list_shards(
+        args.vector_type, args.model, args.params,
+        index_type=args.index_type,
+        partition=args.partition,
+    )
     todo = [k for k in keys if k not in completed]
     print(f"[repopulate] {len(keys):,} total shards, "
           f"{len(todo):,} to process this session, "
