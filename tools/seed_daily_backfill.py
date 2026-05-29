@@ -228,11 +228,9 @@ def main() -> None:
     os_client = get_opensearch_client()
     today     = date.today()
 
-    grand_total = {"seeded": 0, "days": 0,
-                   "skip:already-handled":   0,
-                   "skip:no-os-index":       0,
-                   "skip:no-docs":           0,
-                   "skip:zero-windows":      0}
+    total_jobs        = 0
+    total_day_attempts = 0
+    status_counts: dict[str, int] = {}
 
     for b in get_blocks(today):
         if b.block_id not in args.blocks:
@@ -248,10 +246,10 @@ def main() -> None:
         for offset, d in enumerate(dates):
             n, status = seed_day(s3, os_client, d.isoformat(),
                                   b, day_offset=offset, dry_run=args.dry_run)
-            grand_total[status] = grand_total.get(status, 0) + 1
-            grand_total["days"] += 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+            total_day_attempts += 1
             block_seeded += n
-            grand_total["seeded"] += n
+            total_jobs    += n
             if status == "seeded":
                 logger.info("  {} → seeded {} jobs (priority {})",
                             d.isoformat(), n,
@@ -263,10 +261,9 @@ def main() -> None:
 
     logger.info("──────────────────────────────────────────")
     logger.info("Grand total: {} jobs across {} day-attempts",
-                grand_total["seeded"], grand_total["days"])
-    for k in sorted(grand_total):
-        if k not in ("seeded", "days"):
-            logger.info("  {:30s} {}", k, grand_total[k])
+                total_jobs, total_day_attempts)
+    for k in sorted(status_counts):
+        logger.info("  {:30s} {}", k, status_counts[k])
 
 
 if __name__ == "__main__":
