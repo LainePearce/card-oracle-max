@@ -127,22 +127,49 @@ SSH_TARGETS = WORKER_PRIVATE_IPS if _USE_PRIVATE_IPS else WORKER_IPS
 N_WORKERS = len(WORKER_IPS)
 
 SSH_KEY       = os.path.expanduser("~/.ssh/qdrant-test.pem")
+
+# If the dashboard host doesn't have the SSH key (typical when
+# os-dashboard.service runs on worker-0 but the key was never copied there),
+# every poll fails with exit 255 and the Worker Fleet section turns into a
+# wall of "SSH error: 255". Detect that at startup and degrade gracefully —
+# we'll skip the poll loop entirely and surface a single one-time note.
+SSH_AVAILABLE = os.path.exists(SSH_KEY)
+if not SSH_AVAILABLE:
+    print(f"[dashboard] SSH key not found at {SSH_KEY} — "
+          "worker fleet polling disabled. Job state still polled from S3.",
+          flush=True)
 S3_BUCKET     = "card-oracle-vectors"
 S3_JOB_PREFIX = "backfill-v2"
 POLL_INTERVAL = 60  # seconds
 
-# Priority band definitions (open-closed: [start, end))
-# P1: "2025-10-01" ≤ index ≤ "2026-02-28"
-# P2: "2025-08-01" ≤ index ≤ "2025-09-30"
-# P3: "2024-12-01" ≤ index ≤ "2024-12-31"
-# P4: all other eBay dated indices
-# P5: non-eBay indices (end in -gold, -pris, -heritage, -pwcc, -ms)
+# Priority band definitions — MUST stay in sync with tools/seed_daily_backfill.py.
+#
+# P1: today back 21 days (2026-05-08 → today as of writing) — was zero coverage
+# P2: 2026-01-01 → 2026-05-07                                — was partial coverage
+# P3: 2025-01-01 → 2025-12-31                                — 2025 historical
+# P4: any other eBay-dated index (older history, pre-2025 leftovers)
+# P5: non-eBay markets (end in -gold, -pris, -heritage, -pwcc, -ms)
+#
+# Ranges use [start, end) — start inclusive, end exclusive.
+# P1's end advances with `date.today()`; the dashboard's systemd unit gets
+# restarted on each deploy_os_backfill run, which refreshes this at startup.
+_TODAY     = date.today()
+_P1_START  = "2026-05-08"
+_P1_END    = (_TODAY + timedelta(days=1)).isoformat()   # include today
+_P2_START  = "2026-01-01"
+_P2_END    = _P1_START
+_P3_START  = "2025-01-01"
+_P3_END    = _P2_START
+
 PRIORITY_BANDS: list[dict] = [
-    {"p": 1, "label": "P1 — Oct 2025–Feb 2026", "start": "2025-10-01", "end": "2026-03-01"},
-    {"p": 2, "label": "P2 — Aug–Sep 2025",       "start": "2025-08-01", "end": "2025-10-01"},
-    {"p": 3, "label": "P3 — Dec 2024",            "start": "2024-12-01", "end": "2025-01-01"},
-    {"p": 4, "label": "P4 — Other eBay dated",    "start": None,         "end": None},
-    {"p": 5, "label": "P5 — Non-eBay markets",    "start": None,         "end": None},
+    {"p": 1, "label": f"P1 — {_P1_START} → today",
+     "start": _P1_START, "end": _P1_END},
+    {"p": 2, "label": f"P2 — {_P2_START} → 2026-05-07",
+     "start": _P2_START, "end": _P2_END},
+    {"p": 3, "label": "P3 — 2025-01-01 → 2025-12-31",
+     "start": _P3_START, "end": _P3_END},
+    {"p": 4, "label": "P4 — Other eBay dated",    "start": None, "end": None},
+    {"p": 5, "label": "P5 — Non-eBay markets",    "start": None, "end": None},
 ]
 
 NON_EBAY_SUFFIXES = ("-gold", "-pris", "-heritage", "-pwcc", "-ms")
@@ -385,6 +412,21 @@ def poll_worker_ssh(worker_idx: int, ip: str) -> dict:
 
 
 def poll_all_workers_ssh() -> list[dict]:
+    # If the dashboard host has no SSH key, render a clean "not polled" row
+    # for each worker rather than blasting 12 × "SSH error: 255".
+    if not SSH_AVAILABLE:
+        return [
+            {
+                "index":    i,
+                "ip":       WORKER_IPS[i],
+                "service":  "—",
+                "log_line": "",
+                "error":    "ssh key not on dashboard host (cosmetic — "
+                            "job state still tracked via S3)",
+            }
+            for i in range(N_WORKERS)
+        ]
+
     results: list[dict | None] = [None] * N_WORKERS
     threads = []
 
@@ -829,11 +871,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="section calendar-section">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <div>
-        <div class="section-title" style="margin:0">eBay Date Coverage</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">Jan 2024 – present · newest first</div>
+        <div class="section-title" style="margin:0">eBay Date Coverage (job state)</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">
+          Jan 2024 – present · newest first · "Complete" = job finished, NOT
+          % of OS docs covered. For true coverage run
+          <code>tools/audit_daily_coverage.py</code> or check
+          <code>backfill-v2/verified/&lt;date&gt;.json</code>.
+        </div>
       </div>
       <div class="legend">
-        <div class="legend-item"><div class="legend-dot complete"></div>Complete</div>
+        <div class="legend-item"><div class="legend-dot complete"></div>Job complete</div>
         <div class="legend-item"><div class="legend-dot active"></div>Active</div>
         <div class="legend-item"><div class="legend-dot queued"></div>Queued</div>
         <div class="legend-item"><div class="legend-dot failed"></div>Failed</div>
