@@ -181,6 +181,11 @@ def seed_day(s3, os_client, index_name: str, block: Block,
     if not windows:
         return (0, "skip:zero-windows")
 
+    # Pull marketplace / index_type / has_item_specifics / partition from the
+    # canonical classifier — backfill_from_opensearch.py reads all of these
+    # off the job dict (e.g. job["marketplace"] at line 578).
+    c = classify_index(index_name)
+
     priority = BLOCK_BASES[block.block_id] + day_offset
     seeded = 0
 
@@ -193,8 +198,10 @@ def seed_day(s3, os_client, index_name: str, block: Block,
             "block_id":            block.block_id,
             "day_offset":          day_offset,
             "index_name":          index_name,
-            "index_type":          "ebay-dated",
-            "partition":           index_name,
+            "index_type":          c["index_type"],
+            "marketplace":         c["marketplace"],
+            "has_item_specifics":  c["has_item_specifics"],
+            "partition":           c["partition"],
             "ts_start":            window["ts_start"],
             "ts_end":              window["ts_end"],
             "doc_count_estimate":  window["doc_count_estimate"],
