@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -48,6 +49,11 @@ from pathlib import Path
 
 import boto3
 from loguru import logger
+
+
+# Strict YYYY-MM-DD — guards against false matches like "2021-ms-w0" which
+# pass the dash-position test but aren't real dates.
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -92,7 +98,7 @@ def _list_dates_in_prefix(s3, prefix: str) -> dict[str, int]:
                 date = name.split("_w", 1)[0]
             else:
                 date = name.removesuffix(".json")
-            if len(date) == 10 and date[4] == "-" and date[7] == "-":
+            if _DATE_RE.match(date):
                 counts[date] += 1
     return counts
 
