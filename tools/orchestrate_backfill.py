@@ -71,16 +71,27 @@ REPOPULATE_PY   = ROOT / "tools" / "repopulate_qdrant.py"
 
 
 def _list_dates_in_prefix(s3, prefix: str) -> dict[str, int]:
-    """Return {date: count} of jobs whose key matches {prefix}/{date}_w*.json."""
+    """Return {date: count} of objects under {prefix}/ keyed by date.
+
+    Handles two naming conventions used in backfill-v2/:
+      - Job-state prefixes (queue/active/complete/failed): YYYY-MM-DD_wNN.json
+      - Per-day prefixes  (verified/qdrant-pushed):        YYYY-MM-DD.json
+
+    Returns a count per date so callers can ask "how many windows per
+    date are in this prefix?" — for per-day prefixes that's just 1 per
+    date but counting it the same way keeps the STATUS line honest.
+    """
     counts: dict[str, int] = defaultdict(int)
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix + "/"):
         for obj in page.get("Contents", []):
             name = obj["Key"].rsplit("/", 1)[-1]
-            if "_w" not in name or not name.endswith(".json"):
+            if not name.endswith(".json"):
                 continue
-            date = name.split("_w", 1)[0]
-            # Sanity-check it looks like a YYYY-MM-DD
+            if "_w" in name:
+                date = name.split("_w", 1)[0]
+            else:
+                date = name.removesuffix(".json")
             if len(date) == 10 and date[4] == "-" and date[7] == "-":
                 counts[date] += 1
     return counts
