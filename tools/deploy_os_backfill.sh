@@ -252,8 +252,58 @@ REMOTE
       echo "    Or use the local dashboard:        python tools/backfill_dashboard.py"
     fi
     set -e
+
+    # ── Orchestrator service on worker-0 ──────────────────────────────────
+    # Installs (but does NOT enable/start) os-orchestrator.service. Same
+    # best-effort/non-fatal pattern as the dashboard above. We do not auto-
+    # start because the orchestrator subprocesses repopulate_qdrant per day
+    # (~6 min each); a restart mid-push would orphan that subprocess. The
+    # operator starts it manually with `sudo systemctl start os-orchestrator`
+    # when the in-flight tmux orchestrator (if any) is finished or stopped.
+    set +e
+    echo "Installing os-orchestrator.service on worker-0 (${W0})... (best-effort)"
+    orch_ok=0
+    for attempt in 1 2 3; do
+      ssh -i "${KEY}" ${SSH_OPTS} "ec2-user@${W0}" bash <<REMOTE >/dev/null 2>&1
+        set -e
+        sudo tee /etc/systemd/system/os-orchestrator.service > /dev/null <<SVCEOF
+[Unit]
+Description=Card Oracle per-day backfill orchestrator (worker-0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=${REMOTE_DIR}
+Environment=PATH=${REMOTE_DIR}/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=${REMOTE_DIR}/.venv/bin/python tools/orchestrate_backfill.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+        sudo systemctl daemon-reload
+REMOTE
+      if [ $? -eq 0 ]; then orch_ok=1; break; fi
+      echo "  orchestrator install attempt ${attempt} failed — retrying in 10s..."
+      sleep 10
+    done
+    if [ "$orch_ok" = "1" ]; then
+      echo "  ✓ os-orchestrator.service installed (NOT started — see below)"
+      echo "    Start manually when the tmux orchestrator (if any) is done:"
+      echo "      sudo systemctl enable --now os-orchestrator"
+      echo "    Tail logs:    sudo journalctl -fu os-orchestrator"
+    else
+      echo "  ⚠ orchestrator install failed after 3 tries — non-fatal."
+      echo "    Re-run just the dashboard+orchestrator later:  bash tools/deploy_os_backfill.sh 0"
+    fi
+    set -e
   else
-    echo "(worker-0 not in targets — skipping os-dashboard setup)"
+    echo "(worker-0 not in targets — skipping os-dashboard / os-orchestrator setup)"
   fi
   echo ""
   echo "Monitor:"

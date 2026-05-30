@@ -114,8 +114,14 @@ def push_day_to_qdrant(date_str: str) -> bool:
         "--vector-type",     "image",
         "--index-type",      "ebay-dated",
         "--partition",       date_str,
-        "--no-payload-flag",   # has_image already set; skip the extra set_payload pass
+        "--no-payload-flag",     # has_image already set; skip the extra set_payload pass
         "--checkpoint-every", "10",
+        # Per-batch HNSW commit time is roughly fixed (~300-600ms regardless of
+        # batch size, dominated by wait=True flush). 2000 → ~4x fewer round
+        # trips than the default 500, ~4x faster per partition. Each batch is
+        # still atomic so larger batch ≠ larger failure blast radius for our
+        # idempotent update_vectors use case.
+        "--batch-size",      "2000",
     ]
     logger.info("Qdrant push: starting subprocess for {}", date_str)
     logger.debug("cmd: {}", " ".join(cmd))
