@@ -286,41 +286,68 @@ def _encode_via_batch(pil_image) -> "np.ndarray":
 
 # Score-threshold ladder used by _qdrant_search_adaptive():
 #
-#   Phase 1  0.99 → 0.95  step -0.01    stop when ≥25 results
-#   Phase 2  0.95 → 0.85  step -0.025   triggered when phase-1 exits with <20 results
-#   Floor    0.85          return whatever exists, even if <25
-#   Fallback no threshold  if floor returns 0 results, return top-20 unconstrained
+#   Phase 1  0.99 → 0.95  step -0.01    stop when ≥top_k results
+#   Phase 2  0.95 → floor step -0.025   triggered when phase-1 exits with <80% of top_k
+#   Floor    score_floor   return whatever exists, even if <top_k
+#   Fallback no threshold  if floor returns 0 results, return top-k unconstrained
 #
-# Phase-2 queries: 0.925, 0.90, 0.875, 0.85 (0.95 already tried in phase 1).
+# Phase-2 queries: 0.925, 0.90, 0.875, 0.85, … (0.95 already tried in phase 1).
+#
+# top_k and score_floor are per-request — clients send them in the JSON body
+# to /search and /search_b64. Defaults below.
 
-_SEARCH_TARGET         = 25      # desired result count
+_DEFAULT_TOP_K         = 25
+_MAX_TOP_K             = 1000    # clamp; refuse to ask Qdrant for more than this
+_DEFAULT_SCORE_FLOOR   = 0.85    # never go below this; return whatever we have
+_DEFAULT_HNSW_EF       = 128
+_MAX_HNSW_EF           = 4096    # clamp; defensive against absurd values
+
 _PHASE1_START          = 0.99
 _PHASE1_STOP           = 0.95    # inclusive — last threshold tried in phase 1
 _PHASE1_STEP           = 0.01
-_PHASE2_TRIGGER_COUNT  = 20      # switch to phase 2 if results at 0.95 < this
-_PHASE2_STEP           = 0.025   # coarser step in phase 2 (0.925 → 0.90 → 0.875 → 0.85)
-_SCORE_FLOOR           = 0.85    # never go below this; return whatever we have
+_PHASE2_STEP           = 0.025   # coarser step in phase 2 (0.925 → 0.90 → 0.875 → ...)
+_PHASE2_TRIGGER_FRAC   = 0.8     # skip phase 2 if phase-1 already gave ≥80% of top_k
+
+
+def _clamp_int(val, lo: int, hi: int, default: int) -> int:
+    """Coerce to int and clamp to [lo, hi]; fall back to default if non-numeric."""
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _clamp_float(val, lo: float, hi: float, default: float) -> float:
+    """Coerce to float and clamp to [lo, hi]; fall back to default if non-numeric."""
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
 
 
 def _qdrant_search_adaptive(
     vec: "np.ndarray",
-    hnsw_ef: int = 128,
+    hnsw_ef:     int   = _DEFAULT_HNSW_EF,
+    top_k:       int   = _DEFAULT_TOP_K,
+    score_floor: float = _DEFAULT_SCORE_FLOOR,
 ) -> tuple[list, float, int]:
     """
     Search Qdrant with an adaptive score-threshold ladder.
 
     Phase 1: threshold steps down from 0.99 → 0.95 in 0.01 increments,
-             stopping as soon as ≥ _SEARCH_TARGET (25) results are returned.
+             stopping as soon as ≥ top_k results are returned.
 
-    Phase 2: if phase 1 ends at 0.95 with fewer than _PHASE2_TRIGGER_COUNT (20)
-             results, continue in _PHASE2_STEP (0.025) increments
-             (queries: 0.925, 0.90, 0.875, 0.85).
+    Phase 2: if phase 1 ends at 0.95 with fewer than _PHASE2_TRIGGER_FRAC × top_k
+             results (default 80% of top_k), continue in _PHASE2_STEP (0.025)
+             increments down to `score_floor`.
 
-    Floor:   once the threshold would go below _SCORE_FLOOR (0.85), clamp to
-             0.85, run one final query, and return whatever comes back.
+    Floor:   once the threshold would go below score_floor, clamp to that floor,
+             run one final query, and return whatever comes back.
 
     Fallback: if the floor query returns 0 results, run one final unconstrained
-              query (no score_threshold) and return the top 20 by score.
+              query (no score_threshold) and return the top `top_k` by score.
 
     Returns:
         (hits, final_threshold, qdrant_call_count)
@@ -338,12 +365,13 @@ def _qdrant_search_adaptive(
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=(QDRANT_VECTOR_NAME, vec.tolist()),
-            limit=_SEARCH_TARGET,
+            limit=top_k,
             score_threshold=round(threshold, 4),
             with_payload=True,
             search_params=params,
         )
 
+    phase2_trigger = max(1, int(top_k * _PHASE2_TRIGGER_FRAC))
     calls = 0
     hits  = []
 
@@ -356,23 +384,23 @@ def _qdrant_search_adaptive(
             "Adaptive search: threshold={:.2f} → {} results (phase 1)",
             threshold, len(hits),
         )
-        if len(hits) >= _SEARCH_TARGET:
+        if len(hits) >= top_k:
             return hits, threshold, calls
         threshold = round(threshold - _PHASE1_STEP, 4)
 
     # Phase 1 exhausted — re-anchor to exactly 0.95 for the phase-2 decision.
     threshold = _PHASE1_STOP
 
-    if len(hits) >= _PHASE2_TRIGGER_COUNT:
+    if len(hits) >= phase2_trigger:
         # Already have enough — no need for phase 2
         return hits, threshold, calls
 
-    # ── Phase 2: 0.925 → 0.85 in 0.025 steps ─────────────────────────────────
+    # ── Phase 2: 0.925 → score_floor in 0.025 steps ──────────────────────────
     # 0.95 already queried in phase 1; first new query is 0.95 - 0.025 = 0.925.
     threshold = round(threshold - _PHASE2_STEP, 4)   # 0.95 - 0.025 = 0.925
-    while threshold > _SCORE_FLOOR - 1e-9:
-        if threshold < _SCORE_FLOOR:
-            threshold = _SCORE_FLOOR   # clamp to floor
+    while threshold > score_floor - 1e-9:
+        if threshold < score_floor:
+            threshold = score_floor   # clamp to floor
 
         hits  = _search(threshold)
         calls += 1
@@ -380,9 +408,9 @@ def _qdrant_search_adaptive(
             "Adaptive search: threshold={:.2f} → {} results (phase 2)",
             threshold, len(hits),
         )
-        if len(hits) >= _SEARCH_TARGET:
+        if len(hits) >= top_k:
             return hits, threshold, calls
-        if abs(threshold - _SCORE_FLOOR) < 1e-9:
+        if abs(threshold - score_floor) < 1e-9:
             # At the floor — return what we have if non-empty, otherwise break
             # to the unconstrained fallback below.
             if hits:
@@ -391,13 +419,13 @@ def _qdrant_search_adaptive(
 
         threshold = round(threshold - _PHASE2_STEP, 4)
 
-    # ── Fallback: unconstrained top-20 ───────────────────────────────────────
-    # Reached when the floor query (0.85) returned 0 results.
+    # ── Fallback: unconstrained top_k ────────────────────────────────────────
+    # Reached when the floor query returned 0 results.
     if not hits:
         hits = qdrant.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=(QDRANT_VECTOR_NAME, vec.tolist()),
-            limit=20,
+            limit=top_k,
             with_payload=True,
             search_params=params,
         )
@@ -463,24 +491,38 @@ def search():
     Full pipeline: image URL → GPU encode → Qdrant ANN → OpenSearch enrichment.
 
     Request JSON:
-        image_url   str   URL of the card image to use as query
-        top_k       int   number of results (default 20)
-        hnsw_ef     int   HNSW ef_search parameter (default 128, use 256 for hard queries)
+        image_url    str    URL of the card image to use as query
+        top_k        int    desired result count
+                            (default 25, clamped to [1, 1000])
+        hnsw_ef      int    HNSW ef_search parameter
+                            (default 128, clamped to [1, 4096], 256 for hard queries)
+        score_floor  float  minimum acceptable Qdrant score
+                            (default 0.85, clamped to [0.0, 1.0])
+
+    Out-of-range / non-numeric values for top_k, hnsw_ef, score_floor are
+    silently clamped to the valid range (or fall back to the default if
+    non-numeric); the effective values are echoed back in the response.
 
     Response JSON:
         query_image_url   str   echoed back
         qdrant_results    list  [{qdrant_id, os_id, score, payload, doc}, ...]
-        total             int
+        total             int   actual count returned (may be less than top_k)
+        top_k             int   effective top_k after clamping
+        hnsw_ef           int   effective hnsw_ef after clamping
+        score_floor       float effective score_floor after clamping
+        score_threshold   float threshold at which Qdrant returned results
+        qdrant_calls      int   number of ladder steps run
         encode_ms         int   encoding latency
         qdrant_ms         int   Qdrant search latency
         enrich_ms         int   OpenSearch enrichment latency
     """
     import time
 
-    data      = request.get_json(force=True) or {}
-    image_url = data.get("image_url", "").strip()
-    top_k     = int(data.get("top_k", 20))
-    hnsw_ef   = int(data.get("hnsw_ef", 128))
+    data        = request.get_json(force=True) or {}
+    image_url   = data.get("image_url", "").strip()
+    top_k       = _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,    _DEFAULT_TOP_K)
+    hnsw_ef     = _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF,  _DEFAULT_HNSW_EF)
+    score_floor = _clamp_float(data.get("score_floor"), 0.0, 1.0,            _DEFAULT_SCORE_FLOOR)
 
     if not image_url:
         return jsonify({"error": "image_url is required"}), 400
@@ -514,15 +556,17 @@ def search():
     # ── Step 2: Qdrant ANN search (adaptive score threshold) ─────────────────
     t1 = time.perf_counter()
     try:
-        hits, final_threshold, qdrant_calls = _qdrant_search_adaptive(vec, hnsw_ef)
+        hits, final_threshold, qdrant_calls = _qdrant_search_adaptive(
+            vec, hnsw_ef=hnsw_ef, top_k=top_k, score_floor=score_floor,
+        )
     except Exception as e:
         logger.error("Qdrant search error: {}", e)
         return jsonify({"error": f"Qdrant search failed: {e}"}), 500
 
     qdrant_ms = int((time.perf_counter() - t1) * 1000)
     logger.info(
-        "Qdrant returned {} hits in {}ms (threshold={:.2f}, {} calls)",
-        len(hits), qdrant_ms, final_threshold, qdrant_calls,
+        "Qdrant returned {} hits in {}ms (threshold={:.2f}, {} calls, top_k={}, floor={:.2f})",
+        len(hits), qdrant_ms, final_threshold, qdrant_calls, top_k, score_floor,
     )
 
     # Build result list and gather os_ids for enrichment
@@ -577,6 +621,9 @@ def search():
         "query_image_url":  image_url,
         "qdrant_results":   qdrant_results,
         "total":            len(qdrant_results),
+        "top_k":            top_k,
+        "hnsw_ef":          hnsw_ef,
+        "score_floor":      round(score_floor, 4),
         "score_threshold":  round(final_threshold, 4),
         "qdrant_calls":     qdrant_calls,
         "encode_ms":        encode_ms,
@@ -638,24 +685,38 @@ def search_b64():
       - Enriches results from OpenSearch
 
     Request JSON:
-        image_b64   str   Base64-encoded image bytes at native CDN resolution (no pre-resize)
-        top_k       int   number of results (default 20)
-        hnsw_ef     int   HNSW ef_search parameter (default 128)
+        image_b64    str    Base64-encoded image bytes at native CDN resolution (no pre-resize)
+        top_k        int    desired result count
+                            (default 25, clamped to [1, 1000])
+        hnsw_ef      int    HNSW ef_search parameter
+                            (default 128, clamped to [1, 4096], 256 for hard queries)
+        score_floor  float  minimum acceptable Qdrant score
+                            (default 0.85, clamped to [0.0, 1.0])
+
+    Out-of-range / non-numeric values for top_k, hnsw_ef, score_floor are
+    silently clamped to the valid range (or fall back to the default if
+    non-numeric); the effective values are echoed back in the response.
 
     Response JSON:
         image_size        str   "WxH" of the received image (before padding)
         qdrant_results    list  [{qdrant_id, os_id, score, payload, doc}, ...]
-        total             int
+        total             int   actual count returned (may be less than top_k)
+        top_k             int   effective top_k after clamping
+        hnsw_ef           int   effective hnsw_ef after clamping
+        score_floor       float effective score_floor after clamping
+        score_threshold   float threshold at which Qdrant returned results
+        qdrant_calls      int   number of ladder steps run
         encode_ms         int   decode + GPU encode latency
         qdrant_ms         int   Qdrant search latency
         enrich_ms         int   OpenSearch enrichment latency
     """
     import time
 
-    data      = request.get_json(force=True) or {}
-    image_b64 = data.get("image_b64", "").strip()
-    top_k     = int(data.get("top_k", 20))
-    hnsw_ef   = int(data.get("hnsw_ef", 128))
+    data        = request.get_json(force=True) or {}
+    image_b64   = data.get("image_b64", "").strip()
+    top_k       = _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,    _DEFAULT_TOP_K)
+    hnsw_ef     = _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF,  _DEFAULT_HNSW_EF)
+    score_floor = _clamp_float(data.get("score_floor"), 0.0, 1.0,            _DEFAULT_SCORE_FLOOR)
 
     if not image_b64:
         return jsonify({"error": "image_b64 is required"}), 400
@@ -684,15 +745,17 @@ def search_b64():
     # ── Step 2: Qdrant ANN search (adaptive score threshold) ─────────────────
     t1 = time.perf_counter()
     try:
-        hits, final_threshold, qdrant_calls = _qdrant_search_adaptive(vec, hnsw_ef)
+        hits, final_threshold, qdrant_calls = _qdrant_search_adaptive(
+            vec, hnsw_ef=hnsw_ef, top_k=top_k, score_floor=score_floor,
+        )
     except Exception as e:
         logger.error("Qdrant search error: {}", e)
         return jsonify({"error": f"Qdrant search failed: {e}"}), 500
 
     qdrant_ms = int((time.perf_counter() - t1) * 1000)
     logger.info(
-        "Qdrant returned {} hits in {}ms (threshold={:.2f}, {} calls)",
-        len(hits), qdrant_ms, final_threshold, qdrant_calls,
+        "Qdrant returned {} hits in {}ms (threshold={:.2f}, {} calls, top_k={}, floor={:.2f})",
+        len(hits), qdrant_ms, final_threshold, qdrant_calls, top_k, score_floor,
     )
 
     qdrant_results = []
@@ -746,6 +809,9 @@ def search_b64():
         "image_size":      orig_size,
         "qdrant_results":  qdrant_results,
         "total":           len(qdrant_results),
+        "top_k":           top_k,
+        "hnsw_ef":         hnsw_ef,
+        "score_floor":     round(score_floor, 4),
         "score_threshold": round(final_threshold, 4),
         "qdrant_calls":    qdrant_calls,
         "encode_ms":       encode_ms,
