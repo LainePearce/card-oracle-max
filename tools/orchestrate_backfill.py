@@ -197,6 +197,14 @@ def run_tick(s3) -> dict:
     counts["ready_dates"] = len(ready)
 
     for date_str in ready:
+        # Already pushed (by the orchestrator OR a manual repopulate_qdrant
+        # run for an accepted-as-incomplete day) → skip entirely. Checked
+        # first so manually-handled sub-floor days don't re-verify and
+        # re-log "skip ... manual_review" on every tick forever.
+        push_marker = f"{S3_QDRANT_PUSHED_PFX}/{date_str}.json"
+        if _s3_key_exists(s3, push_marker):
+            continue
+
         verify_key = f"{S3_VERIFIED_PFX}/{date_str}.json"
         already_verified = _s3_key_exists(s3, verify_key)
         if not already_verified:
@@ -221,10 +229,6 @@ def run_tick(s3) -> dict:
         if result.status not in ("complete", "remediation_attempted"):
             logger.info("skip qdrant push for {}: status={}",
                         date_str, result.status)
-            continue
-
-        push_marker = f"{S3_QDRANT_PUSHED_PFX}/{date_str}.json"
-        if _s3_key_exists(s3, push_marker):
             continue
 
         ok = push_day_to_qdrant(date_str)
