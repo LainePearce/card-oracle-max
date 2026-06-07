@@ -146,6 +146,17 @@ KILL_CHECK_INTERVAL = 60
 # queue, so no idle polls) would never re-scan and orphans would pile up.
 RESCUE_INTERVAL_SECONDS = 600
 
+# Skip the Qdrant dedup check when set (BACKFILL_SKIP_DEDUP=1). The worker
+# normally skips any os_id already present in Qdrant — but that means docs
+# that are in Qdrant yet MISSING from S3 (e.g. non-eBay shards lost to the
+# pre-68d5718 shard-key collision) can never be re-written to S3. With this
+# flag every scrolled doc is treated as missing, so it is re-fetched,
+# re-embedded, and written fresh to BOTH S3 and Qdrant. Idempotent: re-upsert
+# at the same point id with the same vector is a no-op-equivalent overwrite.
+# Use for remediation runs where S3 must be made authoritative; leave OFF for
+# normal incremental backfill (dedup saves redundant GPU work).
+SKIP_DEDUP = os.environ.get("BACKFILL_SKIP_DEDUP", "").strip().lower() in ("1", "true", "yes")
+
 # ── eBay image URL fallback ───────────────────────────────────────────────────
 
 _L1200_RE = re.compile(r"(l1200)(\.[a-zA-Z]+)$")
@@ -645,27 +656,33 @@ def process_job(
         stats["scrolled"] += len(page_docs)
 
         # ── Batch-check Qdrant — which IDs are already present? ──────────────
-        all_qdrant_ids = [d["qdrant_id"] for d in page_docs]
-        found_ids: set = set()
-        t_dedup = time.perf_counter()
-        for i in range(0, len(all_qdrant_ids), QDRANT_CHECK_BATCH):
-            batch_ids = all_qdrant_ids[i:i + QDRANT_CHECK_BATCH]
-            try:
-                records = qdrant.retrieve(
-                    collection_name=COLLECTION_NAME,
-                    ids=batch_ids,
-                    with_vectors=False,
-                    with_payload=False,
-                )
-                found_ids.update(r.id for r in records)
-            except Exception as exc:
-                logger.warning("Qdrant retrieve failed (batch {}): {}", i, exc)
-            time.sleep(QDRANT_CHECK_PAUSE)
-        timings["qdrant_dedup"] += time.perf_counter() - t_dedup
+        # SKIP_DEDUP remediation mode: treat every doc as missing so it is
+        # re-embedded and written fresh to S3 (and re-upserted to Qdrant).
+        if SKIP_DEDUP:
+            missing_docs = page_docs
+            stats["missing"] += len(missing_docs)
+        else:
+            all_qdrant_ids = [d["qdrant_id"] for d in page_docs]
+            found_ids: set = set()
+            t_dedup = time.perf_counter()
+            for i in range(0, len(all_qdrant_ids), QDRANT_CHECK_BATCH):
+                batch_ids = all_qdrant_ids[i:i + QDRANT_CHECK_BATCH]
+                try:
+                    records = qdrant.retrieve(
+                        collection_name=COLLECTION_NAME,
+                        ids=batch_ids,
+                        with_vectors=False,
+                        with_payload=False,
+                    )
+                    found_ids.update(r.id for r in records)
+                except Exception as exc:
+                    logger.warning("Qdrant retrieve failed (batch {}): {}", i, exc)
+                time.sleep(QDRANT_CHECK_PAUSE)
+            timings["qdrant_dedup"] += time.perf_counter() - t_dedup
 
-        missing_docs = [d for d in page_docs if d["qdrant_id"] not in found_ids]
-        stats["already_in_qdrant"] += len(page_docs) - len(missing_docs)
-        stats["missing"] += len(missing_docs)
+            missing_docs = [d for d in page_docs if d["qdrant_id"] not in found_ids]
+            stats["already_in_qdrant"] += len(page_docs) - len(missing_docs)
+            stats["missing"] += len(missing_docs)
 
         if missing_docs and not dry_run:
             # ── Fetch images for missing docs ─────────────────────────────────
