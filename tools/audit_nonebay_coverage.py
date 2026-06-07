@@ -93,7 +93,14 @@ def scan_s3_by_index_name(store: S3VectorStore, years: set[str]) -> dict[str, in
 
 
 def os_counts_for(osclient, index_name: str) -> tuple[int, int, bool]:
-    """(total_docs, docs_with_galleryURL, exists)."""
+    """(total_docs, docs_with_REAL_galleryURL, exists).
+
+    "Real" = galleryURL exists AND is not the literal "N/A" placeholder.
+    Non-eBay marketplaces (notably pristine) store galleryURL="N/A" when
+    there is no image — those docs are unembeddable, so counting them in
+    the denominator wildly overstates the achievable gap. The embeddable
+    denominator excludes them.
+    """
     try:
         total = osclient.count(index=index_name, body={"query": {"match_all": {}}})["count"]
     except NotFoundError:
@@ -103,7 +110,10 @@ def os_counts_for(osclient, index_name: str) -> tuple[int, int, bool]:
     if total == 0:
         return (0, 0, True)
     with_img = osclient.count(index=index_name, body={
-        "query": {"exists": {"field": "galleryURL"}}
+        "query": {"bool": {
+            "must":     [{"exists": {"field": "galleryURL"}}],
+            "must_not": [{"term": {"galleryURL": "N/A"}}],
+        }}
     })["count"]
     return (total, with_img, True)
 
@@ -142,8 +152,9 @@ def main() -> None:
 
     # ── Compare ───────────────────────────────────────────────────────────
     print()
-    print(f"{'OS Index':18} {'OS docs':>10} {'OS w/img':>10} {'S3 vecs':>10} "
+    print(f"{'OS Index':18} {'OS docs':>10} {'embeddable':>10} {'S3 vecs':>10} "
           f"{'Gap':>10} {'Gap %':>7}  Note")
+    print("  (embeddable = docs with a real galleryURL; excludes 'N/A' placeholders)")
     print("-" * 88)
 
     rows = []
