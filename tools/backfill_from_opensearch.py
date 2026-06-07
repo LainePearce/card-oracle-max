@@ -130,6 +130,19 @@ IMAGE_RETRY_PAUSE   = 2.0   # seconds before retrying with fallback URL
 # pathological large scans get shrunk.
 MAX_IMAGE_PX = 2048
 
+# Hard cap on bytes downloaded per image. Marketplace CDNs (Goldin/Fanatics)
+# serve full-resolution scans — 10MB+ images decoded 250-at-a-time across 64
+# concurrent fetches previously ballooned RSS past the cgroup cap and OOM-froze
+# workers. We check Content-Length BEFORE reading the body and skip oversized
+# images; a streaming cap backstops missing/lying Content-Length headers.
+MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024   # 10 MB
+
+# Decompression-bomb guard: refuse to decode images above this pixel count.
+# A small file can claim enormous dimensions and OOM during decode. ~50 MP
+# (~7000×7000) is far beyond any real card scan; PIL raises above this and the
+# decode try/except skips the image rather than crashing the worker.
+MAX_IMAGE_PIXELS = 50_000_000
+
 # Flush a parquet shard + update checkpoint every N hits
 SHARD_FLUSH_SIZE = 5_000
 
@@ -188,10 +201,31 @@ async def _fetch_one(session: aiohttp.ClientSession, url: str) -> bytes | None:
                 timeout=aiohttp.ClientTimeout(total=IMAGE_TIMEOUT),
                 allow_redirects=True,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    if len(data) > 500:   # sanity check — reject empty/placeholder responses
-                        return data
+                if resp.status != 200:
+                    continue
+
+                # ── Size check FIRST: declared Content-Length ─────────────────
+                clen = resp.headers.get("Content-Length")
+                if clen is not None and clen.isdigit() and int(clen) > MAX_DOWNLOAD_BYTES:
+                    logger.debug("Skip oversized image {} ({} bytes, Content-Length)",
+                                 try_url, clen)
+                    continue   # don't even read the body
+
+                # ── Streaming read with a hard cap (Content-Length may be
+                #    missing or wrong; never buffer more than the cap) ─────────
+                buf = bytearray()
+                too_big = False
+                async for chunk in resp.content.iter_chunked(65536):
+                    buf.extend(chunk)
+                    if len(buf) > MAX_DOWNLOAD_BYTES:
+                        logger.debug("Image {} exceeded {}B mid-stream — aborting",
+                                     try_url, MAX_DOWNLOAD_BYTES)
+                        too_big = True
+                        break
+                if too_big:
+                    continue
+                if len(buf) > 500:   # sanity check — reject empty/placeholder responses
+                    return bytes(buf)
         except (aiohttp.ClientError, asyncio.TimeoutError):
             pass
         except Exception as exc:
@@ -699,15 +733,26 @@ def process_job(
                 from PIL import Image
                 import io
 
+                # Refuse to decode absurdly-large-dimension images (a small file
+                # can claim huge dimensions and OOM the worker). Above this PIL
+                # raises, the except below skips the image instead of crashing.
+                Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
                 os_ids_ordered: list[str] = []
                 pil_images: list = []
                 t_pil = time.perf_counter()
                 for oid, img_bytes in fetched.items():
                     try:
-                        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                        # Cap the long edge: an oversized scan held 250-at-a-time
-                        # balloons RSS. thumbnail() only ever shrinks, so normal
-                        # images are untouched; lossless for a 224px CLIP input.
+                        pil_img = Image.open(io.BytesIO(img_bytes))
+                        # draft() asks the JPEG decoder to emit a reduced-scale
+                        # image natively (1/2, 1/4, 1/8) so a large marketplace
+                        # scan never allocates its full-resolution RGB bitmap —
+                        # the real peak-memory fix. No-op for non-JPEG and must
+                        # run before the image is loaded/converted.
+                        pil_img.draft("RGB", (MAX_IMAGE_PX, MAX_IMAGE_PX))
+                        pil_img = pil_img.convert("RGB")
+                        # Long-edge cap (post-draft). thumbnail() only shrinks,
+                        # so normal images are untouched; lossless for 224px CLIP.
                         if max(pil_img.size) > MAX_IMAGE_PX:
                             pil_img.thumbnail((MAX_IMAGE_PX, MAX_IMAGE_PX))
                         os_ids_ordered.append(oid)
