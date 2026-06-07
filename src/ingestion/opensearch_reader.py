@@ -46,7 +46,12 @@ _EBAY_RE     = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Pristine / Fanatics: YYYY-MM-<suffix>
 _YYYYMM_RE   = re.compile(r"^(\d{4}-\d{2})-(pris|pwcc)$")
 # Heritage / MySlabs / Goldin: YYYY-<suffix>
-_YYYY_RE     = re.compile(r"^(\d{4})-(heri|ms|gold)$")
+# `heritage` (full word) is accepted as an alias for `heri` — OpenSearch
+# names the index 2026-heritage, but the canonical short suffix is `heri`
+# (kept so S3 paths and specifics_source stay consistent). Without this
+# alias, 2026-heritage fell through to index_type="unknown" and was never
+# backfilled as a marketplace.
+_YYYY_RE     = re.compile(r"^(\d{4})-(heri|heritage|ms|gold)$")
 
 _MARKETPLACE_NAMES: dict[str, str] = {
     "pris": "pristine",
@@ -54,6 +59,11 @@ _MARKETPLACE_NAMES: dict[str, str] = {
     "heri": "heritage",
     "ms":   "myslabs",
     "gold": "goldin",
+}
+
+# Full-word index suffixes normalised to their canonical short form.
+_SUFFIX_ALIASES: dict[str, str] = {
+    "heritage": "heri",
 }
 
 
@@ -88,6 +98,7 @@ def classify_index(index_name: str) -> dict:
     m = _YYYY_RE.match(index_name)
     if m:
         yr, suffix = m.group(1), m.group(2)
+        suffix = _SUFFIX_ALIASES.get(suffix, suffix)   # heritage → heri
         return {
             "marketplace":        _MARKETPLACE_NAMES[suffix],
             "has_item_specifics": False,
