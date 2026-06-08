@@ -130,17 +130,21 @@ IMAGE_RETRY_PAUSE   = 2.0   # seconds before retrying with fallback URL
 # pathological large scans get shrunk.
 MAX_IMAGE_PX = 2048
 
-# Hard cap on bytes downloaded per image. Marketplace CDNs (Goldin/Fanatics)
-# serve full-resolution scans — 10MB+ images decoded 250-at-a-time across 64
-# concurrent fetches previously ballooned RSS past the cgroup cap and OOM-froze
-# workers. We check Content-Length BEFORE reading the body and skip oversized
-# images; a streaming cap backstops missing/lying Content-Length headers.
-MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024   # 10 MB
+# Hard ceiling on bytes downloaded per image — a safety limit against a
+# runaway/absurd download, NOT a skip-threshold for normal large scans.
+# Marketplace CDNs (Goldin/Fanatics) serve full-resolution images; the
+# original OOM came from DECODING those to full-res bitmaps (250/page × 64
+# concurrent), not from the download itself. Now that the decode path uses
+# JPEG draft() to resize during decode (see below), large images are RESIZED
+# rather than skipped, so this cap can be generous — only genuinely
+# pathological downloads are rejected.
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024   # 25 MB safety ceiling
 
 # Decompression-bomb guard: refuse to decode images above this pixel count.
 # A small file can claim enormous dimensions and OOM during decode. ~50 MP
 # (~7000×7000) is far beyond any real card scan; PIL raises above this and the
-# decode try/except skips the image rather than crashing the worker.
+# decode try/except skips the image rather than crashing the worker. Applies
+# to formats draft() can't downscale (PNG/WebP); JPEGs are handled by draft.
 MAX_IMAGE_PIXELS = 50_000_000
 
 # Flush a parquet shard + update checkpoint every N hits
