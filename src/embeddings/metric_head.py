@@ -135,14 +135,31 @@ def load_dataset(parquet_path: str | Path) -> tuple[np.ndarray, np.ndarray, list
     """
     import pyarrow.parquet as pq
 
-    table = pq.read_table(str(parquet_path), columns=["image_vec", "tier3"])
+    # Stream row-groups into a preallocated array. The previous implementation
+    # used .to_pylist() + np.array() on the whole vector column, which
+    # materialises N×768 floats as Python objects (~24B each + per-row list
+    # overhead): ~35-40GB transient for a 1.76M-point dataset — OOM-froze two
+    # g5 workers before training ever started. Arrow→NumPy via .values avoids
+    # Python objects entirely; per-row-group conversion bounds the transient
+    # to one row group. Peak RSS ≈ the final (N,768) float32 array (~5.4GB).
+    pf      = pq.ParquetFile(str(parquet_path))
+    n_total = pf.metadata.num_rows
 
-    # Stack vectors
-    raw = table.column("image_vec").to_pylist()
-    vectors = np.array(raw, dtype=np.float32)
+    vectors    = np.empty((n_total, 768), dtype=np.float32)
+    tier3_strs: list[str] = []
+    row = 0
+    for rg in range(pf.num_row_groups):
+        tbl  = pf.read_row_group(rg, columns=["image_vec", "tier3"])
+        col  = tbl.column("image_vec").combine_chunks()
+        # (FixedSize)List<float> → flat numpy → reshape: no Python objects
+        flat = col.values.to_numpy(zero_copy_only=False)
+        n_rg = len(col)
+        vectors[row:row + n_rg] = flat.reshape(n_rg, -1).astype(np.float32, copy=False)
+        tier3_strs.extend(tbl.column("tier3").to_pylist())
+        row += n_rg
+    assert row == n_total, f"row-group rows {row} != metadata rows {n_total}"
 
     # Encode tier3 strings → integers
-    tier3_strs  = table.column("tier3").to_pylist()
     unique_keys = sorted(set(tier3_strs))
     key_to_int  = {k: i for i, k in enumerate(unique_keys)}
     labels      = np.array([key_to_int[k] for k in tier3_strs], dtype=np.int64)
@@ -378,7 +395,15 @@ def train_metric_head(
                 baseline[1], baseline[5], baseline[10], baseline[20])
 
     # ── Model & optimiser ─────────────────────────────────────────────────────
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # cuda (EC2 g5 workers) → mps (local Mac dev) → cpu. The original line
+    # checked mps-else-cpu only, which silently trained on CPU on the GPU
+    # workers — ~10-20x slower with the A10G sitting idle.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     logger.info("Training on {}", device)
 
     model = MetricHead(input_dim=vec_dim, output_dim=128, dropout=dropout).to(device)
