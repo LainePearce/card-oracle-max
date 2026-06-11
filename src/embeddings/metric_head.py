@@ -371,24 +371,40 @@ def train_metric_head(
     val_vecs     = vectors[val_mask]
     val_labels   = labels[val_mask]
 
+    # The mask-indexed copies above fully duplicate the data; the original
+    # array would otherwise stay referenced for the whole run (5.4GB at 1.76M
+    # points). Free it — combined with the no-vstack baseline below, this is
+    # what keeps the run inside a 16GB g5 worker.
+    del vectors, train_mask, val_mask
+
     logger.info("Train: {:,} points ({:,} classes) | Val: {:,} points ({:,} classes)",
                 len(train_vecs), len(train_classes), len(val_vecs), len(val_classes))
 
     # ── Baseline recall (before training) ────────────────────────────────────
     # For large datasets, cap baseline evaluation at 50k points for speed.
-    # This gives a representative estimate without taking many minutes.
+    # Sample indices FIRST, then gather only those rows — the previous
+    # vstack-then-sample materialised another full copy of the dataset
+    # (+5.4GB), which pushed the third training attempt into swap-thrash.
     BASELINE_CAP = 50_000
     logger.info("Computing baseline Recall@K (raw CLIP vectors) ...")
     if n_total > BASELINE_CAP:
-        bl_idx  = rng.choice(n_total, BASELINE_CAP, replace=False)
-        bl_vecs = np.vstack([train_vecs, val_vecs]) if len(val_vecs) else train_vecs
-        bl_labs = np.concatenate([train_labels, val_labels]) if len(val_labels) else train_labels
-        bl_vecs = bl_vecs[bl_idx]
-        bl_labs = bl_labs[bl_idx]
+        bl_idx = rng.choice(n_total, BASELINE_CAP, replace=False)
+        n_tr   = len(train_vecs)
+        tr_sel = bl_idx[bl_idx < n_tr]
+        va_sel = bl_idx[bl_idx >= n_tr] - n_tr
+        if len(val_vecs) and len(va_sel):
+            bl_vecs = np.concatenate([train_vecs[tr_sel], val_vecs[va_sel]])
+            bl_labs = np.concatenate([train_labels[tr_sel], val_labels[va_sel]])
+        else:
+            bl_vecs = train_vecs[tr_sel]
+            bl_labs = train_labels[tr_sel]
         logger.info("  (using {:,}-point sample for baseline — full dataset is {:,})", BASELINE_CAP, n_total)
+    elif len(val_vecs):
+        bl_vecs = np.concatenate([train_vecs, val_vecs])
+        bl_labs = np.concatenate([train_labels, val_labels])
     else:
-        bl_vecs = np.vstack([train_vecs, val_vecs]) if len(val_vecs) else train_vecs
-        bl_labs = np.concatenate([train_labels, val_labels]) if len(val_labels) else train_labels
+        bl_vecs = train_vecs
+        bl_labs = train_labels
 
     baseline = recall_at_k(bl_vecs, bl_labs, k_values=[1, 5, 10, 20])
     logger.info("Baseline  R@1={:.3f}  R@5={:.3f}  R@10={:.3f}  R@20={:.3f}",
