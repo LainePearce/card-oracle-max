@@ -76,13 +76,20 @@ def load_eval_data(parquet_path: Path, tier: str = "tier3"):
 
 def apply_head_batched(head: MetricHead, vectors: np.ndarray, batch: int = 2048,
                        device: str = "cpu") -> np.ndarray:
-    """Apply metric head to all vectors in batches."""
+    """Apply metric head to all vectors in batches.
+
+    The head is moved to `device` here — previously only the inputs were,
+    which crashed with weights-on-cpu/inputs-on-cuda. Batches are converted
+    via from_numpy on numpy slices instead of materialising one full torch
+    copy of the dataset up front (another +5.4GB at 1.76M points).
+    """
     head.eval()
+    head = head.to(device)
     out_parts = []
-    t = torch.tensor(vectors, dtype=torch.float32)
     with torch.no_grad():
-        for i in range(0, len(t), batch):
-            out_parts.append(head(t[i:i+batch].to(device)).cpu().numpy())
+        for i in range(0, len(vectors), batch):
+            chunk = torch.from_numpy(np.ascontiguousarray(vectors[i:i+batch])).to(device)
+            out_parts.append(head(chunk).cpu().numpy())
     return np.vstack(out_parts) if out_parts else np.zeros((0, head.output_dim))
 
 
