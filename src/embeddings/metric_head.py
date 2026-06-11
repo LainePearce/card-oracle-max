@@ -263,8 +263,12 @@ def recall_at_k(
     recalls = {k: 0 for k in k_values}
     max_k   = max(k_values)
 
-    # Batch cosine similarity computation
-    batch = 512
+    # Batch cosine similarity computation. The query batch is scaled to the
+    # corpus size: each chunk allocates a (B, N) float32 sims matrix AND a
+    # (B, N) int64 argpartition index array (2x the sims bytes). At the old
+    # fixed B=512 with N=1.76M that's 3.6GB + 7.2GB transient — OOM-killed
+    # the eval on a 16GB worker. Target ~0.8GB sims (~2.4GB total transient).
+    batch = max(16, min(512, int(200_000_000 / max(n, 1))))
     hits  = {k: 0 for k in k_values}
     total = 0
 
