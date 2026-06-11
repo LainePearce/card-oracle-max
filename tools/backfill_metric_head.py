@@ -232,7 +232,7 @@ def run_backfill(
             collection_name = QDRANT_COLLECTION,
             offset          = next_offset,
             limit           = SCROLL_PAGE,
-            with_vectors    = [NEW_VECTOR_NAME == nv or "image" for nv in ["image"]][0],
+            with_vectors    = ["image"],
             with_payload    = False,   # payload not needed for projection
         )
         # scroll() returns (points, next_offset_or_None)
@@ -273,6 +273,7 @@ def run_backfill(
             qdrant.update_vectors(
                 collection_name = QDRANT_COLLECTION,
                 points          = upsert_buf[:UPSERT_BATCH],
+                wait            = True,   # surface write errors immediately
             )
             projected  += len(upsert_buf[:UPSERT_BATCH])
             upsert_buf  = upsert_buf[UPSERT_BATCH:]
@@ -305,6 +306,7 @@ def run_backfill(
         qdrant.update_vectors(
             collection_name = QDRANT_COLLECTION,
             points          = upsert_buf,
+            wait            = True,
         )
         projected += len(upsert_buf)
 
