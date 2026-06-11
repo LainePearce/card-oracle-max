@@ -44,15 +44,33 @@ def load_eval_data(parquet_path: Path, tier: str = "tier3"):
     """
     Load vectors and identity labels from parquet.
     Returns: (vectors: np.ndarray, labels: np.ndarray, label_strs: list[str])
+
+    Streams row-groups into a preallocated array. The previous .to_pylist()
+    + np.array() materialised N×768 floats as Python objects (~35-40GB for
+    1.76M rows) — the same OOM that froze training attempts 1-3, here in
+    its own copy of the loader. Mirrors metric_head.load_dataset.
     """
-    table  = pq.read_table(str(parquet_path), columns=["image_vec", tier, "genre", "player", "card_set"])
-    raw    = table.column("image_vec").to_pylist()
-    vecs   = np.array(raw, dtype=np.float32)
-    strs   = table.column(tier).to_pylist()
+    pf      = pq.ParquetFile(str(parquet_path))
+    n_total = pf.metadata.num_rows
+
+    vecs   = np.empty((n_total, 768), dtype=np.float32)
+    strs:   list[str] = []
+    genres: list[str] = []
+    row = 0
+    for rg in range(pf.num_row_groups):
+        tbl  = pf.read_row_group(rg, columns=["image_vec", tier, "genre"])
+        col  = tbl.column("image_vec").combine_chunks()
+        flat = col.values.to_numpy(zero_copy_only=False)
+        n_rg = len(col)
+        vecs[row:row + n_rg] = flat.reshape(n_rg, -1).astype(np.float32, copy=False)
+        strs.extend(tbl.column(tier).to_pylist())
+        genres.extend(tbl.column("genre").to_pylist())
+        row += n_rg
+    assert row == n_total, f"row-group rows {row} != metadata rows {n_total}"
+
     unique = sorted(set(strs))
     k2i    = {k: i for i, k in enumerate(unique)}
     labels = np.array([k2i[s] for s in strs], dtype=np.int64)
-    genres = table.column("genre").to_pylist()
     return vecs, labels, unique, genres
 
 
