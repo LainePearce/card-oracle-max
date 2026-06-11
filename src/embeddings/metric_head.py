@@ -238,12 +238,18 @@ def recall_at_k(
     k_values:   list[int] = (1, 5, 10, 20),
     n_queries:  int = 1000,
     seed:       int = 42,
+    query_pool_idx: Optional[np.ndarray] = None,
 ) -> dict[int, float]:
     """
     Compute Recall@K: fraction of queries where at least one true positive
     appears in the top-K retrieved results (excluding self).
 
-    Uses brute-force cosine similarity — fine for <200k vectors on CPU.
+    Retrieval is always against the FULL `embeddings` corpus. If
+    `query_pool_idx` is given, queries are sampled only from those row
+    indices (e.g. held-out val keys) — the production-realistic protocol:
+    unseen queries, full-corpus distractors.
+
+    Brute-force cosine similarity; batch size auto-scales with corpus size.
     """
     rng   = np.random.RandomState(seed)
     n     = len(embeddings)
@@ -254,6 +260,9 @@ def recall_at_k(
     valid_classes  = unique[counts >= 2]
     valid_mask     = np.isin(labels, valid_classes)
     valid_idx      = np.where(valid_mask)[0]
+
+    if query_pool_idx is not None:
+        valid_idx = np.intersect1d(valid_idx, query_pool_idx, assume_unique=False)
 
     if len(valid_idx) == 0:
         return {k: 0.0 for k in k_values}
@@ -313,6 +322,8 @@ def train_metric_head(
     seed:            int    = 42,
     epoch_sample:    Optional[int] = None,
     init_checkpoint: Optional[str | Path] = None,
+    output_dim:      int    = 256,
+    eval_queries:    int    = 2000,
 ) -> MetricHead:
     """
     Train the MetricHead on the extracted dataset.
@@ -367,50 +378,29 @@ def train_metric_head(
     val_classes    = set(unique_classes[:n_val].tolist())
     train_classes  = set(unique_classes[n_val:].tolist())
 
+    # Index-based split — NO data copies. The single `vectors` array stays the
+    # only full-size allocation (5.4GB at 1.76M); train/val are index sets into
+    # it. This is what lets the in-training eval run against the FULL corpus
+    # (the production-realistic protocol) without re-introducing the +5-10GB
+    # copies that OOM-froze earlier attempts.
     train_mask = np.array([l in train_classes for l in labels])
-    val_mask   = np.array([l in val_classes   for l in labels])
-
-    train_vecs   = vectors[train_mask]
-    train_labels = labels[train_mask]
-    val_vecs     = vectors[val_mask]
-    val_labels   = labels[val_mask]
-
-    # The mask-indexed copies above fully duplicate the data; the original
-    # array would otherwise stay referenced for the whole run (5.4GB at 1.76M
-    # points). Free it — combined with the no-vstack baseline below, this is
-    # what keeps the run inside a 16GB g5 worker.
-    del vectors, train_mask, val_mask
+    train_idx  = np.where(train_mask)[0]
+    val_idx    = np.where(~train_mask)[0]
+    del train_mask
 
     logger.info("Train: {:,} points ({:,} classes) | Val: {:,} points ({:,} classes)",
-                len(train_vecs), len(train_classes), len(val_vecs), len(val_classes))
+                len(train_idx), len(train_classes), len(val_idx), len(val_classes))
 
     # ── Baseline recall (before training) ────────────────────────────────────
-    # For large datasets, cap baseline evaluation at 50k points for speed.
-    # Sample indices FIRST, then gather only those rows — the previous
-    # vstack-then-sample materialised another full copy of the dataset
-    # (+5.4GB), which pushed the third training attempt into swap-thrash.
-    BASELINE_CAP = 50_000
-    logger.info("Computing baseline Recall@K (raw CLIP vectors) ...")
-    if n_total > BASELINE_CAP:
-        bl_idx = rng.choice(n_total, BASELINE_CAP, replace=False)
-        n_tr   = len(train_vecs)
-        tr_sel = bl_idx[bl_idx < n_tr]
-        va_sel = bl_idx[bl_idx >= n_tr] - n_tr
-        if len(val_vecs) and len(va_sel):
-            bl_vecs = np.concatenate([train_vecs[tr_sel], val_vecs[va_sel]])
-            bl_labs = np.concatenate([train_labels[tr_sel], val_labels[va_sel]])
-        else:
-            bl_vecs = train_vecs[tr_sel]
-            bl_labs = train_labels[tr_sel]
-        logger.info("  (using {:,}-point sample for baseline — full dataset is {:,})", BASELINE_CAP, n_total)
-    elif len(val_vecs):
-        bl_vecs = np.concatenate([train_vecs, val_vecs])
-        bl_labs = np.concatenate([train_labels, val_labels])
-    else:
-        bl_vecs = train_vecs
-        bl_labs = train_labels
-
-    baseline = recall_at_k(bl_vecs, bl_labs, k_values=[1, 5, 10, 20])
+    # Full-corpus protocol: queries sampled from HELD-OUT val keys, retrieval
+    # corpus = the entire dataset. This matches tests/eval_metric_head.py.
+    # The previous 50K-sample baseline (and the 45K-corpus in-training eval)
+    # wildly overstated the head's edge: training R@10 said 0.897 vs formal
+    # eval 0.803, purely from corpus-size mismatch.
+    logger.info("Computing baseline Recall@K (raw CLIP, full {:,}-corpus, "
+                "{:,} val-key queries) ...", n_total, eval_queries)
+    baseline = recall_at_k(vectors, labels, k_values=[1, 5, 10, 20],
+                           n_queries=eval_queries, query_pool_idx=val_idx)
     logger.info("Baseline  R@1={:.3f}  R@5={:.3f}  R@10={:.3f}  R@20={:.3f}",
                 baseline[1], baseline[5], baseline[10], baseline[20])
 
@@ -426,7 +416,8 @@ def train_metric_head(
         device = torch.device("cpu")
     logger.info("Training on {}", device)
 
-    model = MetricHead(input_dim=vec_dim, output_dim=128, dropout=dropout).to(device)
+    model = MetricHead(input_dim=vec_dim, output_dim=output_dim, dropout=dropout).to(device)
+    logger.info("MetricHead: {} → {} dims", vec_dim, output_dim)
     optimiser = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=epochs, eta_min=lr/20)
 
@@ -444,10 +435,10 @@ def train_metric_head(
         best_recall10 = init_r10   # must beat the checkpoint to save a new one
 
     if epoch_sample:
-        effective_n = min(epoch_sample, len(train_vecs))
+        effective_n = min(epoch_sample, len(train_idx))
         logger.info(
             "Training {:,} epochs | epoch_sample={:,} of {:,} train | batch={} | lr={} | margin={}",
-            epochs, effective_n, len(train_vecs), batch_size, lr, margin,
+            epochs, effective_n, len(train_idx), batch_size, lr, margin,
         )
     else:
         logger.info("Training {:,} epochs | batch={} | lr={} | margin={}",
@@ -460,17 +451,16 @@ def train_metric_head(
         t_ep         = time.perf_counter()
 
         # ── Per-epoch sampling for large datasets ─────────────────────────────
-        if epoch_sample and epoch_sample < len(train_vecs):
-            ep_idx    = rng.choice(len(train_vecs), epoch_sample, replace=False)
-            ep_vecs   = train_vecs[ep_idx]
-            ep_labels = train_labels[ep_idx]
-            ep_ds     = TripletDataset(ep_vecs, ep_labels)
-            loader    = DataLoader(ep_ds, batch_size=batch_size, shuffle=True,
-                                   num_workers=0, pin_memory=False)
+        # Gather only the sampled rows (one bounded copy per epoch); without
+        # epoch_sample the full train set is gathered — use epoch_sample for
+        # datasets that don't comfortably fit twice in RAM.
+        if epoch_sample and epoch_sample < len(train_idx):
+            ep_sel    = rng.choice(train_idx, epoch_sample, replace=False)
         else:
-            ep_ds  = TripletDataset(train_vecs, train_labels)
-            loader = DataLoader(ep_ds, batch_size=batch_size, shuffle=True,
-                                num_workers=0, pin_memory=False)
+            ep_sel    = train_idx
+        ep_ds  = TripletDataset(vectors[ep_sel], labels[ep_sel])
+        loader = DataLoader(ep_ds, batch_size=batch_size, shuffle=True,
+                            num_workers=0, pin_memory=False)
 
         for vecs_batch, labels_batch in loader:
             vecs_batch   = vecs_batch.to(device)
@@ -492,45 +482,26 @@ def train_metric_head(
         log_row = {"epoch": epoch, "loss": mean_loss}
 
         # ── Eval ──────────────────────────────────────────────────────────────
+        # Full-corpus protocol, matching tests/eval_metric_head.py: project
+        # EVERY point through the head, then Recall@K with queries sampled
+        # only from held-out val keys against the entire corpus. The previous
+        # 45K-corpus eval (30K val + 15K train sample) overstated R@10 by
+        # ~10pp — the head's margin shrinks as the distractor pool grows,
+        # which is precisely the production-relevant property.
         if epoch % eval_every == 0 or epoch == epochs:
             model.eval()
 
-            # For large val sets, cap at 30k to keep eval tractable.
-            # Recall@K needs enough coverage to be meaningful — 30k is sufficient.
-            VAL_EVAL_CAP   = 30_000
-            TRAIN_EVAL_CAP = 15_000
-
+            proj = np.empty((n_total, output_dim), dtype=np.float32)
             with torch.no_grad():
-                # Apply head to val vectors (capped subset)
-                if len(val_vecs) > VAL_EVAL_CAP:
-                    val_eval_idx = rng.choice(len(val_vecs), VAL_EVAL_CAP, replace=False)
-                    val_eval_vecs   = val_vecs[val_eval_idx]
-                    val_eval_labels = val_labels[val_eval_idx]
-                else:
-                    val_eval_vecs   = val_vecs
-                    val_eval_labels = val_labels
+                for i in range(0, n_total, 8192):
+                    chunk = torch.from_numpy(
+                        np.ascontiguousarray(vectors[i:i + 8192])
+                    ).to(device)
+                    proj[i:i + 8192] = model(chunk).cpu().numpy()
 
-                val_t   = torch.tensor(val_eval_vecs, dtype=torch.float32, device=device)
-                val_emb = []
-                for i in range(0, len(val_t), 1024):
-                    val_emb.append(model(val_t[i:i+1024]).cpu().numpy())
-                val_emb = np.vstack(val_emb) if val_emb else np.zeros((0, 128))
-
-                # Apply head to train vectors (capped subset for diversity)
-                n_train_sample = min(TRAIN_EVAL_CAP, len(train_vecs))
-                idx_sample     = rng.choice(len(train_vecs), n_train_sample, replace=False)
-                tr_t    = torch.tensor(train_vecs[idx_sample], dtype=torch.float32, device=device)
-                tr_emb  = []
-                for i in range(0, len(tr_t), 1024):
-                    tr_emb.append(model(tr_t[i:i+1024]).cpu().numpy())
-                tr_emb  = np.vstack(tr_emb) if tr_emb else np.zeros((0, 128))
-
-                # Combined embeddings for Recall@K
-                all_emb    = np.vstack([tr_emb, val_emb]) if len(val_emb) else tr_emb
-                all_labels = np.concatenate([train_labels[idx_sample], val_eval_labels]) if len(val_emb) else train_labels[idx_sample]
-
-            r = recall_at_k(all_emb, all_labels, k_values=[1, 5, 10, 20],
-                            n_queries=2000)
+            r = recall_at_k(proj, labels, k_values=[1, 5, 10, 20],
+                            n_queries=eval_queries, query_pool_idx=val_idx)
+            del proj
             log_row.update(r)
 
             flag = ""
@@ -540,7 +511,7 @@ def train_metric_head(
                 torch.save({
                     "state_dict":  best_state,
                     "input_dim":   vec_dim,
-                    "output_dim":  128,
+                    "output_dim":  output_dim,
                     "epoch":       epoch,
                     "recall10":    best_recall10,
                     "baseline":    baseline,
