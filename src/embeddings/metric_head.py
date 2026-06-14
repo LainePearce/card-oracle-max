@@ -307,6 +307,60 @@ def recall_at_k(
     return {k: hits[k] / total for k in k_values}
 
 
+def recall_at_k_gpu(
+    emb,                       # torch.Tensor (N, D) on GPU, L2-normalised
+    labels:     np.ndarray,    # (N,) int
+    device,
+    k_values:   list[int] = (1, 5, 10, 20),
+    n_queries:  int = 1000,
+    seed:       int = 42,
+    query_pool_idx: Optional[np.ndarray] = None,
+    q_batch:    int = 128,
+) -> dict[int, float]:
+    """
+    GPU Recall@K. Same protocol as recall_at_k (queries from query_pool_idx,
+    retrieval against the full `emb` corpus) but the (B, N) similarity matrix
+    and top-k live in VRAM, not system RAM — which is what keeps the
+    full-corpus in-training eval from OOM-killing a 16GB worker. Also ~10x
+    faster than the numpy argpartition path.
+    """
+    import torch
+
+    rng = np.random.RandomState(seed)
+    n   = emb.shape[0]
+
+    unique, counts = np.unique(labels, return_counts=True)
+    valid_classes  = unique[counts >= 2]
+    valid_idx      = np.where(np.isin(labels, valid_classes))[0]
+    if query_pool_idx is not None:
+        valid_idx = np.intersect1d(valid_idx, query_pool_idx, assume_unique=False)
+    if len(valid_idx) == 0:
+        return {k: 0.0 for k in k_values}
+
+    q_all    = rng.choice(valid_idx, size=min(n_queries, len(valid_idx)), replace=False)
+    labels_t = torch.from_numpy(labels).to(device)
+    max_k    = max(k_values)
+    hits     = {k: 0 for k in k_values}
+    total    = 0
+
+    with torch.no_grad():
+        for s in range(0, len(q_all), q_batch):
+            qb   = q_all[s:s + q_batch]
+            qb_t = torch.from_numpy(qb).to(device)
+            sims = emb[qb_t] @ emb.T                       # (B, N) in VRAM
+            sims[torch.arange(len(qb), device=device), qb_t] = -1e30   # exclude self
+            _, topi   = torch.topk(sims, max_k, dim=1)     # (B, max_k)
+            ret_lab   = labels_t[topi]                     # (B, max_k)
+            q_lab     = labels_t[qb_t].unsqueeze(1)        # (B, 1)
+            match     = (ret_lab == q_lab)                 # (B, max_k)
+            for k in k_values:
+                hits[k] += int(match[:, :k].any(dim=1).sum().item())
+            total += len(qb)
+            del sims, topi, ret_lab, match
+
+    return {k: hits[k] / total for k in k_values}
+
+
 # ── Training loop ─────────────────────────────────────────────────────────────────
 
 def train_metric_head(
@@ -391,23 +445,9 @@ def train_metric_head(
     logger.info("Train: {:,} points ({:,} classes) | Val: {:,} points ({:,} classes)",
                 len(train_idx), len(train_classes), len(val_idx), len(val_classes))
 
-    # ── Baseline recall (before training) ────────────────────────────────────
-    # Full-corpus protocol: queries sampled from HELD-OUT val keys, retrieval
-    # corpus = the entire dataset. This matches tests/eval_metric_head.py.
-    # The previous 50K-sample baseline (and the 45K-corpus in-training eval)
-    # wildly overstated the head's edge: training R@10 said 0.897 vs formal
-    # eval 0.803, purely from corpus-size mismatch.
-    logger.info("Computing baseline Recall@K (raw CLIP, full {:,}-corpus, "
-                "{:,} val-key queries) ...", n_total, eval_queries)
-    baseline = recall_at_k(vectors, labels, k_values=[1, 5, 10, 20],
-                           n_queries=eval_queries, query_pool_idx=val_idx)
-    logger.info("Baseline  R@1={:.3f}  R@5={:.3f}  R@10={:.3f}  R@20={:.3f}",
-                baseline[1], baseline[5], baseline[10], baseline[20])
-
-    # ── Model & optimiser ─────────────────────────────────────────────────────
-    # cuda (EC2 g5 workers) → mps (local Mac dev) → cpu. The original line
-    # checked mps-else-cpu only, which silently trained on CPU on the GPU
-    # workers — ~10-20x slower with the A10G sitting idle.
+    # ── Device ────────────────────────────────────────────────────────────────
+    # cuda (EC2 g5 workers) → mps (local Mac dev) → cpu. Selected BEFORE the
+    # baseline so the eval runs on GPU (the OOM-safe path — see below).
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -415,6 +455,34 @@ def train_metric_head(
     else:
         device = torch.device("cpu")
     logger.info("Training on {}", device)
+
+    # On CUDA, hold the raw corpus in VRAM for the whole run. The in-training
+    # eval allocates a full-corpus (N, output_dim) projection plus a (B, N)
+    # similarity matrix; on the 16GB workers those land in SYSTEM RAM on top
+    # of the 7.7GB dataset and OOM-kill the process at the first eval (no
+    # swap → SIGKILL, no traceback). Keeping the corpus + sims in the A10G's
+    # 24GB VRAM moves all of it off system RAM and runs ~10x faster.
+    use_gpu_eval = (device.type == "cuda")
+    corpus_gpu   = None
+    if use_gpu_eval:
+        corpus_gpu = torch.from_numpy(vectors).to(device)   # (N, 768) ~7.7GB VRAM
+
+    # ── Baseline recall (before training) ────────────────────────────────────
+    # Full-corpus protocol: queries sampled from HELD-OUT val keys, retrieval
+    # corpus = the entire dataset. Matches tests/eval_metric_head.py. The old
+    # 45K-corpus in-training eval overstated R@10 by ~10pp vs the full corpus.
+    logger.info("Computing baseline Recall@K (raw CLIP, full {:,}-corpus, "
+                "{:,} val-key queries) ...", n_total, eval_queries)
+    if use_gpu_eval:
+        baseline = recall_at_k_gpu(corpus_gpu, labels, device, k_values=[1, 5, 10, 20],
+                                   n_queries=eval_queries, query_pool_idx=val_idx)
+    else:
+        baseline = recall_at_k(vectors, labels, k_values=[1, 5, 10, 20],
+                               n_queries=eval_queries, query_pool_idx=val_idx)
+    logger.info("Baseline  R@1={:.3f}  R@5={:.3f}  R@10={:.3f}  R@20={:.3f}",
+                baseline[1], baseline[5], baseline[10], baseline[20])
+
+    # ── Model & optimiser ─────────────────────────────────────────────────────
 
     model = MetricHead(input_dim=vec_dim, output_dim=output_dim, dropout=dropout).to(device)
     logger.info("MetricHead: {} → {} dims", vec_dim, output_dim)
@@ -491,17 +559,29 @@ def train_metric_head(
         if epoch % eval_every == 0 or epoch == epochs:
             model.eval()
 
-            proj = np.empty((n_total, output_dim), dtype=np.float32)
-            with torch.no_grad():
-                for i in range(0, n_total, 8192):
-                    chunk = torch.from_numpy(
-                        np.ascontiguousarray(vectors[i:i + 8192])
-                    ).to(device)
-                    proj[i:i + 8192] = model(chunk).cpu().numpy()
-
-            r = recall_at_k(proj, labels, k_values=[1, 5, 10, 20],
-                            n_queries=eval_queries, query_pool_idx=val_idx)
-            del proj
+            if use_gpu_eval:
+                # Project the whole corpus into VRAM, eval there, free. Nothing
+                # touches system RAM beyond the resident numpy dataset.
+                with torch.no_grad():
+                    proj_t = torch.empty((n_total, output_dim),
+                                         dtype=torch.float32, device=device)
+                    for i in range(0, n_total, 16384):
+                        proj_t[i:i + 16384] = model(corpus_gpu[i:i + 16384])
+                r = recall_at_k_gpu(proj_t, labels, device, k_values=[1, 5, 10, 20],
+                                    n_queries=eval_queries, query_pool_idx=val_idx)
+                del proj_t
+                torch.cuda.empty_cache()
+            else:
+                proj = np.empty((n_total, output_dim), dtype=np.float32)
+                with torch.no_grad():
+                    for i in range(0, n_total, 8192):
+                        chunk = torch.from_numpy(
+                            np.ascontiguousarray(vectors[i:i + 8192])
+                        ).to(device)
+                        proj[i:i + 8192] = model(chunk).cpu().numpy()
+                r = recall_at_k(proj, labels, k_values=[1, 5, 10, 20],
+                                n_queries=eval_queries, query_pool_idx=val_idx)
+                del proj
             log_row.update(r)
 
             flag = ""
@@ -529,6 +609,10 @@ def train_metric_head(
             logger.info("Epoch {:>3}/{} | loss={:.4f} | {:.1f}s", epoch, epochs, mean_loss, ep_time)
 
         history.append(log_row)
+
+    if corpus_gpu is not None:
+        del corpus_gpu
+        torch.cuda.empty_cache()
 
     logger.info("─" * 70)
     logger.info("Training complete")
