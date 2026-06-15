@@ -109,21 +109,45 @@ def call_openai(model: str, image_bytes: bytes, media_type: str) -> str:
     return resp.choices[0].message.content or ""
 
 
-_LOCAL = {}   # lazily-loaded model + processor
+_LOCAL = {}   # model + processor, loaded once via load_local_model()
+
+
+def load_local_model(model: str, quantize: bool) -> None:
+    """
+    Load the self-hosted VLM once, up front, so a load failure crashes the
+    script immediately with a real traceback instead of being swallowed by the
+    per-card try/except and silently retried 300×.
+
+    quantize=True loads in 4-bit (bitsandbytes) — required to fit a 7B VLM on
+    the 16GB T4 workers (fp16 7B ≈ 14.6GB > the T4's usable ~14.5GB → OOM).
+    4-bit drops it to ~5-6GB, which is also what production would run here.
+    """
+    import torch
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    logger.info("Loading {} (quantize={}) ...", model, quantize)
+    if quantize:
+        from transformers import BitsAndBytesConfig
+        qcfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        m = Qwen2VLForConditionalGeneration.from_pretrained(
+            model, quantization_config=qcfg, device_map="auto",
+        ).eval()
+    else:
+        m = Qwen2VLForConditionalGeneration.from_pretrained(
+            model, torch_dtype=torch.float16,
+        ).eval().to("cuda")
+    _LOCAL["model"] = m
+    _LOCAL["proc"]  = AutoProcessor.from_pretrained(model)
+    logger.info("Model loaded.")
+
 
 def call_local(model: str, image_bytes: bytes, media_type: str) -> str:
-    """Self-hosted Qwen2-VL on the GPU. Loads the model once per process."""
     import io as _io
     import torch
     from PIL import Image
-
-    if "model" not in _LOCAL:
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-        logger.info("Loading {} on GPU (first call) ...", model)
-        _LOCAL["model"] = Qwen2VLForConditionalGeneration.from_pretrained(
-            model, torch_dtype=torch.float16, device_map="cuda",
-        ).eval()
-        _LOCAL["proc"] = AutoProcessor.from_pretrained(model)
 
     m, proc = _LOCAL["model"], _LOCAL["proc"]
     img = Image.open(_io.BytesIO(image_bytes)).convert("RGB")
@@ -132,10 +156,9 @@ def call_local(model: str, image_bytes: bytes, media_type: str) -> str:
         {"role": "user", "content": [
             {"type": "image"}, {"type": "text", "text": USER_PROMPT}]},
     ]
-    text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = proc(text=[text], images=[img], return_tensors="pt").to("cuda")
-    import torch as _torch
-    with _torch.no_grad():
+    text   = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = proc(text=[text], images=[img], return_tensors="pt").to(m.device)
+    with torch.no_grad():
         gen = m.generate(**inputs, max_new_tokens=1024, do_sample=False)
     trimmed = gen[:, inputs.input_ids.shape[1]:]
     return proc.batch_decode(trimmed, skip_special_tokens=True)[0]
@@ -166,7 +189,12 @@ def main() -> None:
     ap.add_argument("--eval-dir", default="data/vlm_eval")
     ap.add_argument("--out",     required=True)
     ap.add_argument("--limit",   type=int, default=None, help="Cap N cards (testing).")
+    ap.add_argument("--quantize", action="store_true",
+                    help="local backend: load in 4-bit (needed to fit a 7B VLM on the 16GB T4).")
     args = ap.parse_args()
+
+    if args.backend == "local":
+        load_local_model(args.model, args.quantize)
 
     eval_dir = ROOT / args.eval_dir
     out_path = ROOT / args.out
