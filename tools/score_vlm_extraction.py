@@ -37,7 +37,9 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-ID_FIELDS    = ["player", "year", "set", "card_number"]   # the identity key
+ID_FIELDS    = ["player", "year", "set", "card_number"]   # strict identity key
+ID_NONUM     = ["player", "year", "set"]                  # realistic retrieval key — card_number often isn't on the front image
+ID_COARSE    = ["player", "set"]                          # coarse narrow
 ALL_FIELDS   = ["player", "year", "brand", "set", "card_number", "parallel"]
 
 _PUNCT = re.compile(r"[^\w\s]")
@@ -91,6 +93,8 @@ def score_backend(manifest: list[dict], extr: dict[str, dict],
                   price_per_call: float | None) -> dict:
     field_hits   = {f: {"raw": [0, 0], "graded": [0, 0]} for f in ALL_FIELDS}
     id_hits      = {"raw": [0, 0], "graded": [0, 0]}
+    nonum_hits   = {"raw": [0, 0], "graded": [0, 0]}
+    coarse_hits  = {"raw": [0, 0], "graded": [0, 0]}
     latencies    = []
     parse_errors = 0
     disagreements = []
@@ -104,6 +108,8 @@ def score_backend(manifest: list[dict], extr: dict[str, dict],
         if rec.get("error") or "_parse_error" in ex:
             parse_errors += 1
             id_hits[bucket][1] += 1
+            nonum_hits[bucket][1] += 1
+            coarse_hits[bucket][1] += 1
             for f in ALL_FIELDS:
                 field_hits[f][bucket][1] += 1
             continue
@@ -122,6 +128,11 @@ def score_backend(manifest: list[dict], extr: dict[str, dict],
         id_hits[bucket][0] += int(id_ok)
         id_hits[bucket][1] += 1
 
+        nonum_hits[bucket][0]  += int(all(per_field_ok[f] for f in ID_NONUM))
+        nonum_hits[bucket][1]  += 1
+        coarse_hits[bucket][0] += int(all(per_field_ok[f] for f in ID_COARSE))
+        coarse_hits[bucket][1] += 1
+
         if not id_ok:
             disagreements.append({
                 "os_id": card["os_id"], "graded": card["graded"],
@@ -137,6 +148,8 @@ def score_backend(manifest: list[dict], extr: dict[str, dict],
         "id_match": {b: pct(id_hits[b]) for b in ("raw", "graded")},
         "id_match_overall": pct([id_hits["raw"][0] + id_hits["graded"][0],
                                  id_hits["raw"][1] + id_hits["graded"][1]]),
+        "id_nonum":  {b: pct(nonum_hits[b])  for b in ("raw", "graded")},
+        "id_coarse": {b: pct(coarse_hits[b]) for b in ("raw", "graded")},
         "field": {f: {b: pct(field_hits[f][b]) for b in ("raw", "graded")}
                   for f in ALL_FIELDS},
         "parse_errors": parse_errors,
@@ -180,10 +193,15 @@ def main() -> None:
         print(f"  IDENTITY-MATCH   raw={s['id_match']['raw']:.1f}%   "
               f"graded={s['id_match']['graded']:.1f}%   "
               f"overall={s['id_match_overall']:.1f}%")
-        gate = ("STRONG → build" if s['id_match']['raw'] >= 85 else
-                "PROMISING → tune" if s['id_match']['raw'] >= 70 else
+        print(f"  IDENTITY (no card#)  raw={s['id_nonum']['raw']:.1f}%   "
+              f"graded={s['id_nonum']['graded']:.1f}%    "
+              f"[player+year+set — the realistic retrieval key]")
+        print(f"  IDENTITY (coarse)    raw={s['id_coarse']['raw']:.1f}%   "
+              f"graded={s['id_coarse']['graded']:.1f}%    [player+set]")
+        gate = ("STRONG → build" if s['id_nonum']['raw'] >= 85 else
+                "PROMISING → tune" if s['id_nonum']['raw'] >= 70 else
                 "WEAK → reconsider")
-        print(f"  gate (raw cards): {gate}")
+        print(f"  gate (raw, no-card# key): {gate}")
         print(f"\n  Per-field accuracy (raw / graded):")
         for f in ALL_FIELDS:
             print(f"    {f:13s} {s['field'][f]['raw']:5.1f}% / {s['field'][f]['graded']:5.1f}%")
