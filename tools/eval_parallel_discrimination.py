@@ -87,28 +87,36 @@ def embed_clip(pils: list, batch: int) -> np.ndarray:
 
 
 def embed_hf_vision(model_id: str, pils: list, batch: int,
-                    image_size: int | None, device: str) -> np.ndarray:
+                    image_size: int | None, device: str,
+                    fp16: bool = False) -> np.ndarray:
     """Generic DINOv2/v3 (or any HF vision backbone) encoder.
 
     Applies the SAME grey-114 pad-to-square as production CLIP, then the model's
     own processor, then L2-normalises the CLS/pooler embedding.
+
+    Runs in fp32 by default. DINOv3 overflows to NaN in fp16 (its norm layers
+    are fp16-unstable); the eval set is tiny so fp32 costs nothing meaningful.
+    Pass fp16=True only for a backbone you've confirmed is stable in half.
     """
     import torch
     from transformers import AutoModel, AutoImageProcessor
 
+    dtype = torch.float16 if fp16 else torch.float32
     proc  = AutoImageProcessor.from_pretrained(model_id)
     if image_size is not None and hasattr(proc, "size"):
         proc.size = {"shortest_edge": image_size}
         if hasattr(proc, "crop_size"):
             proc.crop_size = {"height": image_size, "width": image_size}
-    model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float16).eval().to(device)
+    model = AutoModel.from_pretrained(model_id, torch_dtype=dtype).eval().to(device)
 
     pad = ImageEncoder._pad_to_square
     out = []
     for i in range(0, len(pils), batch):
         chunk  = [pad(p) for p in pils[i:i + batch]]
         inputs = proc(images=chunk, return_tensors="pt").to(device)
-        inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
+        if fp16:
+            inputs = {k: v.half() if v.dtype == torch.float32 else v
+                      for k, v in inputs.items()}
         with torch.no_grad():
             res = model(**inputs)
         emb = getattr(res, "pooler_output", None)
@@ -116,7 +124,11 @@ def embed_hf_vision(model_id: str, pils: list, batch: int,
             emb = res.last_hidden_state[:, 0]
         emb = torch.nn.functional.normalize(emb.float(), dim=-1)
         out.append(emb.cpu().numpy())
-    return np.vstack(out).astype(np.float32)
+    embs = np.vstack(out).astype(np.float32)
+    if not np.isfinite(embs).all():
+        logger.error("{} produced non-finite embeddings (NaN/Inf) — results "
+                     "for this model are invalid", model_id)
+    return embs
 
 
 def average_precision(relevant: np.ndarray, order: np.ndarray) -> float:
@@ -202,6 +214,8 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--dino-image-size", type=int, default=None,
                     help="Override DINO resize (e.g. 518) to test the resolution lever.")
+    ap.add_argument("--fp16", action="store_true",
+                    help="Run DINO backbones in fp16 (faster; DINOv3 is NaN-unstable in fp16).")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
@@ -222,7 +236,7 @@ def main() -> None:
                 emb = embed_clip(pils, args.batch)
             else:
                 emb = embed_hf_vision(DINO_MODEL_IDS[m], pils, args.batch,
-                                      args.dino_image_size, device)
+                                      args.dino_image_size, device, fp16=args.fp16)
         except Exception as e:
             logger.error("{} failed to load/run ({}: {}) — skipping",
                          m, type(e).__name__, e)
