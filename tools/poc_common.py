@@ -41,11 +41,13 @@ POC_ENCODERS: list[EncoderSpec] = [
     EncoderSpec("image_dinov3", "dinov3-vitl16", "512px-fp32-sqpad",    1024, "dinov3", False),
 ]
 
-S3_IMAGE_PREFIX = "images/ebay"   # images/ebay/{os_id}/{variant}.jpg
+S3_IMAGE_PREFIX = "images/ebay"   # images/ebay/{variant}/{os_id}.jpg
 
 
 def image_key(os_id: str, variant: str) -> str:
-    return f"{S3_IMAGE_PREFIX}/{os_id.replace('/', '_')}/{variant}.jpg"
+    # variant-first so lifecycle rules can tier a whole variant by prefix
+    # (e.g. images/ebay/original/ -> Glacier IR) and the CDN serves images/ebay/512/.
+    return f"{S3_IMAGE_PREFIX}/{variant}/{os_id.replace('/', '_')}.jpg"
 
 
 _SL_RE = re.compile(r"s-l\d+")
