@@ -53,6 +53,8 @@ DOWNLOAD_HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 }
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_PIXELS   = 50_000_000   # reject decompression bombs before decoding
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 _local = threading.local()
 
 
@@ -110,7 +112,14 @@ def download(url: str) -> bytes | None:
 
 
 def process_one(os_id: str, src: dict, bucket: str) -> dict | None:
-    """Download s-l1600, build 3 variants, upload to S3, return a manifest row."""
+    """Download s-l1600, build 3 variants, upload to S3, return a manifest row.
+
+    Never raises: download/decode/resize/upload are all guarded so one bad image
+    or a transient S3 error can't crash a pool thread (and thence the run). A
+    pixel cap rejects decompression bombs BEFORE decoding so a single giant
+    image can't exhaust RAM across 12+ concurrent threads. Returns None for a
+    skip, {"_error": ...} for a failure worth surfacing, else the manifest row.
+    """
     url = upsize_ebay_url(str(src.get("galleryURL") or "").strip())
     if not url:
         return None
@@ -118,37 +127,38 @@ def process_one(os_id: str, src: dict, bucket: str) -> dict | None:
     if raw is None:
         return None
     try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception:
-        return None
+        img = Image.open(io.BytesIO(raw))           # lazy — header only
+        if (img.width or 0) * (img.height or 0) > MAX_IMAGE_PIXELS:
+            return None
+        img = img.convert("RGB")                     # forces decode
 
-    s3 = _s3()
-    sizes: dict[str, int] = {}
+        s3 = _s3()
+        keys: dict[str, str] = {}
+        sizes: dict[str, int] = {}
 
-    # Original — store the fetched bytes as-is (re-encode to normalise to JPEG).
-    orig_bytes = encode_jpeg(img, quality=92)
-    k = image_key(os_id, "original")
-    put_image(s3, bucket, k, orig_bytes)
-    sizes["original"] = len(orig_bytes)
-    keys = {"original": k}
+        orig_bytes = encode_jpeg(img, quality=92)
+        keys["original"] = image_key(os_id, "original")
+        put_image(s3, bucket, keys["original"], orig_bytes)
+        sizes["original"] = len(orig_bytes)
 
-    for name, dim in RESIZE_DIMS.items():
-        v = img.copy()
-        v.thumbnail((dim, dim), Image.LANCZOS)
-        b = encode_jpeg(v, quality=88)
-        kk = image_key(os_id, name)
-        put_image(s3, bucket, kk, b)
-        sizes[name] = len(b)
-        keys[name] = kk
+        for name, dim in RESIZE_DIMS.items():
+            v = img.copy()
+            v.thumbnail((dim, dim), Image.LANCZOS)
+            b = encode_jpeg(v, quality=88)
+            keys[name] = image_key(os_id, name)
+            put_image(s3, bucket, keys[name], b)
+            sizes[name] = len(b)
 
-    return {
-        "os_id":       os_id,
-        "qdrant_id":   str(os_id_to_qdrant_id(os_id)),
-        "gallery_url": url,
-        "s3_keys":     keys,
-        "sizes":       sizes,
-        "source_doc":  src,
-    }
+        return {
+            "os_id":       os_id,
+            "qdrant_id":   str(os_id_to_qdrant_id(os_id)),
+            "gallery_url": url,
+            "s3_keys":     keys,
+            "sizes":       sizes,
+            "source_doc":  src,
+        }
+    except Exception as e:
+        return {"_error": f"{type(e).__name__}: {e}"}
 
 
 def main() -> None:
@@ -158,7 +168,7 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="Manifest JSONL output path.")
     ap.add_argument("--bucket", default=os.environ.get("S3_IMAGE_BUCKET")
                     or os.environ.get("S3_VECTOR_BUCKET"))
-    ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--workers", type=int, default=12)
     args = ap.parse_args()
 
     if not args.bucket:
@@ -174,19 +184,28 @@ def main() -> None:
                 args.date, len(docs), args.bucket)
 
     ok = fail = 0
+    err_samples: list[str] = []
     with open(out_path, "w") as fout, ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(process_one, oid, src, args.bucket): oid for oid, src in docs}
         for i, f in enumerate(as_completed(futs)):
             row = f.result()
             if row is None:
                 fail += 1
+            elif "_error" in row:
+                fail += 1
+                if len(err_samples) < 5:
+                    err_samples.append(row["_error"])
             else:
                 fout.write(json.dumps(row) + "\n")
                 ok += 1
-            if (i + 1) % 2000 == 0:
+            if (i + 1) % 1000 == 0:
                 logger.info("  {}/{}  ok={} fail={}", i + 1, len(docs), ok, fail)
+                if ok == 0 and err_samples:
+                    logger.error("All uploads failing — sample errors: {}", err_samples)
 
     logger.info("─" * 60)
+    if err_samples:
+        logger.warning("Sample failures: {}", err_samples)
     logger.info("Archived {} cards ({} failed) → manifest {}", ok, fail, out_path)
     logger.info("Each card stored as original/512/256 under s3://{}/images/ebay/",
                 args.bucket)
