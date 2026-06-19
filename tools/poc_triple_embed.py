@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -39,18 +40,24 @@ from tools.eval_retrieval_at_scale import build_encoder
 from tools.eval_parallel_discrimination import _pick_device
 
 
-def load_batch_images(s3, bucket: str, rows: list[dict]):
-    """Load the 512px variant for a batch; substitute grey on failure (kept aligned)."""
+def load_batch_images(pool: ThreadPoolExecutor, s3, bucket: str, rows: list[dict]):
+    """Load the 512px variant for a batch in parallel; grey on failure (kept aligned).
+
+    The sequential per-batch S3 fetch was the throughput bottleneck — downloads
+    parallelise cleanly (boto3 clients are thread-safe) and pool.map preserves
+    input order, so the returned images stay positionally aligned with rows.
+    """
     from PIL import Image
     grey = Image.new("RGB", (224, 224), (114, 114, 114))
-    out = []
-    for r in rows:
+
+    def _load(r):
         key = r["s3_keys"].get("512") or image_key(r["os_id"], "512")
         try:
-            out.append(get_image_pil(s3, bucket, key))
+            return get_image_pil(s3, bucket, key)
         except Exception:
-            out.append(grey)
-    return out
+            return grey
+
+    return list(pool.map(_load, rows))
 
 
 def main() -> None:
@@ -62,15 +69,28 @@ def main() -> None:
     ap.add_argument("--vector-bucket", default=os.environ.get("S3_VECTOR_BUCKET"))
     ap.add_argument("--vector-prefix", default=os.environ.get("S3_VECTOR_PREFIX", "vectors"))
     ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--download-workers", type=int, default=16,
+                    help="Parallel S3 image fetches per batch.")
+    ap.add_argument("--shard-index", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="Fleet fan-out: this worker handles rows[shard_index::num_shards].")
     args = ap.parse_args()
 
     rows = [json.loads(l) for l in open(ROOT / args.manifest)]
-    logger.info("Embedding {} cards with {} backbones", len(rows), len(POC_ENCODERS))
+    if args.num_shards > 1:
+        rows = rows[args.shard_index::args.num_shards]
+    logger.info("Embedding {} cards (shard {}/{}) with {} backbones",
+                len(rows), args.shard_index, args.num_shards, len(POC_ENCODERS))
 
     device = _pick_device()
     s3 = make_s3()
+    pool = ThreadPoolExecutor(max_workers=args.download_workers)
     store = S3VectorStore(bucket=args.vector_bucket, prefix=args.vector_prefix)
+    # Per-shard job_id so each worker's S3 shards don't collide (shard_num
+    # restarts at 0 per job). The loader globs all job_ids under the partition.
     job_id = poc_job_id(args.date)
+    if args.num_shards > 1:
+        job_id = f"{job_id}-s{args.shard_index:02d}"
 
     # Load all three encoders once (weights co-resident; activations sequential).
     encoders = {}
@@ -95,7 +115,7 @@ def main() -> None:
 
     for i in range(0, len(rows), args.batch):
         chunk = rows[i:i + args.batch]
-        pils = load_batch_images(s3, args.bucket, chunk)
+        pils = load_batch_images(pool, s3, args.bucket, chunk)
         for spec in POC_ENCODERS:
             vecs = encoders[spec.vector_name](pils)
             for r, v in zip(chunk, vecs):
