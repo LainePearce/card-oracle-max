@@ -24,6 +24,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 PRICE_STANDARD_GB = 0.023     # S3 Standard, us-east-1 $/GB-month
+PRICE_IA_GB       = 0.0125    # S3 Standard-Infrequent Access $/GB-month
 PRICE_GIR_GB      = 0.004     # Glacier Instant Retrieval $/GB-month
 PRICE_PUT_1K      = 0.005     # $ per 1,000 PUT requests
 GB = 1024 ** 3
@@ -62,24 +63,30 @@ def main() -> None:
     print(f"  per-image    : {per_image/1024:8.1f} KB  "
           f"(original {100*avg['original']/per_image:.0f}% of bytes)\n")
 
-    print(f"{'scale':>8}  {'total':>9}  {'Standard/mo':>12}  {'Tiered/mo':>11}  {'1x PUTs':>9}")
-    print("-" * 60)
+    print(f"{'scale':>8}  {'total':>9}  {'Standard/mo':>12}  {'IA-tier/mo':>11}  "
+          f"{'GIR-tier/mo':>12}  {'1x PUTs':>9}")
+    print("-" * 74)
     for scale in args.scales:
         total_bytes   = per_image * scale
         resized_bytes = resized * scale
         orig_bytes    = avg["original"] * scale
 
         cost_standard = (total_bytes / GB) * PRICE_STANDARD_GB
-        cost_tiered   = (resized_bytes / GB) * PRICE_STANDARD_GB \
+        cost_ia       = (resized_bytes / GB) * PRICE_STANDARD_GB \
+                        + (orig_bytes / GB) * PRICE_IA_GB
+        cost_gir      = (resized_bytes / GB) * PRICE_STANDARD_GB \
                         + (orig_bytes / GB) * PRICE_GIR_GB
         put_cost      = (scale * 3 / 1000) * PRICE_PUT_1K
 
         print(f"{scale/1e6:6.0f}M  {total_bytes/TB:7.1f}TB  "
-              f"${cost_standard:>10,.0f}  ${cost_tiered:>9,.0f}  ${put_cost:>7,.0f}")
+              f"${cost_standard:>10,.0f}  ${cost_ia:>9,.0f}  ${cost_gir:>10,.0f}  "
+              f"${put_cost:>7,.0f}")
 
-    print("\nTiered = Glacier-IR originals + Standard resized (served via CDN).")
-    print("CloudFront egress is separate and traffic-dependent; caching the")
-    print("512/256 variants offloads nearly all S3 GETs.")
+    print("\nIA-tier  = Standard-IA originals + Standard resized (instant access,")
+    print("           $0.01/GB retrieval) — pick this if originals are served regularly.")
+    print("GIR-tier = Glacier-IR originals ($0.03/GB retrieval) — archival-only originals.")
+    print("Resized variants stay in Standard (the 128KB IA minimum penalises small thumbs).")
+    print("CloudFront egress is separate; caching 512/256 offloads nearly all S3 GETs.")
 
 
 if __name__ == "__main__":
