@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Backbone POC — CLIP vs DINOv2 vs DINOv3</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+  header { padding: 16px 24px; background: #161a22; border-bottom: 1px solid #262c38; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #8a93a6; font-size: 13px; }
+  .bar { padding: 16px 24px; display: flex; gap: 16px; align-items: center; }
+  .bar input[type=file] { color: #c7cdda; }
+  button { background: #3b82f6; color: #fff; border: 0; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:disabled { background: #394150; cursor: default; }
+  #query { max-height: 120px; border-radius: 6px; border: 1px solid #2a3340; }
+  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; padding: 0 24px 40px; }
+  .col h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #aab3c5; border-bottom: 1px solid #262c38; padding-bottom: 6px; }
+  .card { display: flex; gap: 10px; padding: 8px; border: 1px solid #232a36; border-radius: 8px; margin-bottom: 8px; background: #141821; }
+  .card img { width: 64px; height: 64px; object-fit: cover; border-radius: 5px; background: #0b0d12; }
+  .meta { font-size: 12px; line-height: 1.35; }
+  .meta .p { font-weight: 600; color: #f1f4fa; }
+  .meta .s { color: #8a93a6; }
+  .score { color: #5eead4; font-variant-numeric: tabular-nums; }
+  .rank { color: #5b6577; font-size: 11px; }
+  .empty { color: #6b7280; font-size: 13px; padding: 20px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Backbone POC — same query, three encoders</h1>
+  <div class="sub">Upload a card photo; compare what CLIP (768d), DINOv2@512 (1024d) and DINOv3@512 (1024d) retrieve from <code>cards_backbone_poc</code>.</div>
+</header>
+
+<div class="bar">
+  <input type="file" id="file" accept="image/*">
+  <button id="go" disabled>Search</button>
+  <img id="query" alt="">
+  <span id="status" class="sub"></span>
+</div>
+
+<div class="cols">
+  <div class="col"><h2>CLIP — image</h2><div id="image"></div></div>
+  <div class="col"><h2>DINOv2 — image_dinov2</h2><div id="image_dinov2"></div></div>
+  <div class="col"><h2>DINOv3 — image_dinov3</h2><div id="image_dinov3"></div></div>
+</div>
+
+<script>
+const file = document.getElementById('file');
+const go = document.getElementById('go');
+const status = document.getElementById('status');
+const query = document.getElementById('query');
+
+file.onchange = () => {
+  go.disabled = !file.files.length;
+  if (file.files.length) query.src = URL.createObjectURL(file.files[0]);
+};
+
+function render(colId, items) {
+  const el = document.getElementById(colId);
+  if (!items || !items.length) { el.innerHTML = '<div class="empty">No results</div>'; return; }
+  el.innerHTML = items.map((r, i) => `
+    <div class="card">
+      <img src="${r.thumb || ''}" alt="">
+      <div class="meta">
+        <div><span class="rank">#${i+1}</span> <span class="score">${r.score}</span></div>
+        <div class="p">${r.player || '—'}</div>
+        <div class="s">${[r.year, r.set, r.card_number, r.parallel].filter(Boolean).join(' · ')}</div>
+        <div class="s">${r.title || ''}</div>
+      </div>
+    </div>`).join('');
+}
+
+go.onclick = async () => {
+  if (!file.files.length) return;
+  go.disabled = true; status.textContent = 'Embedding + searching…';
+  const fd = new FormData();
+  fd.append('image', file.files[0]);
+  try {
+    const resp = await fetch('/search', { method: 'POST', body: fd });
+    const data = await resp.json();
+    for (const k of ['image', 'image_dinov2', 'image_dinov3']) render(k, data.results[k]);
+    status.textContent = 'Done';
+  } catch (e) {
+    status.textContent = 'Error: ' + e;
+  }
+  go.disabled = false;
+};
+</script>
+</body>
+</html>
