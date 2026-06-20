@@ -33,12 +33,11 @@ load_dotenv(ROOT / ".env")
 from loguru import logger
 from PIL import Image
 
+import requests
 import uvicorn
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from qdrant_client.models import NamedVector
 
-from src.ingestion.qdrant_writer import get_qdrant_client
 from tools.poc_common import POC_COLLECTION, POC_ENCODERS, DINO_IMAGE_SIZE, make_s3, image_key
 from tools.eval_retrieval_at_scale import build_encoder
 from tools.eval_parallel_discrimination import _pick_device
@@ -48,6 +47,26 @@ STATE: dict = {}
 TOP_K = 20
 PRESIGN_TTL = 3600
 IMAGE_BUCKET = os.environ.get("S3_IMAGE_BUCKET") or os.environ.get("S3_VECTOR_BUCKET")
+QDRANT_URL = f"http://{os.environ.get('QDRANT_HOST', 'localhost')}:6333"
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
+
+
+def _qsearch(vector_name: str, vec: list, limit: int) -> list[dict]:
+    """Legacy REST /points/search — works against the 1.8.2 server.
+
+    The 1.18 client dropped the high-level .search method, and query_points
+    targets a /points/query endpoint that 1.8.2 doesn't have; this classic
+    search endpoint exists in every Qdrant version.
+    """
+    headers = {"Content-Type": "application/json"}
+    if QDRANT_API_KEY:
+        headers["api-key"] = QDRANT_API_KEY
+    body = {"vector": {"name": vector_name, "vector": vec},
+            "limit": limit, "with_payload": True}
+    r = requests.post(f"{QDRANT_URL}/collections/{POC_COLLECTION}/points/search",
+                      json=body, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()["result"]
 
 
 @app.on_event("startup")
@@ -58,7 +77,6 @@ def _startup() -> None:
     for spec in POC_ENCODERS:
         enc, _ = build_encoder(spec.encoder, DINO_IMAGE_SIZE, spec.fp16, device)
         STATE["encoders"][spec.vector_name] = enc
-    STATE["qdrant"] = get_qdrant_client()
     STATE["s3"] = make_s3()
     logger.info("Ready — collection '{}'", POC_COLLECTION)
 
@@ -72,10 +90,10 @@ def _presign(payload: dict) -> str:
         return ""
 
 
-def _result(point) -> dict:
-    p = point.payload or {}
+def _result(h: dict) -> dict:
+    p = h.get("payload") or {}
     return {
-        "score":       round(float(point.score), 4),
+        "score":       round(float(h.get("score", 0.0)), 4),
         "player":      p.get("player", ""),
         "set":         p.get("set", ""),
         "card_number": p.get("card_number", ""),
@@ -101,15 +119,10 @@ def healthz() -> dict:
 async def search(image: UploadFile = File(...)) -> JSONResponse:
     raw = await image.read()
     pil = Image.open(io.BytesIO(raw)).convert("RGB")
-    client = STATE["qdrant"]
     out: dict[str, list] = {}
     for spec in POC_ENCODERS:
         vec = STATE["encoders"][spec.vector_name]([pil])[0].tolist()
-        hits = client.search(
-            collection_name=POC_COLLECTION,
-            query_vector=NamedVector(name=spec.vector_name, vector=vec),
-            limit=TOP_K, with_payload=True,
-        )
+        hits = _qsearch(spec.vector_name, vec, TOP_K)
         out[spec.vector_name] = [_result(h) for h in hits]
     return JSONResponse({"results": out})
 
