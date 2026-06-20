@@ -50,6 +50,14 @@ def _read_marker(s3, d: str) -> tuple[str, dict]:
         return d, {}
 
 
+def _read_active(s3, d: str) -> tuple[str, dict]:
+    try:
+        body = s3.get_object(Bucket=QUEUE_BUCKET, Key=f"{ACTIVE}/{d}.json")["Body"].read()
+        return d, json.loads(body)
+    except Exception:
+        return d, {}
+
+
 def poll_s3_state() -> dict:
     s3 = s3_client()
     queued   = list_dates(s3, QUEUE)
@@ -61,6 +69,14 @@ def poll_s3_state() -> dict:
         with ThreadPoolExecutor(max_workers=16) as ex:
             for d, m in ex.map(lambda d: _read_marker(s3, d), complete):
                 markers[d] = m
+
+    active_jobs: list[dict] = []
+    if active:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for d, m in ex.map(lambda d: _read_active(s3, d), active):
+                m["date"] = d
+                active_jobs.append(m)
+    active_jobs.sort(key=lambda j: j["date"], reverse=True)
 
     total_archived = sum(m.get("archived", 0) for m in markers.values())
     total_os       = sum(m.get("os_total", 0) for m in markers.values())
@@ -92,6 +108,7 @@ def poll_s3_state() -> dict:
         "total_gb":       round(total_bytes / (1024 ** 3), 1),
         "coverage":       coverage,
         "per_day":        per_day,
+        "active_jobs":    active_jobs,
     }
 
 
@@ -220,6 +237,9 @@ header h1{font-size:18px}header h1 span{color:var(--blue)}.header-meta{font-size
 <div class="card blue"><div class="label">Storage</div><div class="value" id="s-gb">—</div><div class="sub">GB in S3</div></div>
 <div class="card yellow"><div class="label">ETA</div><div class="value" id="s-eta" style="font-size:18px">—</div><div class="sub">all 2026 days</div></div>
 </div>
+<div class="section"><div class="section-title">Active Days — downloading now</div>
+<div style="overflow-x:auto"><table class="worker-table"><thead><tr><th>Date</th><th>Worker</th><th>Archived</th><th>OS docs</th><th>Progress</th><th>Updated</th></tr></thead>
+<tbody id="active-jobs"><tr><td colspan="6" class="loading">Loading…</td></tr></tbody></table></div></div>
 <div class="section"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
 <div class="section-title" style="margin:0">2026 Image-Download Coverage</div>
 <div class="legend"><div class="legend-item"><div class="legend-dot complete"></div>Complete</div><div class="legend-item"><div class="legend-dot active"></div>Active</div><div class="legend-item"><div class="legend-dot queued"></div>Queued</div><div class="legend-item"><div class="legend-dot not_in_queue"></div>Not queued</div></div></div>
@@ -258,6 +278,13 @@ function renderCal(cov,perday){
     return `<div class="month-block"><div class="month-name">${MN[m-1]} ${y}</div><div class="days-grid">${hc}${ec}${cells.join('')}</div></div>`;
   }).join('');
 }
+function renderActive(jobs){const tb=document.getElementById('active-jobs');
+  if(!jobs||!jobs.length){tb.innerHTML='<tr><td colspan="6" class="svc-unknown" style="text-align:center;padding:14px">No active days</td></tr>';return;}
+  tb.innerHTML=jobs.map(j=>{const a=j.archived||0,t=j.os_total||0;const pct=t?Math.min(100,a/t*100):0;
+    const bar=`<div style="display:flex;align-items:center;gap:6px"><div style="background:var(--gray-dim);border-radius:3px;height:7px;width:90px;overflow:hidden"><div style="height:100%;background:var(--green);width:${pct}%"></div></div><span style="font-size:10px;color:var(--muted)">${pct.toFixed(0)}%</span></div>`;
+    return `<tr><td><b>${j.date}</b></td><td class="ip">${j.host||'—'}</td><td>${fmt(a)}</td><td>${fmt(t)}</td><td>${bar}</td><td class="ip">${fmtTime(j.updated_at||j.claimed_at)}</td></tr>`;
+  }).join('');
+}
 function renderWorkers(ws){const tb=document.getElementById('workers');
   if(!ws||!ws.length){tb.innerHTML='<tr><td colspan="4" class="loading">Loading…</td></tr>';return;}
   tb.innerHTML=ws.map(w=>{const svc=w.service??'unknown';const cls=svc==='active'?'svc-active':svc==='unknown'||svc==='—'?'svc-unknown':'svc-inactive';
@@ -266,7 +293,7 @@ function renderWorkers(ws){const tb=document.getElementById('workers');
 }
 async function tick(){try{const r=await fetch('/api/status');const d=await r.json();
   nextT=d.next_update_at?new Date(d.next_update_at).getTime():Date.now()+60000;
-  renderSummary(d);renderCal(d.coverage||{},d.per_day||{});renderWorkers(d.workers||[]);}catch(e){console.error(e);}}
+  renderSummary(d);renderActive(d.active_jobs||[]);renderCal(d.coverage||{},d.per_day||{});renderWorkers(d.workers||[]);}catch(e){console.error(e);}}
 setInterval(()=>{if(nextT)document.getElementById('countdown').textContent=Math.max(0,Math.round((nextT-Date.now())/1000))+'s';},1000);
 tick();setInterval(tick,60000);
 </script></body></html>"""

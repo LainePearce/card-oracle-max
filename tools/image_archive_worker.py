@@ -37,17 +37,21 @@ from opensearchpy.exceptions import NotFoundError
 from src.ingestion.opensearch_reader import get_opensearch_client
 from tools.poc_image_archive import fetch_window, process_one
 from tools.image_archive_common import (
-    s3_client, claim_next, mark_complete, release,
+    s3_client, claim_next, mark_complete, release, update_active,
     QUEUE_BUCKET, IMAGE_BUCKET, MANIFESTS,
 )
 
 
-def archive_date(os_client, date_str: str, workers: int) -> tuple[list[dict], dict]:
-    """Archive one day. Returns (manifest_rows, stats)."""
+def archive_date(os_client, s3, date_str: str, workers: int) -> tuple[list[dict], dict]:
+    """Archive one day. Returns (manifest_rows, stats). Writes intra-day progress
+    to the active marker every 5k images so the dashboard can show a live bar."""
     try:
         docs = list(fetch_window(os_client, date_str, None))
     except NotFoundError:
         return [], {"archived": 0, "failed": 0, "os_total": 0, "note": "no OS index"}
+
+    os_total = len(docs)
+    update_active(s3, date_str, {"os_total": os_total, "archived": 0, "failed": 0})
 
     rows: list[dict] = []
     ok = fail = 0
@@ -64,9 +68,11 @@ def archive_date(os_client, date_str: str, workers: int) -> tuple[list[dict], di
                 bytes_total += sum(r.get("sizes", {}).values())
             if (i + 1) % 5000 == 0:
                 logger.info("  [{}] {}/{}  ok={} fail={}",
-                            date_str, i + 1, len(docs), ok, fail)
+                            date_str, i + 1, os_total, ok, fail)
+                update_active(s3, date_str,
+                              {"os_total": os_total, "archived": ok, "failed": fail})
 
-    return rows, {"archived": ok, "failed": fail, "os_total": len(docs),
+    return rows, {"archived": ok, "failed": fail, "os_total": os_total,
                   "bytes": bytes_total}
 
 
@@ -105,7 +111,7 @@ def main() -> None:
         logger.info("Claimed {}", date_str)
         t0 = time.time()
         try:
-            rows, stats = archive_date(os_client, date_str, args.workers)
+            rows, stats = archive_date(os_client, s3, date_str, args.workers)
             if rows:
                 upload_manifest(s3, date_str, rows)
             stats["seconds"] = round(time.time() - t0, 1)

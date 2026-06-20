@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from datetime import datetime, timezone
 
 import boto3
@@ -24,6 +25,7 @@ from botocore.exceptions import ClientError
 
 QUEUE_BUCKET = os.environ.get("S3_VECTOR_BUCKET", "card-oracle-vectors")
 IMAGE_BUCKET = os.environ.get("S3_IMAGE_BUCKET") or QUEUE_BUCKET
+HOST = socket.gethostname()
 
 PFX       = "image-archive"
 QUEUE     = f"{PFX}/queue"
@@ -70,7 +72,8 @@ def claim_next(s3) -> str | None:
     for d in sorted(list_dates(s3, QUEUE), reverse=True):
         try:
             s3.put_object(Bucket=QUEUE_BUCKET, Key=f"{ACTIVE}/{d}.json",
-                          Body=json.dumps({"date": d, "claimed_at": _now()}).encode(),
+                          Body=json.dumps({"date": d, "host": HOST,
+                                           "claimed_at": _now()}).encode(),
                           IfNoneMatch="*")
         except ClientError:
             continue  # another worker claimed it first
@@ -80,6 +83,14 @@ def claim_next(s3) -> str | None:
             pass
         return d
     return None
+
+
+def update_active(s3, date_str: str, stats: dict) -> None:
+    """Overwrite the active marker with intra-day progress. The worker owns the
+    marker after claiming, so this is a plain put (no IfNoneMatch)."""
+    s3.put_object(Bucket=QUEUE_BUCKET, Key=f"{ACTIVE}/{date_str}.json",
+                  Body=json.dumps({"date": date_str, "host": HOST, **stats,
+                                   "updated_at": _now()}).encode())
 
 
 def mark_complete(s3, date_str: str, stats: dict) -> None:
