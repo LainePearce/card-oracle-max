@@ -1,0 +1,16 @@
+[Unit]
+Description=Card Oracle image-archive worker (2026 image downloads to S3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/card-oracle-max
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python -u tools/image_archive_worker.py --workers 12 --loop
+Restart=on-failure
+RestartSec=15
+# Restart cleanly if a day is mid-flight; the claim is released on error and re-queued.
+
+[Install]
+WantedBy=multi-user.target

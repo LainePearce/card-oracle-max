@@ -1,0 +1,15 @@
+[Unit]
+Description=Card Oracle image-archive dashboard (worker-0, port 8082)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/card-oracle-max
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python -u tools/image_archive_dashboard.py --port 8082
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
