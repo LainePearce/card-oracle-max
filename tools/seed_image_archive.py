@@ -24,13 +24,16 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from loguru import logger
-from tools.image_archive_common import s3_client, seed_date
+from tools.image_archive_common import s3_client, seed_date, reap_stale
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--start", default="2026-01-01")
     ap.add_argument("--end", default=date.today().isoformat())
+    ap.add_argument("--reap-stale-minutes", type=float, default=0,
+                    help="Also re-queue active days idle longer than this "
+                         "(recovers dead/spot-killed workers). 0 = off.")
     args = ap.parse_args()
 
     start = datetime.fromisoformat(args.start).date()
@@ -48,6 +51,10 @@ def main() -> None:
 
     logger.info("Image-archive queue seeded: {} new days, {} already present "
                 "({} → {})", seeded, skipped, start, end)
+
+    if args.reap_stale_minutes > 0:
+        reaped = reap_stale(s3, args.reap_stale_minutes)
+        logger.info("Reaped {} stale active days back to queue", reaped)
 
 
 if __name__ == "__main__":

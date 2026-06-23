@@ -111,3 +111,33 @@ def release(s3, date_str: str) -> None:
         s3.delete_object(Bucket=QUEUE_BUCKET, Key=f"{ACTIVE}/{date_str}.json")
     except ClientError:
         pass
+
+
+def _age_minutes(ts) -> float:
+    if not ts:
+        return 1e9
+    try:
+        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds() / 60
+    except Exception:
+        return 1e9
+
+
+def reap_stale(s3, max_age_minutes: float) -> int:
+    """Re-queue active days whose marker hasn't updated in max_age_minutes — i.e.
+    the owning worker died or was spot-reclaimed mid-day. Returns the count
+    re-queued. Run periodically (the seed timer) so the fleet self-heals."""
+    n = 0
+    for d in list_dates(s3, ACTIVE):
+        try:
+            m = json.loads(s3.get_object(Bucket=QUEUE_BUCKET,
+                                         Key=f"{ACTIVE}/{d}.json")["Body"].read())
+        except ClientError:
+            continue
+        ts = m.get("updated_at") or m.get("claimed_at")
+        if _age_minutes(ts) >= max_age_minutes:
+            release(s3, d)
+            n += 1
+    return n

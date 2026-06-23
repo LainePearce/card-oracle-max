@@ -1,0 +1,28 @@
+# --- image-archive CPU fleet ---
+# Copy to terraform.tfvars and fill in. Two modes:
+#
+#   2025 historical drain:  worker_count = 6,  instance_type = "c7i.2xlarge"
+#   in-service daily:       worker_count = 1,  instance_type = "c7i.xlarge"
+#
+# Switch modes by editing these two and re-running `terraform apply`.
+
+aws_region    = "us-west-1"
+key_pair_name = "qdrant-test"
+my_ips        = ["153.53.225.179/32"]
+
+worker_count  = 6
+instance_type = "c7i.2xlarge"
+
+# Spot is on by default (~70% cheaper; the workload is resumable). Set false for
+# guaranteed capacity on the daily single instance if you prefer.
+use_spot       = true
+spot_max_price = ""
+
+download_workers = 16
+
+s3_vector_bucket = "card-oracle-vectors"
+s3_image_bucket  = "images-130-sold"
+
+opensearch_host     = "REPLACE-with-extant-os-host.us-west-1.es.amazonaws.com"
+opensearch_user     = "REPLACE"
+opensearch_password = "REPLACE"

@@ -1,0 +1,13 @@
+# Lean dependency set for the CPU image-archive fleet.
+# Deliberately NO torch / open_clip / transformers / pyarrow — image archival is
+# download + Pillow resize + S3 upload only. (qdrant-client + numpy are pulled in
+# transitively by tools/poc_image_archive.py importing os_id_to_qdrant_id; they're
+# small and CUDA-free.)
+boto3
+requests
+Pillow
+opensearch-py
+loguru
+python-dotenv
+numpy
+qdrant-client
