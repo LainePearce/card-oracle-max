@@ -5,6 +5,7 @@
 # small and CUDA-free.)
 boto3
 requests
+requests-aws4auth
 Pillow
 opensearch-py
 loguru
