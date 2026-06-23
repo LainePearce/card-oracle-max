@@ -1,0 +1,10 @@
+[Unit]
+Description=Seed newly-archived days into the DINOv2 embed queue + reap stale every 30 min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

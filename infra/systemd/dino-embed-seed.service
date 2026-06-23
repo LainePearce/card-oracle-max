@@ -1,0 +1,10 @@
+[Unit]
+Description=Card Oracle DINOv2 embed seeder + stale reaper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/card-oracle-max
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python tools/seed_dino_embed.py --reap-stale-minutes 30

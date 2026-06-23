@@ -1,0 +1,15 @@
+[Unit]
+Description=Card Oracle DINOv2 embed dashboard (GPU worker-0, port 8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/card-oracle-max
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python -u tools/dino_embed_dashboard.py --port 8080
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
