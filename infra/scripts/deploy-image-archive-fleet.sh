@@ -24,10 +24,13 @@ PRIVATE=()
 
 for ip in "${PUBLIC[@]}"; do
   echo "=== deploying $ip ==="
+  # NEVER ship .env (each box has its own from user_data), keys, or generated/
+  # secret local files — rsync ignores .gitignore, so exclude them explicitly.
   rsync -az -e "ssh ${SSH_OPTS[*]}" \
     --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='.venv-local' \
     --exclude='data' --exclude='*.pyc' \
     --exclude='.terraform' --exclude='*.tfstate*' --exclude='*.tfvars' \
+    --exclude='.env' --exclude='worker_ips.json' --exclude='*.pem' \
     ./ "ec2-user@$ip:$REMOTE/"
 
   ssh "${SSH_OPTS[@]}" "ec2-user@$ip" "
