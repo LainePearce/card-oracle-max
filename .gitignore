@@ -60,3 +60,8 @@ Thumbs.db
 htmlcov/
 .coverage
 .coverage.*
+
+.venv-local/
+
+*.json
+*.parquet
