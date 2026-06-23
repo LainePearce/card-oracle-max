@@ -25,8 +25,9 @@ PRIVATE=()
 for ip in "${PUBLIC[@]}"; do
   echo "=== deploying $ip ==="
   rsync -az -e "ssh ${SSH_OPTS[*]}" \
-    --exclude='.git' --exclude='__pycache__' --exclude='.venv' \
+    --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='.venv-local' \
     --exclude='data' --exclude='*.pyc' \
+    --exclude='.terraform' --exclude='*.tfstate*' --exclude='*.tfvars' \
     ./ "ec2-user@$ip:$REMOTE/"
 
   ssh "${SSH_OPTS[@]}" "ec2-user@$ip" "
