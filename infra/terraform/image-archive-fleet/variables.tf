@@ -4,16 +4,28 @@ variable "aws_region" {
   default     = "us-west-1"
 }
 
-variable "instance_type" {
-  description = "CPU instance type (no GPU). c7i.2xlarge = 8 vCPU for the bulk 2025 drain; drop to c7i.xlarge (4 vCPU) for the 1-instance daily routine."
-  type        = string
-  default     = "c7i.2xlarge"
+variable "instance_types" {
+  description = "CPU instance types for the ASG to diversify across (spot resilience). All ~8 vCPU equivalents; first is the launch-template default."
+  type        = list(string)
+  default     = ["c7i.2xlarge", "c6i.2xlarge", "m7i.2xlarge", "c7a.2xlarge", "m6i.2xlarge"]
 }
 
 variable "worker_count" {
-  description = "Number of CPU workers. 6 for the 2025 historical drain; 1 for in-service daily downloads."
+  description = "Desired ASG size (= min). 6 for the 2025 historical drain; 1 for in-service daily downloads."
   type        = number
   default     = 6
+}
+
+variable "on_demand_base_capacity" {
+  description = "Instances guaranteed on-demand (the rest are spot). 0 = all spot (cheapest); set 1 to keep one stable anchor."
+  type        = number
+  default     = 0
+}
+
+variable "code_s3_key" {
+  description = "S3 key (under the vector bucket) of the code tarball that user_data fetches at boot. Publish with infra/scripts/publish-image-archive-code.sh."
+  type        = string
+  default     = "deploy/image-archive-code.tar.gz"
 }
 
 variable "key_pair_name" {
@@ -30,20 +42,6 @@ variable "name_prefix" {
   description = "Prefix for resource names/tags"
   type        = string
   default     = "image-archive"
-}
-
-# --- Spot (the workload is fully resumable: claim queue + orphan reaper) ---
-
-variable "use_spot" {
-  description = "Use spot instances (~70% cheaper). Safe here because days are re-queued on worker death; the reaper recovers orphaned in-flight days."
-  type        = bool
-  default     = true
-}
-
-variable "spot_max_price" {
-  description = "Max spot price ($/hr). Empty string = cap at the on-demand price."
-  type        = string
-  default     = ""
 }
 
 # --- Workload config ---

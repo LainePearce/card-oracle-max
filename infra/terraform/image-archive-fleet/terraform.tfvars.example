@@ -10,13 +10,14 @@ aws_region    = "us-west-1"
 key_pair_name = "qdrant-test"
 my_ips        = ["153.53.225.179/32"]
 
-worker_count  = 6
-instance_type = "c7i.2xlarge"
+# ASG desired size (= min). 6 for the 2025 drain; 1 for daily routine.
+worker_count = 6
 
-# Spot is on by default (~70% cheaper; the workload is resumable). Set false for
-# guaranteed capacity on the daily single instance if you prefer.
-use_spot       = true
-spot_max_price = ""
+# The ASG diversifies across these spot pools for resilience; first is the LT default.
+instance_types = ["c7i.2xlarge", "c6i.2xlarge", "m7i.2xlarge", "c7a.2xlarge", "m6i.2xlarge"]
+
+# 0 = all spot (cheapest). Set 1 to keep one guaranteed on-demand anchor.
+on_demand_base_capacity = 0
 
 download_workers = 16
 

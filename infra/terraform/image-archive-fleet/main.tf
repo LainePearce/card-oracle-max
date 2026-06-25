@@ -13,7 +13,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-# --- AMI: stock Amazon Linux 2023 x86_64 (no GPU/CUDA — image archival is CPU/IO only) ---
+# --- AMI: stock Amazon Linux 2023 x86_64 (no GPU — archival is CPU/IO only) ---
 
 data "aws_ami" "al2023" {
   most_recent = true
@@ -23,14 +23,26 @@ data "aws_ami" "al2023" {
     name   = "name"
     values = ["al2023-ami-2023.*-x86_64"]
   }
-
   filter {
     name   = "architecture"
     values = ["x86_64"]
   }
 }
 
-# --- IAM: read/write the image bucket + the queue bucket; no Qdrant/RDS needed ---
+# --- Default VPC subnets (ASG spreads across AZs for spot resilience) ---
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+# --- IAM: read/write the image bucket + the queue bucket (incl. the code tarball) ---
 
 resource "aws_iam_role" "worker" {
   name = "${var.name_prefix}-role"
@@ -71,52 +83,96 @@ resource "aws_iam_instance_profile" "worker" {
   role = aws_iam_role.worker.name
 }
 
-# --- EC2 instances ---
+# --- Launch template: self-bootstrapping (fetches code tarball from S3) ---
 
-resource "aws_instance" "worker" {
-  count = var.worker_count
+resource "aws_launch_template" "worker" {
+  name_prefix   = "${var.name_prefix}-lt-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.instance_types[0] # overridden per-type by the ASG policy
+  key_name      = var.key_pair_name
 
-  ami                    = data.aws_ami.al2023.id
-  instance_type          = var.instance_type
-  key_name               = var.key_pair_name
   vpc_security_group_ids = [aws_security_group.worker.id]
-  iam_instance_profile   = aws_iam_instance_profile.worker.name
 
-  # Spot when enabled — interruptions are safe: the day re-queues and the reaper
-  # recovers it. Note: with count-based instances a reclaimed spot box is not
-  # auto-replaced; re-run `apply` to top the fleet back up.
-  dynamic "instance_market_options" {
-    for_each = var.use_spot ? [1] : []
-    content {
-      market_type = "spot"
-      spot_options {
-        max_price                      = var.spot_max_price != "" ? var.spot_max_price : null
-        spot_instance_type             = "one-time"
-        instance_interruption_behavior = "terminate"
-      }
+  iam_instance_profile {
+    name = aws_iam_instance_profile.worker.name
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = var.root_volume_size
+      volume_type = "gp3"
+      encrypted   = true
     }
   }
 
-  user_data = templatefile("${path.module}/user_data.sh", {
+  user_data = base64encode(templatefile("${path.module}/user_data.sh", {
     s3_vector_bucket = var.s3_vector_bucket
     s3_image_bucket  = var.s3_image_bucket
+    code_key         = var.code_s3_key
     os_host          = var.opensearch_host
     os_user          = var.opensearch_user
     os_password      = var.opensearch_password
     download_workers = var.download_workers
-    worker_index     = count.index
-  })
+  }))
 
-  root_block_device {
-    volume_type = "gp3"
-    volume_size = var.root_volume_size
-    encrypted   = true
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name    = "${var.name_prefix}-worker"
+      Project = "card-oracle-max"
+      Role    = "image-archive"
+    }
+  }
+}
+
+# --- ASG: diversified spot + capacity rebalancing = auto-replacement ---
+
+resource "aws_autoscaling_group" "worker" {
+  name                = "${var.name_prefix}-asg"
+  vpc_zone_identifier = data.aws_subnets.default.ids
+
+  desired_capacity = var.worker_count
+  min_size         = var.worker_count
+  max_size         = var.worker_count + 2
+
+  # Proactively replace instances AWS flags for spot interruption.
+  capacity_rebalance = true
+  health_check_type  = "EC2"
+
+  mixed_instances_policy {
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.worker.id
+        version            = "$Latest"
+      }
+      # Diversify across instance types so a reclaim of one type is replaced
+      # from another type's spot pool — the key to spot resilience.
+      dynamic "override" {
+        for_each = var.instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+    instances_distribution {
+      on_demand_base_capacity                  = var.on_demand_base_capacity
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "price-capacity-optimized"
+    }
   }
 
-  tags = {
-    Name    = "${var.name_prefix}-worker-${count.index}"
-    Project = "card-oracle-max"
-    Role    = "image-archive"
-    Worker  = tostring(count.index)
+  tag {
+    key                 = "Name"
+    value               = "${var.name_prefix}-worker"
+    propagate_at_launch = true
+  }
+
+  # Replace instances when the launch template (e.g. new code_key) changes.
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
   }
 }
