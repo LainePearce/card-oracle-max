@@ -97,6 +97,11 @@ QDRANT_PORT       = int(os.environ.get("QDRANT_HTTP_PORT",
 QDRANT_API_KEY    = os.environ.get("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "cards")
 
+# DINOv2 A/B test path (additive — never touches the live CLIP path/collection).
+DINO_COLLECTION = os.environ.get("DINO_COLLECTION", "cards_dinov2")
+DINO_VECTOR     = "image_dinov2"
+DINO_SIZE       = 512
+
 OS_HOST    = os.environ.get("OPENSEARCH_HOST", "")
 OS_USE_SSL = os.environ.get("OPENSEARCH_USE_SSL", "true").lower() == "true"
 OS_INDEX   = os.environ.get("OPENSEARCH_INDEX", "*,-*.*,-*-live*")
@@ -200,6 +205,57 @@ def get_encoder():
                 _encoder._load()
                 logger.info("CLIP ViT-L/14 ready ({}-dim)", _encoder._embedding_dim())
     return _encoder
+
+
+# DINOv2 query encoder — lazy-loaded ONLY on the first /search*_dino call, so
+# the live CLIP path is unaffected at startup and DINOv2 only takes GPU memory
+# when actually being tested.
+_dino_encoder = None
+_dino_lock    = threading.Lock()
+
+
+class _DinoEncoder:
+    """DINOv2-large @512 fp16. Matches the embed worker's config (pad-to-square
+    + 512px + fp16) so query vectors align with the cards_dinov2 index."""
+
+    def __init__(self, device):
+        import torch
+        from transformers import AutoModel, AutoImageProcessor
+        from src.embeddings.image_encoder import ImageEncoder
+        self.torch = torch
+        self.pad   = ImageEncoder._pad_to_square
+        self.proc  = AutoImageProcessor.from_pretrained("facebook/dinov2-large")
+        if hasattr(self.proc, "size"):
+            self.proc.size = {"shortest_edge": DINO_SIZE}
+        if hasattr(self.proc, "crop_size"):
+            self.proc.crop_size = {"height": DINO_SIZE, "width": DINO_SIZE}
+        self.model = AutoModel.from_pretrained(
+            "facebook/dinov2-large", torch_dtype=torch.float16).eval().to(device)
+        self.device = device
+
+    def encode(self, pil) -> "np.ndarray":
+        sq     = self.pad(pil.convert("RGB"))
+        inputs = self.proc(images=[sq], return_tensors="pt").to(self.device)
+        inputs = {k: (v.half() if v.dtype == self.torch.float32 else v)
+                  for k, v in inputs.items()}
+        with self.torch.no_grad():
+            res = self.model(**inputs)
+        emb = getattr(res, "pooler_output", None)
+        if emb is None:
+            emb = res.last_hidden_state[:, 0]
+        emb = self.torch.nn.functional.normalize(emb.float(), dim=-1)
+        return emb[0].cpu().numpy()
+
+
+def get_dino_encoder():
+    global _dino_encoder
+    if _dino_encoder is None:
+        with _dino_lock:
+            if _dino_encoder is None:
+                logger.info("Loading DINOv2-large @{} on {} ...", DINO_SIZE, EMBEDDING_DEVICE)
+                _dino_encoder = _DinoEncoder(EMBEDDING_DEVICE)
+                logger.info("DINOv2 ready (1024-d) → collection '{}'", DINO_COLLECTION)
+    return _dino_encoder
 
 
 # Qdrant client — created once and reused
@@ -436,6 +492,122 @@ def _qdrant_search_adaptive(
         )
 
     return hits, threshold, calls
+
+
+# ── DINOv2 A/B search (additive) ──────────────────────────────────────────────
+
+def _dino_search(vec, hnsw_ef, top_k, score_floor):
+    """Plain top_k search against cards_dinov2 (image_dinov2). DINOv2 cosine
+    scores sit higher and tighter than CLIP, so the CLIP score-ladder doesn't
+    transfer — score_floor here is a single optional threshold (default 0 =
+    pure top_k)."""
+    from qdrant_client.models import SearchParams, QuantizationSearchParams
+    qdrant = get_qdrant()
+    params = SearchParams(hnsw_ef=hnsw_ef, exact=False,
+                          quantization=QuantizationSearchParams(rescore=True))
+    return qdrant.search(
+        collection_name=DINO_COLLECTION,
+        query_vector=(DINO_VECTOR, vec.tolist()),
+        limit=top_k,
+        score_threshold=(score_floor if score_floor > 0 else None),
+        with_payload=True,
+        search_params=params,
+    )
+
+
+def _format_and_enrich(hits):
+    """Build the qdrant_results list and OS-enrich (shared by the DINO endpoints)."""
+    qdrant_results, os_ids = [], []
+    for h in hits:
+        os_id = str(h.payload.get("os_id", h.id))
+        qdrant_results.append({"qdrant_id": str(h.id), "os_id": os_id,
+                               "score": round(float(h.score), 4),
+                               "payload": h.payload, "doc": {}})
+        os_ids.append(os_id)
+    if os_ids and OS_BASE:
+        ids_query = {"size": len(os_ids), "query": {"ids": {"values": os_ids}},
+                     "_source": ["id", "itemId", "title", "galleryURL", "itemURL",
+                                 "saleType", "currentPrice", "currentPriceCurrency",
+                                 "endTime", "globalId", "source", "itemSpecifics"]}
+        try:
+            with httpx.Client(timeout=15, verify=False) as c:
+                r = c.post(f"{OS_BASE}/{OS_INDEX}/_search", json=ids_query, headers=OS_HEADERS)
+            os_docs = {d["_id"]: d["_source"] for d in r.json().get("hits", {}).get("hits", [])}
+            for item in qdrant_results:
+                item["doc"] = os_docs.get(item["os_id"], {})
+        except Exception as e:
+            logger.warning("OpenSearch enrichment failed: {}", e)
+    return qdrant_results
+
+
+def _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, extra):
+    t0 = time.perf_counter()
+    try:
+        vec = get_dino_encoder().encode(pil_img)
+    except Exception as e:
+        return jsonify({"error": f"DINOv2 encode failed: {e}"}), 422
+    encode_ms = int((time.perf_counter() - t0) * 1000)
+
+    t1 = time.perf_counter()
+    try:
+        hits = _dino_search(vec, hnsw_ef, top_k, score_floor)
+    except Exception as e:
+        logger.error("DINOv2 Qdrant search error: {}", e)
+        return jsonify({"error": f"Qdrant search failed: {e}"}), 500
+    qdrant_ms = int((time.perf_counter() - t1) * 1000)
+
+    t2 = time.perf_counter()
+    results = _format_and_enrich(hits)
+    enrich_ms = int((time.perf_counter() - t2) * 1000)
+    logger.info("DINOv2 search: {} hits (encode={}ms qdrant={}ms)", len(results), encode_ms, qdrant_ms)
+
+    return jsonify({**extra, "backbone": "dinov2", "collection": DINO_COLLECTION,
+                    "qdrant_results": results, "total": len(results),
+                    "top_k": top_k, "hnsw_ef": hnsw_ef, "score_floor": round(score_floor, 4),
+                    "encode_ms": encode_ms, "qdrant_ms": qdrant_ms, "enrich_ms": enrich_ms})
+
+
+@app.route("/search_dino", methods=["POST"])
+def search_dino():
+    """DINOv2 A/B test via image URL → DINOv2@512 → cards_dinov2 → OS enrich.
+    Additive — the live CLIP /search is unchanged. score_floor defaults to 0."""
+    data        = request.get_json(force=True) or {}
+    image_url   = data.get("image_url", "").strip()
+    top_k       = _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,   _DEFAULT_TOP_K)
+    hnsw_ef     = _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF, _DEFAULT_HNSW_EF)
+    score_floor = _clamp_float(data.get("score_floor"), 0.0, 1.0,          0.0)
+    if not image_url:
+        return jsonify({"error": "image_url is required"}), 400
+    try:
+        from PIL import Image as PILImage
+        from src.embeddings.image_encoder import DOWNLOAD_HEADERS, DOWNLOAD_TIMEOUT
+        resp = httpx.get(image_url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True,
+                         headers=DOWNLOAD_HEADERS)
+        resp.raise_for_status()
+        pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+    except Exception as e:
+        return jsonify({"error": f"Failed to download image: {e}"}), 422
+    return _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, {"query_image_url": image_url})
+
+
+@app.route("/search_b64_dino", methods=["POST"])
+def search_b64_dino():
+    """DINOv2 A/B test via pre-resized base64 → DINOv2@512 → cards_dinov2 → enrich.
+    Mirrors /search_b64's input contract so the UI can call it with the same payload."""
+    data        = request.get_json(force=True) or {}
+    image_b64   = data.get("image_b64", "").strip()
+    top_k       = _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,   _DEFAULT_TOP_K)
+    hnsw_ef     = _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF, _DEFAULT_HNSW_EF)
+    score_floor = _clamp_float(data.get("score_floor"), 0.0, 1.0,          0.0)
+    if not image_b64:
+        return jsonify({"error": "image_b64 is required"}), 400
+    try:
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        orig    = f"{pil_img.width}x{pil_img.height}"
+    except Exception as e:
+        return jsonify({"error": f"Failed to decode image: {e}"}), 400
+    return _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, {"image_size": orig})
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
