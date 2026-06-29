@@ -5,9 +5,9 @@ variable "aws_region" {
 }
 
 variable "instance_types" {
-  description = "CPU instance types for the ASG to diversify across (spot resilience). All ~8 vCPU equivalents; first is the launch-template default."
+  description = "CPU instance types for the ASG to diversify across (spot resilience). All ~8 vCPU, all available in us-west-1 (older region — no c7a/m7a, limited c7i AZs). First is the launch-template default."
   type        = list(string)
-  default     = ["c7i.2xlarge", "c6i.2xlarge", "m7i.2xlarge", "c7a.2xlarge", "m6i.2xlarge"]
+  default     = ["c7i.2xlarge", "c6i.2xlarge", "m6i.2xlarge", "c5.2xlarge", "m5.2xlarge"]
 }
 
 variable "worker_count" {
