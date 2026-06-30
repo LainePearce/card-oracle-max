@@ -19,7 +19,11 @@ ROOT = Path(__file__).parent.parent
 POC_COLLECTION = "cards_backbone_poc"
 DINO_IMAGE_SIZE = 512
 IMAGE_VARIANTS = ("original", "512", "256")
-RESIZE_DIMS = {"512": 512, "256": 256}   # "original" is stored as fetched
+RESIZE_DIMS = {"512": 512, "256": 256}
+# Cap the stored "original" to this longest-edge size. eBay s-l1600 is already
+# ~1600px (no-op), but non-eBay marketplaces (Fanatics/PWCC) serve full-res
+# 5MB+ images — downscaling to 1600 keeps storage/cost in line with eBay.
+ORIGINAL_MAX = 1600
 
 
 @dataclass(frozen=True)

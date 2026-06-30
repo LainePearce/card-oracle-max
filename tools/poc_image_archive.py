@@ -45,7 +45,7 @@ from src.ingestion.opensearch_reader import get_opensearch_client
 from src.ingestion.qdrant_writer import os_id_to_qdrant_id
 from tools.poc_common import (
     image_key, upsize_ebay_url, make_s3, put_image, encode_jpeg,
-    RESIZE_DIMS,
+    RESIZE_DIMS, ORIGINAL_MAX,
 )
 
 DOWNLOAD_HEADERS = {
@@ -136,7 +136,11 @@ def process_one(os_id: str, src: dict, bucket: str) -> dict | None:
         keys: dict[str, str] = {}
         sizes: dict[str, int] = {}
 
-        orig_bytes = encode_jpeg(img, quality=92)
+        # Original — cap the longest edge to ORIGINAL_MAX (downscales non-eBay
+        # hi-res like Fanatics/PWCC; no-op for eBay's already-~1600 s-l1600).
+        orig = img.copy()
+        orig.thumbnail((ORIGINAL_MAX, ORIGINAL_MAX), Image.LANCZOS)
+        orig_bytes = encode_jpeg(orig, quality=92)
         keys["original"] = image_key(os_id, "original")
         put_image(s3, bucket, keys["original"], orig_bytes)
         sizes["original"] = len(orig_bytes)
