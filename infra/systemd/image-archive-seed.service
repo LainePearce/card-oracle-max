@@ -7,4 +7,4 @@ Wants=network-online.target
 Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/card-oracle-max
-ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python tools/seed_image_archive.py --reap-stale-minutes 30
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python tools/seed_image_archive.py --start 2025-01-01 --reap-stale-minutes 30
