@@ -36,7 +36,11 @@ def main() -> None:
     args = ap.parse_args()
 
     s3 = s3_client()
-    archived = [d for d in list_dates(s3, ARCHIVE_COMPLETE) if args.start <= d <= args.end]
+    # Filter by YEAR prefix, not full-string range, so non-eBay index-name
+    # markers (e.g. "2025-gold", "2026-04-pwcc") are included alongside dated
+    # eBay days — string range comparison mis-sorts the letter suffixes.
+    y0, y1 = args.start[:4], args.end[:4]
+    archived = [d for d in list_dates(s3, ARCHIVE_COMPLETE) if y0 <= d[:4] <= y1]
     archived.sort(reverse=True)   # newest first
 
     seeded = skipped = 0
