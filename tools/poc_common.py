@@ -45,13 +45,29 @@ POC_ENCODERS: list[EncoderSpec] = [
     EncoderSpec("image_dinov3", "dinov3-vitl16", "512px-fp32-sqpad",    1024, "dinov3", False),
 ]
 
-S3_IMAGE_PREFIX = "images/ebay"   # images/ebay/{variant}/{os_id}.jpg
+S3_IMAGE_PREFIX = "images"   # images/{source}/{variant}/{os_id}.jpg
 
 
-def image_key(os_id: str, variant: str) -> str:
-    # variant-first so lifecycle rules can tier a whole variant by prefix
-    # (e.g. images/ebay/original/ -> Glacier IR) and the CDN serves images/ebay/512/.
-    return f"{S3_IMAGE_PREFIX}/{variant}/{os_id.replace('/', '_')}.jpg"
+def image_key(os_id: str, variant: str, source: str = "ebay") -> str:
+    # {source}/{variant} layout: the source segment namespaces marketplaces so an
+    # OS _id reused across different indexes/marketplaces can't overwrite another
+    # source's image. Variant within source keeps lifecycle/CDN prefix rules
+    # workable (images/{source}/original/ -> Glacier IR; CDN serves
+    # images/{source}/512/). eBay defaults to source="ebay", so existing keys
+    # (images/ebay/{variant}/...) are unchanged.
+    return f"{S3_IMAGE_PREFIX}/{source}/{variant}/{os_id.replace('/', '_')}.jpg"
+
+
+def source_for_index(index_name: str) -> str:
+    """eBay-dated YYYY-MM-DD -> 'ebay'; non-eBay -> its marketplace suffix
+    (pris/pwcc/ms/gold/heri; 'heritage' normalised to 'heri')."""
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", index_name):
+        return "ebay"
+    m = re.match(r"^\d{4}(?:-\d{2})?-(pris|pwcc|heri|heritage|ms|gold)$", index_name)
+    if not m:
+        return "other"
+    sfx = m.group(1)
+    return "heri" if sfx == "heritage" else sfx
 
 
 _SL_RE = re.compile(r"s-l\d+")

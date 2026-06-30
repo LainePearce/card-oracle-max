@@ -45,7 +45,7 @@ from src.ingestion.opensearch_reader import get_opensearch_client
 from src.ingestion.qdrant_writer import os_id_to_qdrant_id
 from tools.poc_common import (
     image_key, upsize_ebay_url, make_s3, put_image, encode_jpeg,
-    RESIZE_DIMS, ORIGINAL_MAX,
+    RESIZE_DIMS, ORIGINAL_MAX, source_for_index,
 )
 
 DOWNLOAD_HEADERS = {
@@ -111,8 +111,12 @@ def download(url: str) -> bytes | None:
         return None
 
 
-def process_one(os_id: str, src: dict, bucket: str) -> dict | None:
+def process_one(os_id: str, src: dict, bucket: str, source: str = "ebay") -> dict | None:
     """Download s-l1600, build 3 variants, upload to S3, return a manifest row.
+
+    `source` namespaces the S3 keys by marketplace (images/{source}/{variant}/...)
+    so an OS _id reused across indexes/marketplaces can't overwrite another
+    source's image. eBay days pass source="ebay" (unchanged keys).
 
     Never raises: download/decode/resize/upload are all guarded so one bad image
     or a transient S3 error can't crash a pool thread (and thence the run). A
@@ -141,7 +145,7 @@ def process_one(os_id: str, src: dict, bucket: str) -> dict | None:
         orig = img.copy()
         orig.thumbnail((ORIGINAL_MAX, ORIGINAL_MAX), Image.LANCZOS)
         orig_bytes = encode_jpeg(orig, quality=92)
-        keys["original"] = image_key(os_id, "original")
+        keys["original"] = image_key(os_id, "original", source)
         put_image(s3, bucket, keys["original"], orig_bytes)
         sizes["original"] = len(orig_bytes)
 
@@ -149,7 +153,7 @@ def process_one(os_id: str, src: dict, bucket: str) -> dict | None:
             v = img.copy()
             v.thumbnail((dim, dim), Image.LANCZOS)
             b = encode_jpeg(v, quality=88)
-            keys[name] = image_key(os_id, name)
+            keys[name] = image_key(os_id, name, source)
             put_image(s3, bucket, keys[name], b)
             sizes[name] = len(b)
 
@@ -182,15 +186,16 @@ def main() -> None:
     out_path = ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    source = source_for_index(args.date)
     os_client = get_opensearch_client()
     docs = list(fetch_window(os_client, args.date, args.limit))
-    logger.info("{}: {} cards with gallery image → archiving to s3://{}",
-                args.date, len(docs), args.bucket)
+    logger.info("{}: {} cards with gallery image → archiving to s3://{}/images/{}/",
+                args.date, len(docs), args.bucket, source)
 
     ok = fail = 0
     err_samples: list[str] = []
     with open(out_path, "w") as fout, ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(process_one, oid, src, args.bucket): oid for oid, src in docs}
+        futs = {ex.submit(process_one, oid, src, args.bucket, source): oid for oid, src in docs}
         for i, f in enumerate(as_completed(futs)):
             row = f.result()
             if row is None:
@@ -211,8 +216,8 @@ def main() -> None:
     if err_samples:
         logger.warning("Sample failures: {}", err_samples)
     logger.info("Archived {} cards ({} failed) → manifest {}", ok, fail, out_path)
-    logger.info("Each card stored as original/512/256 under s3://{}/images/ebay/",
-                args.bucket)
+    logger.info("Each card stored as original/512/256 under s3://{}/images/{}/",
+                args.bucket, source)
 
 
 if __name__ == "__main__":

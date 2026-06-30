@@ -36,6 +36,7 @@ from opensearchpy.exceptions import NotFoundError
 
 from src.ingestion.opensearch_reader import get_opensearch_client
 from tools.poc_image_archive import fetch_window, process_one
+from tools.poc_common import source_for_index
 from tools.image_archive_common import (
     s3_client, claim_next, mark_complete, release, update_active,
     QUEUE_BUCKET, IMAGE_BUCKET, MANIFESTS,
@@ -53,11 +54,15 @@ def archive_date(os_client, s3, date_str: str, workers: int) -> tuple[list[dict]
     os_total = len(docs)
     update_active(s3, date_str, {"os_total": os_total, "archived": 0, "failed": 0})
 
+    # Namespace S3 keys by marketplace (ebay for YYYY-MM-DD, else the suffix) so
+    # an OS _id reused across indexes/marketplaces can't clash.
+    source = source_for_index(date_str)
+
     rows: list[dict] = []
     ok = fail = 0
     bytes_total = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(process_one, oid, src, IMAGE_BUCKET): oid for oid, src in docs}
+        futs = {ex.submit(process_one, oid, src, IMAGE_BUCKET, source): oid for oid, src in docs}
         for i, f in enumerate(as_completed(futs)):
             r = f.result()
             if r is None or "_error" in r:
