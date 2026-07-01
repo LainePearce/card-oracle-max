@@ -39,6 +39,17 @@ from tools.backfill_dashboard import (
 
 POLL_INTERVAL = 60
 CALENDAR_START = date(2026, 1, 1)
+
+
+def _is_date(s: str) -> bool:
+    """True only for YYYY-MM-DD marker names. Non-eBay index names (2025-gold,
+    2026-04-pwcc) are excluded from the date calendar — they'd break the
+    frontend's date parsing and hang the coverage grid on 'Loading'."""
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
 SERVICE = "image-archive"
 
 
@@ -82,16 +93,22 @@ def poll_s3_state() -> dict:
     total_os       = sum(m.get("os_total", 0) for m in markers.values())
     total_bytes    = sum(m.get("bytes", 0) for m in markers.values())
 
+    # Only YYYY-MM-DD markers go in the date calendar; non-eBay index-name
+    # markers (2025-gold, 2026-04-pwcc) still count in totals + the Active table.
     coverage: dict[str, str] = {}
     per_day: dict[str, dict] = {}
     for d in complete:
+        if not _is_date(d):
+            continue
         coverage[d] = "complete"
         per_day[d] = {"archived": markers.get(d, {}).get("archived", 0),
                       "os_total": markers.get(d, {}).get("os_total", 0)}
     for d in active:
-        coverage[d] = "active"
+        if _is_date(d):
+            coverage[d] = "active"
     for d in queued:
-        coverage.setdefault(d, "queued")
+        if _is_date(d):
+            coverage.setdefault(d, "queued")
 
     today = date.today()
     dd = CALENDAR_START
