@@ -70,6 +70,26 @@ def write_manifest(s3, date_str: str, rows: list[dict]) -> None:
                   Key=f"{MANIFESTS}/{date_str}.jsonl.gz", Body=buf.getvalue())
 
 
+_NONEBAY_MONTHLY = ("pris", "pwcc")
+_NONEBAY_ANNUAL  = ("heri", "heritage", "ms", "gold")
+
+
+def recent_nonebay_indices(os_client, today) -> list[str]:
+    """Non-eBay indices where new listings currently land: this + previous
+    month's monthly pris/pwcc, and this year's annual heri/heritage/ms/gold.
+    Intersected with indices that actually exist so we never query a missing one."""
+    cat = os_client.cat.indices(h="index", format="json", request_timeout=60)
+    existing = {r["index"] for r in cat}
+    prev = today.replace(day=1) - timedelta(days=1)   # last day of previous month
+    targets = set()
+    for yr, mo in {(today.year, today.month), (prev.year, prev.month)}:
+        for typ in _NONEBAY_MONTHLY:
+            targets.add(f"{yr}-{mo:02d}-{typ}")
+    for typ in _NONEBAY_ANNUAL:
+        targets.add(f"{today.year}-{typ}")
+    return sorted(targets & existing)
+
+
 def incremental_day(os_client, s3, date_str: str, workers: int) -> tuple[int, int]:
     """Archive only images missing from the manifest for one day.
     Returns (new_archived, os_total)."""
@@ -108,25 +128,31 @@ def incremental_day(os_client, s3, date_str: str, workers: int) -> tuple[int, in
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--days", type=int, default=2,
-                    help="How many recent days to re-scan (today going back). Default 2.")
+                    help="How many recent eBay days to re-scan (today going back). Default 2.")
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--no-nonebay", action="store_true",
+                    help="Skip the current non-eBay marketplace indices (eBay days only).")
     args = ap.parse_args()
 
     s3 = s3_client()
     os_client = get_opensearch_client()
     today = date.today()
 
+    # eBay dated days + the non-eBay indices where new listings currently land.
+    indices = [(today - timedelta(days=i)).isoformat() for i in range(args.days)]
+    if not args.no_nonebay:
+        indices += recent_nonebay_indices(os_client, today)
+
     total_new = 0
-    for i in range(args.days):
-        d = (today - timedelta(days=i)).isoformat()
+    for idx in indices:
         t0 = time.time()
-        new, os_total = incremental_day(os_client, s3, d, args.workers)
+        new, os_total = incremental_day(os_client, s3, idx, args.workers)
         total_new += new
         logger.info("{}: +{} new images ({} docs in OS) in {:.0f}s",
-                    d, new, os_total, time.time() - t0)
+                    idx, new, os_total, time.time() - t0)
 
-    logger.info("Incremental run complete — {} new images across last {} day(s)",
-                total_new, args.days)
+    logger.info("Incremental run complete — {} new images across {} indices "
+                "(eBay days + non-eBay)", total_new, len(indices))
 
 
 if __name__ == "__main__":
