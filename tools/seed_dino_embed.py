@@ -28,19 +28,31 @@ from loguru import logger
 from tools.dino_embed_common import s3_client, seed_date, reap_stale, list_dates, ARCHIVE_COMPLETE
 
 
+def _is_date(s: str) -> bool:
+    """True only for YYYY-MM-DD (eBay) marker names."""
+    p = s.split("-")
+    return len(p) == 3 and len(p[0]) == 4 and all(x.isdigit() for x in p)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--start", default="2026-01-01")
     ap.add_argument("--end", default="2026-12-31")
     ap.add_argument("--reap-stale-minutes", type=float, default=0)
+    ap.add_argument("--include-nonebay", action="store_true",
+                    help="Also embed non-eBay index markers (2025-gold, 2026-pwcc). "
+                         "OFF by default so eBay dates are embedded first — enable "
+                         "only once the eBay backlog is drained.")
     args = ap.parse_args()
 
     s3 = s3_client()
-    # Filter by YEAR prefix, not full-string range, so non-eBay index-name
-    # markers (e.g. "2025-gold", "2026-04-pwcc") are included alongside dated
-    # eBay days — string range comparison mis-sorts the letter suffixes.
+    # Filter by YEAR prefix (not full-string range — that mis-sorts the letter
+    # suffixes). By default embed eBay dates ONLY: non-eBay index names sort
+    # above dates and would otherwise jump the embed queue ahead of the eBay
+    # backlog. --include-nonebay opts them in once eBay is done.
     y0, y1 = args.start[:4], args.end[:4]
-    archived = [d for d in list_dates(s3, ARCHIVE_COMPLETE) if y0 <= d[:4] <= y1]
+    archived = [d for d in list_dates(s3, ARCHIVE_COMPLETE)
+                if y0 <= d[:4] <= y1 and (args.include_nonebay or _is_date(d))]
     archived.sort(reverse=True)   # newest first
 
     seeded = skipped = 0
