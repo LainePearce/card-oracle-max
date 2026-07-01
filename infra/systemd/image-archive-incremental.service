@@ -1,0 +1,10 @@
+[Unit]
+Description=Card Oracle hourly incremental image archiver (recent OS days -> S3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/card-oracle-max
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python tools/image_archive_incremental.py --days 2 --workers 12

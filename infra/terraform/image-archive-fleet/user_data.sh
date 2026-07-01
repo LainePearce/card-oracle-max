@@ -49,26 +49,13 @@ python3.11 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install -q -r "$APP/requirements-image-archive.txt"
 chown -R ec2-user:ec2-user "$APP"
 
-# --- 7. systemd service ---
-cat > /etc/systemd/system/image-archive.service <<SVCEOF
-[Unit]
-Description=Card Oracle image-archive worker (CPU, ASG)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=ec2-user
-WorkingDirectory=$APP
-ExecStart=$APP/.venv/bin/python -u tools/image_archive_worker.py --workers ${download_workers} --loop
-Restart=on-failure
-RestartSec=15
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
+# --- 7. systemd: hourly incremental archiver (steady-state) ---
+# Installs the repo's incremental units and runs them on an hourly timer instead
+# of the continuous backfill loop. To re-drain history instead, bump worker_count
+# and swap this for image-archive.service (--loop).
+cp "$APP/infra/systemd/image-archive-incremental.service" /etc/systemd/system/
+cp "$APP/infra/systemd/image-archive-incremental.timer"   /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now image-archive
+systemctl enable --now image-archive-incremental.timer
 
-echo "=== bootstrap complete — image-archive started ==="
+echo "=== bootstrap complete — hourly incremental archiver enabled ==="

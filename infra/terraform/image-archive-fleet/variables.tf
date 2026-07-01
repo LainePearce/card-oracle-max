@@ -11,9 +11,9 @@ variable "instance_types" {
 }
 
 variable "worker_count" {
-  description = "Desired ASG size (= min). 6 for the 2025 historical drain; 1 for in-service daily downloads."
+  description = "Desired ASG size (= min). 1 for in-service hourly incremental downloads; bump to 6 for a historical re-drain."
   type        = number
-  default     = 6
+  default     = 1
 }
 
 variable "on_demand_base_capacity" {
