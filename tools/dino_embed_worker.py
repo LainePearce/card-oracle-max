@@ -39,7 +39,13 @@ from qdrant_client.models import (
 
 from src.embeddings.vector_store import S3VectorStore, VectorRecord, SHARD_SIZE
 from src.ingestion.qdrant_writer import get_qdrant_client, extract_payload
-from tools.poc_common import get_image_pil, image_key
+from tools.poc_common import get_image_pil, image_key, source_for_index
+
+
+def _point_id(qid: str):
+    """Qdrant point id: uint64 for numeric eBay os_ids, UUID string otherwise
+    (non-eBay _ids are UUIDs). Qdrant accepts both — forcing int() crashes on UUIDs."""
+    return int(qid) if qid.isdigit() else qid
 from tools.eval_retrieval_at_scale import build_encoder
 from tools.eval_parallel_discrimination import _pick_device
 from tools.dino_embed_common import (
@@ -111,6 +117,10 @@ def embed_day(date_str, encode, client, store, s3, pool, batch) -> dict:
         return {"embedded": 0, "total": 0, "note": "no manifest"}
     total = len(rows)
     job_id = f"dino-{date_str}"
+    # eBay dated days keep the historical "ebay-dated" index_type (don't change
+    # it — 57.86M vectors are stored under it); non-eBay uses its marketplace.
+    source = source_for_index(date_str)
+    itype  = "ebay-dated" if source == "ebay" else source
     update_active(s3, date_str, {"total": total, "vectors": 0})
 
     shard_buf: list[VectorRecord] = []
@@ -124,14 +134,14 @@ def embed_day(date_str, encode, client, store, s3, pool, batch) -> dict:
             vl = v.tolist()
             shard_buf.append(VectorRecord(
                 os_id=r["os_id"], qdrant_id=r["qdrant_id"],
-                index_name=date_str, index_type="ebay-dated",
+                index_name=date_str, index_type=itype,
                 vector=vl, vector_type="image",
                 model_id=MODEL_ID, params_hash=PARAMS,
                 job_id=job_id, source_url=r.get("gallery_url", "")))
             payload = extract_payload(r["source_doc"], doc_id=r["os_id"])
             payload["img_512"] = r["s3_keys"].get("512", "")
             payload["img_256"] = r["s3_keys"].get("256", "")
-            points.append(PointStruct(id=int(r["qdrant_id"]),
+            points.append(PointStruct(id=_point_id(r["qdrant_id"]),
                                       vector={VEC_NAME: vl}, payload=payload))
         # S3 (durable) before Qdrant; flush whole shards as they fill.
         while len(shard_buf) >= SHARD_SIZE:
