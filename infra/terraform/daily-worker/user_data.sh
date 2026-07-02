@@ -71,8 +71,8 @@ Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/card-oracle-max
 Environment=PATH=/home/ec2-user/card-oracle-max/.venv/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python tools/daily_update.py \
-    --lookback-days ${lookback_days}
+ExecStart=/home/ec2-user/card-oracle-max/.venv/bin/python tools/daily_dual_embed.py \
+    --days ${lookback_days}
 StandardOutput=journal
 StandardError=journal
 
