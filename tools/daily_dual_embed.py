@@ -139,10 +139,18 @@ def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
             shard_n += 1
         return shard_n
 
+    load_failed = 0
     for i in range(0, total, batch):
         chunk = rows[i:i + batch]
         raw = list(pool.map(lambda r: load_one(s3, r), chunk))
         keep = [(r, im) for r, im in zip(chunk, raw) if im is not None]
+        load_failed += len(chunk) - len(keep)
+        # Fail loudly on systemic image-fetch failure (IAM/bucket/key issues) —
+        # otherwise the run "completes" at 0 embedded and marks the day done.
+        if load_failed >= 100 and embedded == 0:
+            raise RuntimeError(
+                f"{load_failed} consecutive S3 image loads failed for {date_str} "
+                f"(bucket={IMAGE_BUCKET}) — aborting instead of marking complete")
         if not keep:
             continue
         sub  = [r for r, _ in keep]
