@@ -70,8 +70,11 @@ def ensure_collection(client) -> None:
             vectors_config={VEC_NAME: VectorParams(
                 size=1024, distance=Distance.COSINE, on_disk=True,
                 hnsw_config=HnswConfigDiff(m=16, ef_construct=200, on_disk=True))},
+            # always_ram=False is deliberate: True pinned ~59GB+/node of quantized
+            # vectors in RAM on top of `cards`, OOM-killing the qdrant cluster
+            # (2026-07-03 outage). Quantized vectors page from disk instead.
             quantization_config=ScalarQuantization(scalar=ScalarQuantizationConfig(
-                type=ScalarType.INT8, quantile=0.99, always_ram=True)),
+                type=ScalarType.INT8, quantile=0.99, always_ram=False)),
             optimizers_config=OptimizersConfigDiff(indexing_threshold=50_000,
                                                    memmap_threshold=50_000),
             on_disk_payload=True,
