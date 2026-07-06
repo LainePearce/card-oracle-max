@@ -93,7 +93,10 @@ def poc_job_id(date_str: str) -> str:
 
 def make_s3():
     import boto3
-    return boto3.client("s3")
+    from botocore.config import Config
+    # Pool sized above our download thread counts (12-16) — the default 10
+    # causes constant "Connection pool is full, discarding connection" churn.
+    return boto3.client("s3", config=Config(max_pool_connections=32))
 
 
 def put_image(s3, bucket: str, key: str, jpeg_bytes: bytes) -> None:
