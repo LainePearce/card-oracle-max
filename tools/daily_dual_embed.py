@@ -219,7 +219,10 @@ def build_index_list(os_client_getter, s3, args) -> list[str]:
     if args.date:
         return [args.date]
     today = date.today()
-    idx = [(today - timedelta(days=i)).isoformat() for i in range(args.days)]
+    # Only COMPLETED days (yesterday backward). Including today would mark it
+    # complete mid-day and the per-day marker would skip the rest of its
+    # listings forever. Today's day gets embedded tomorrow, fully.
+    idx = [(today - timedelta(days=i)).isoformat() for i in range(1, args.days + 1)]
     if not args.no_nonebay:
         idx += recent_nonebay_indices(os_client_getter(), today)
     return idx
