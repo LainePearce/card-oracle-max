@@ -132,16 +132,23 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--no-nonebay", action="store_true",
                     help="Skip the current non-eBay marketplace indices (eBay days only).")
+    ap.add_argument("--index", nargs="+", default=None,
+                    help="Re-scan specific indices instead of the recent-days set. "
+                         "Retries anything missing from each index's manifest — the "
+                         "second-pass mechanism for transient download failures.")
     args = ap.parse_args()
 
     s3 = s3_client()
     os_client = get_opensearch_client()
     today = date.today()
 
-    # eBay dated days + the non-eBay indices where new listings currently land.
-    indices = [(today - timedelta(days=i)).isoformat() for i in range(args.days)]
-    if not args.no_nonebay:
-        indices += recent_nonebay_indices(os_client, today)
+    if args.index:
+        indices = args.index
+    else:
+        # eBay dated days + the non-eBay indices where new listings currently land.
+        indices = [(today - timedelta(days=i)).isoformat() for i in range(args.days)]
+        if not args.no_nonebay:
+            indices += recent_nonebay_indices(os_client, today)
 
     total_new = 0
     for idx in indices:
