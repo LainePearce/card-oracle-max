@@ -35,9 +35,10 @@ from loguru import logger
 from src.ingestion.opensearch_reader import get_opensearch_client
 from tools.image_archive_common import s3_client, seed_date
 
-# Non-eBay index naming (mirrors seed_nonebay_backfill.py).
+# Non-eBay index naming. PWCC is ANNUAL pre-2021 (2008-pwcc .. 2020-pwcc) and
+# monthly from 2021 on — the annual pattern must include pwcc/pris too.
 _MONTHLY = re.compile(r"^(\d{4})-\d{2}-(pris|pwcc)$")
-_ANNUAL  = re.compile(r"^(\d{4})-(heri|heritage|ms|gold)$")
+_ANNUAL  = re.compile(r"^(\d{4})-(pris|pwcc|heri|heritage|ms|gold)$")
 
 
 def discover_nonebay(os_client, years: set[str], include: set[str] | None) -> list[str]:
