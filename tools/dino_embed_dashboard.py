@@ -100,6 +100,28 @@ def poll_s3_state() -> dict:
         coverage.setdefault(dd.isoformat(), "not_in_queue")
         dd += timedelta(days=1)
 
+    # Non-eBay marketplace indices (non-date marker names) — one row per index
+    # with its embed status + counts, for the backfill table.
+    active_by_name = {j["date"]: j for j in active_jobs}
+    rank = {"active": 0, "queued": 1, "complete": 2}
+    nonebay: list[dict] = []
+    for n in sorted(set(queued + active + complete)):
+        if _is_date(n):
+            continue
+        if n in active:
+            j = active_by_name.get(n, {})
+            nonebay.append({"index": n, "status": "active",
+                            "embedded": j.get("vectors", 0), "total": j.get("total", 0),
+                            "host": j.get("host", ""),
+                            "updated_at": j.get("updated_at") or j.get("claimed_at")})
+        elif n in complete:
+            m = markers.get(n, {})
+            nonebay.append({"index": n, "status": "complete",
+                            "embedded": m.get("embedded", 0), "total": m.get("total", 0)})
+        else:
+            nonebay.append({"index": n, "status": "queued"})
+    nonebay.sort(key=lambda r: (rank.get(r["status"], 3), r["index"]))
+
     return {
         "days_complete": len(complete),
         "days_active":   len(active),
@@ -108,6 +130,7 @@ def poll_s3_state() -> dict:
         "coverage":      coverage,
         "per_day":       per_day,
         "active_jobs":   active_jobs,
+        "nonebay":       nonebay,
     }
 
 
@@ -235,6 +258,9 @@ header h1{font-size:18px}header h1 span{color:var(--blue)}.header-meta{font-size
 <div class="section-title" style="margin:0">2026 Embed Coverage</div>
 <div class="legend"><div class="legend-item"><div class="legend-dot complete"></div>Embedded</div><div class="legend-item"><div class="legend-dot active"></div>Active</div><div class="legend-item"><div class="legend-dot queued"></div>Queued</div><div class="legend-item"><div class="legend-dot not_in_queue"></div>Not queued</div></div></div>
 <div class="calendar-grid" id="calendar"><div class="loading">Loading…</div></div></div>
+<div class="section"><div class="section-title">Non-eBay Marketplace Backfill — per index</div>
+<div style="overflow-x:auto"><table class="worker-table"><thead><tr><th>Index</th><th>Status</th><th>Embedded</th><th>Manifest total</th><th>Coverage</th><th>Updated</th></tr></thead>
+<tbody id="nonebay"><tr><td colspan="6" class="loading">Loading…</td></tr></tbody></table></div></div>
 <div class="section"><div class="section-title">Worker Fleet — dino-embed service</div>
 <div style="overflow-x:auto"><table class="worker-table"><thead><tr><th>#</th><th>IP</th><th>Service</th><th>Last log line</th></tr></thead>
 <tbody id="workers"><tr><td colspan="4" class="loading">Loading…</td></tr></tbody></table></div></div>
@@ -274,6 +300,14 @@ function renderCal(cov,perday){const grid=document.getElementById('calendar');
     return `<div class="month-block"><div class="month-name">${MN[m-1]} ${y}</div><div class="days-grid">${hc}${ec}${cells.join('')}</div></div>`;
   }).join('');
 }
+function renderNonebay(rows){const tb=document.getElementById('nonebay');
+  if(!rows||!rows.length){tb.innerHTML='<tr><td colspan="6" class="svc-unknown" style="text-align:center;padding:14px">No non-eBay indices seeded</td></tr>';return;}
+  tb.innerHTML=rows.map(r=>{const a=r.embedded||0,t=r.total||0;const pct=t?Math.min(100,a/t*100):0;
+    const st=r.status==='complete'?'<span class="svc-active">✓ complete</span>':r.status==='active'?'<span style="color:var(--yellow);font-weight:700">● active</span>':'<span style="color:var(--muted)">◌ queued</span>';
+    const cov=r.status==='queued'?'—':`<div style="display:flex;align-items:center;gap:6px"><div style="background:var(--gray-dim);border-radius:3px;height:7px;width:80px;overflow:hidden"><div style="height:100%;background:${pct>=95?'var(--green)':pct>=60?'var(--yellow)':'var(--red)'};width:${pct}%"></div></div><span style="font-size:10px;color:var(--muted)">${pct.toFixed(0)}%</span></div>`;
+    return `<tr><td><b>${r.index}</b></td><td>${st}</td><td>${r.status==='queued'?'—':fmt(a)}</td><td>${r.status==='queued'?'—':fmt(t)}</td><td>${cov}</td><td class="ip">${r.updated_at?fmtTime(r.updated_at):'—'}</td></tr>`;
+  }).join('');
+}
 function renderWorkers(ws){const tb=document.getElementById('workers');
   if(!ws||!ws.length){tb.innerHTML='<tr><td colspan="4" class="loading">Loading…</td></tr>';return;}
   tb.innerHTML=ws.map(w=>{const svc=w.service??'unknown';const cls=svc==='active'?'svc-active':svc==='unknown'||svc==='—'?'svc-unknown':'svc-inactive';
@@ -282,7 +316,7 @@ function renderWorkers(ws){const tb=document.getElementById('workers');
 }
 async function tick(){try{const r=await fetch('/api/status');const d=await r.json();
   nextT=d.next_update_at?new Date(d.next_update_at).getTime():Date.now()+60000;
-  renderSummary(d);renderActive(d.active_jobs||[]);renderCal(d.coverage||{},d.per_day||{});renderWorkers(d.workers||[]);}catch(e){console.error(e);}}
+  renderSummary(d);renderActive(d.active_jobs||[]);renderCal(d.coverage||{},d.per_day||{});renderNonebay(d.nonebay||[]);renderWorkers(d.workers||[]);}catch(e){console.error(e);}}
 setInterval(()=>{if(nextT)document.getElementById('countdown').textContent=Math.max(0,Math.round((nextT-Date.now())/1000))+'s';},1000);
 tick();setInterval(tick,60000);
 </script></body></html>"""
