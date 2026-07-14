@@ -1,0 +1,10 @@
+[Unit]
+Description=Push qdrant memory metrics every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
