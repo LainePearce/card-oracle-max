@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
 #
-# One-time setup for qdrant memory alarms (run from an admin laptop).
+# One-time setup for qdrant memory alarms with SLACK notifications
+# (run from an admin laptop).
 #
 # Creates: IAM permission for worker-0's role to publish CloudWatch metrics,
-# an SNS topic + email subscription, and per-node alarms on the custom metrics
+# an SNS topic, a small Lambda that formats CloudWatch alarm events and posts
+# them to a Slack incoming webhook, and per-node alarms on the custom metrics
 # published by tools/qdrant_memory_metrics.py (worker-0, 1-min timer):
 #   - MemoryUsedPercent > 85 for 3 consecutive minutes
 #   - SwapUsedGB > 40 for 5 consecutive minutes (active thrash signal)
 #   - NodeUnreachable >= 1 for 3 consecutive minutes (frozen-box signal)
 #
+# Prereq: a Slack incoming webhook URL for the target channel
+# (Slack: create app -> Incoming Webhooks -> Add New Webhook to Workspace).
+#
 # Usage:
-#   ALERT_EMAIL=130point@gmail.com ./infra/scripts/setup-qdrant-alarms.sh
+#   SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T…/B…/x… \
+#     ./infra/scripts/setup-qdrant-alarms.sh
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-1}"
-EMAIL="${ALERT_EMAIL:?set ALERT_EMAIL}"
+WEBHOOK="${SLACK_WEBHOOK_URL:?set SLACK_WEBHOOK_URL (Slack incoming webhook)}"
 NAMESPACE="CardOracle/Qdrant"
 NODES=(node-0 node-1 node-2)
+FN_NAME="qdrant-alerts-to-slack"
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 
 echo "== IAM: allow worker-0's role to put metrics =="
 PROFILE=$(aws ec2 describe-instances --region "$REGION" \
@@ -28,10 +36,71 @@ echo "worker-0 role: $ROLE"
 aws iam put-role-policy --role-name "$ROLE" --policy-name cloudwatch-put-metrics \
   --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cloudwatch:PutMetricData","Resource":"*"}]}'
 
-echo "== SNS topic + email subscription =="
+echo "== SNS topic =="
 TOPIC=$(aws sns create-topic --region "$REGION" --name qdrant-alerts --query TopicArn --output text)
-aws sns subscribe --region "$REGION" --topic-arn "$TOPIC" --protocol email --notification-endpoint "$EMAIL" >/dev/null
-echo "topic: $TOPIC  (CONFIRM THE SUBSCRIPTION EMAIL sent to $EMAIL)"
+echo "topic: $TOPIC"
+
+echo "== Lambda execution role =="
+LROLE="qdrant-alerts-slack-role"
+aws iam create-role --role-name "$LROLE" --assume-role-policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' 2>/dev/null \
+  || echo "role exists"
+aws iam attach-role-policy --role-name "$LROLE" \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+echo "waiting 10s for role propagation"; sleep 10
+
+echo "== Lambda function =="
+WORKDIR=$(mktemp -d)
+cat > "$WORKDIR/index.py" << 'PYEOF'
+import json, os, urllib.request
+
+EMOJI = {"ALARM": ":rotating_light:", "OK": ":white_check_mark:",
+         "INSUFFICIENT_DATA": ":grey_question:"}
+
+def handler(event, context):
+    for rec in event.get("Records", []):
+        msg = json.loads(rec["Sns"]["Message"])
+        state = msg.get("NewStateValue", "?")
+        name = msg.get("AlarmName", "?")
+        reason = msg.get("NewStateReason", "")
+        node = next((d["value"] for d in
+                     msg.get("Trigger", {}).get("Dimensions", [])
+                     if d.get("name") == "Node"), "?")
+        metric = msg.get("Trigger", {}).get("MetricName", "?")
+        text = (f"{EMOJI.get(state, ':bell:')} *{name}* is *{state}*\n"
+                f"> node: `{node}`  metric: `{metric}`\n> {reason}")
+        body = json.dumps({"text": text}).encode()
+        req = urllib.request.Request(
+            os.environ["SLACK_WEBHOOK_URL"], data=body,
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    return {"ok": True}
+PYEOF
+(cd "$WORKDIR" && zip -q fn.zip index.py)
+
+if aws lambda get-function --region "$REGION" --function-name "$FN_NAME" >/dev/null 2>&1; then
+  aws lambda update-function-code --region "$REGION" --function-name "$FN_NAME" \
+    --zip-file "fileb://$WORKDIR/fn.zip" >/dev/null
+  aws lambda update-function-configuration --region "$REGION" --function-name "$FN_NAME" \
+    --environment "Variables={SLACK_WEBHOOK_URL=$WEBHOOK}" >/dev/null
+  echo "lambda updated"
+else
+  aws lambda create-function --region "$REGION" --function-name "$FN_NAME" \
+    --runtime python3.12 --handler index.handler \
+    --role "arn:aws:iam::${ACCOUNT}:role/${LROLE}" \
+    --zip-file "fileb://$WORKDIR/fn.zip" --timeout 15 \
+    --environment "Variables={SLACK_WEBHOOK_URL=$WEBHOOK}" >/dev/null
+  echo "lambda created"
+fi
+rm -rf "$WORKDIR"
+
+echo "== Wire SNS -> Lambda =="
+aws lambda add-permission --region "$REGION" --function-name "$FN_NAME" \
+  --statement-id sns-qdrant-alerts --action lambda:InvokeFunction \
+  --principal sns.amazonaws.com --source-arn "$TOPIC" 2>/dev/null || echo "permission exists"
+aws sns subscribe --region "$REGION" --topic-arn "$TOPIC" --protocol lambda \
+  --notification-endpoint "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${FN_NAME}" >/dev/null
+echo "subscribed"
 
 echo "== Alarms =="
 for node in "${NODES[@]}"; do
@@ -65,4 +134,10 @@ for node in "${NODES[@]}"; do
     --treat-missing-data breaching \
     --alarm-actions "$TOPIC" --ok-actions "$TOPIC"
 done
-echo "9 alarms created. Done — enable the metrics timer on worker-0 to start data flowing."
+
+echo "== Test message =="
+aws lambda invoke --region "$REGION" --function-name "$FN_NAME" --payload \
+  '{"Records":[{"Sns":{"Message":"{\"AlarmName\":\"qdrant-alerts-setup-test\",\"NewStateValue\":\"OK\",\"NewStateReason\":\"Setup complete — this is a test message.\",\"Trigger\":{\"MetricName\":\"Setup\",\"Dimensions\":[{\"name\":\"Node\",\"value\":\"all\"}]}}"}}]}' \
+  --cli-binary-format raw-in-base64-out /dev/null >/dev/null && echo "test message sent — check the Slack channel"
+
+echo "9 alarms created, Slack wired. Enable the metrics timer on worker-0 to start data flowing."
