@@ -8,7 +8,9 @@
 # them to a Slack incoming webhook, and per-node alarms on the custom metrics
 # published by tools/qdrant_memory_metrics.py (worker-0, 1-min timer):
 #   - MemoryUsedPercent > 85 for 3 consecutive minutes
-#   - SwapUsedGB > 40 for 5 consecutive minutes (active thrash signal)
+#   - SwapUsedGB > 58 for 5 consecutive minutes (near-exhaustion of the 64G
+#     swapfile — the July OOM precursor; steady-state parks ~40-60G of cold
+#     pages in swap, so lower thresholds flap)
 #   - NodeUnreachable >= 1 for 3 consecutive minutes (frozen-box signal)
 #
 # Prereq: a Slack incoming webhook URL for the target channel
@@ -116,11 +118,11 @@ for node in "${NODES[@]}"; do
 
   aws cloudwatch put-metric-alarm --region "$REGION" \
     --alarm-name "qdrant-${node}-swap-thrash" \
-    --alarm-description "qdrant ${node} swap >40GB for 5 min" \
+    --alarm-description "qdrant ${node} swap >58GB for 5 min (near-full 64G swapfile)" \
     --namespace "$NAMESPACE" --metric-name SwapUsedGB \
     --dimensions "Name=Node,Value=${node}" \
     --statistic Maximum --period 60 --evaluation-periods 5 \
-    --threshold 40 --comparison-operator GreaterThanThreshold \
+    --threshold 58 --comparison-operator GreaterThanThreshold \
     --treat-missing-data notBreaching \
     --alarm-actions "$TOPIC" --ok-actions "$TOPIC"
 
