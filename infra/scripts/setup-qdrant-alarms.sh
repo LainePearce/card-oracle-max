@@ -83,8 +83,10 @@ PYEOF
 if aws lambda get-function --region "$REGION" --function-name "$FN_NAME" >/dev/null 2>&1; then
   aws lambda update-function-code --region "$REGION" --function-name "$FN_NAME" \
     --zip-file "fileb://$WORKDIR/fn.zip" >/dev/null
+  aws lambda wait function-updated --region "$REGION" --function-name "$FN_NAME"
   aws lambda update-function-configuration --region "$REGION" --function-name "$FN_NAME" \
     --environment "Variables={SLACK_WEBHOOK_URL=$WEBHOOK}" >/dev/null
+  aws lambda wait function-updated --region "$REGION" --function-name "$FN_NAME"
   echo "lambda updated"
 else
   aws lambda create-function --region "$REGION" --function-name "$FN_NAME" \
@@ -92,6 +94,7 @@ else
     --role "arn:aws:iam::${ACCOUNT}:role/${LROLE}" \
     --zip-file "fileb://$WORKDIR/fn.zip" --timeout 15 \
     --environment "Variables={SLACK_WEBHOOK_URL=$WEBHOOK}" >/dev/null
+  aws lambda wait function-active --region "$REGION" --function-name "$FN_NAME"
   echo "lambda created"
 fi
 rm -rf "$WORKDIR"
