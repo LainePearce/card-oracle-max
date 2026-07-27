@@ -216,8 +216,16 @@ def thumb(os_id: str):
             _thumb_cache[os_id] = key
             return Response(obj["Body"].read(), mimetype="image/jpeg",
                             headers={"Cache-Control": "max-age=86400"})
-        except Exception:
-            continue
+        except Exception as e:
+            # A plain missing key is the normal miss path; anything else
+            # (NoSuchBucket, AccessDenied, NoCredentials, region) means the
+            # proxy itself is broken — surface it instead of blanket-404ing.
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                continue
+            logger.warning("thumb S3 error ({}): {} — bucket={} key={}",
+                           code or type(e).__name__, e, IMAGE_BUCKET, key)
+            return Response(status=502)
     _thumb_cache[os_id] = None
     return Response(status=404)
 
