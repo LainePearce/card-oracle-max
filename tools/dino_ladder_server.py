@@ -84,26 +84,66 @@ _ENRICH_FIELDS = ["id", "itemId", "title", "galleryURL", "itemURL", "saleType",
                   "source", "itemSpecifics"]
 
 
+def _os_search(body: dict) -> list[dict]:
+    with httpx.Client(timeout=30, verify=False) as c:
+        r = c.post(f"{OS_BASE}/{OS_INDEX}/_search", json=body, headers=OS_HEADERS)
+        r.raise_for_status()
+    return r.json().get("hits", {}).get("hits", [])
+
+
 def _reenrich(results: list[dict]) -> None:
-    """Fill empty docs in-place via a terms query on the numeric `id` field."""
-    missing = {r["os_id"]: r for r in results
-               if not r.get("doc") and str(r.get("os_id", "")).isdigit()}
+    """
+    Fill empty docs in-place for results the worker's enrichment missed
+    (points whose payload os_id holds the numeric `id`-field value, not the
+    OS _id).
+
+    Primary path: the OS _id IS the document's itemId, and the payload carries
+    it as item_id — an ids query on that is exact and unique. Fallback for
+    results without item_id: terms query on the numeric `id` field, which is
+    NOT unique across indices, so duplicate hits are disambiguated by the
+    payload's global_id (e.g. ebay-us vs gold-us).
+    """
+    missing = [r for r in results if not r.get("doc")]
     if not missing:
         return
-    body = {"size": len(missing), "track_scores": False,
-            "query": {"terms": {"id": [int(i) for i in missing]}},
-            "_source": _ENRICH_FIELDS}
     try:
-        with httpx.Client(timeout=30, verify=False) as c:
-            r = c.post(f"{OS_BASE}/{OS_INDEX}/_search", json=body, headers=OS_HEADERS)
-            r.raise_for_status()
-        for hit in r.json().get("hits", {}).get("hits", []):
-            src = hit.get("_source", {})
-            rec = missing.get(str(src.get("id", "")))
-            if rec is not None:
-                rec["doc"] = src
-        logger.info("re-enriched {}/{} docs via id-field terms query",
-                    sum(1 for r in missing.values() if r["doc"]), len(missing))
+        by_item_id: dict[str, dict] = {}
+        for r in missing:
+            iid = str((r.get("payload") or {}).get("item_id", "")).strip()
+            if iid:
+                by_item_id.setdefault(iid, r)
+        if by_item_id:
+            hits = _os_search({"size": len(by_item_id), "track_scores": False,
+                               "query": {"ids": {"values": list(by_item_id)}},
+                               "_source": _ENRICH_FIELDS})
+            for hit in hits:
+                rec = by_item_id.get(str(hit.get("_id", "")))
+                if rec is not None:
+                    rec["doc"] = hit.get("_source", {})
+
+        leftovers = [r for r in missing
+                     if not r.get("doc") and str(r.get("os_id", "")).isdigit()]
+        if leftovers:
+            hits = _os_search({"size": min(1000, 3 * len(leftovers)),
+                               "track_scores": False,
+                               "query": {"terms": {"id": [int(r["os_id"]) for r in leftovers]}},
+                               "_source": _ENRICH_FIELDS})
+            by_num: dict[str, list[dict]] = {}
+            for hit in hits:
+                src = hit.get("_source", {})
+                by_num.setdefault(str(src.get("id", "")), []).append(src)
+            for r in leftovers:
+                cands = by_num.get(str(r["os_id"]), [])
+                if not cands:
+                    continue
+                gid = str((r.get("payload") or {}).get("global_id", "")).lower()
+                match = next((c for c in cands
+                              if str(c.get("globalId", "")).lower() == gid), None)
+                r["doc"] = match or cands[0]
+
+        n_fixed = sum(1 for r in missing if r["doc"])
+        logger.info("re-enriched {}/{} docs (item_id ids query + id-field fallback)",
+                    n_fixed, len(missing))
     except Exception as e:
         logger.warning("re-enrichment failed (check OPENSEARCH_* env): {}", e)
 
