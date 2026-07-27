@@ -29,6 +29,12 @@ Configuration (env, .env is loaded):
     LADDER_UI_PORT    port to listen on      (default: 8090)
     LADDER_LABELS     labels JSONL path
                       (default: experiment/results/dino_ladder/labels.jsonl)
+    S3_IMAGE_BUCKET   image-archive bucket for thumbnail fallback
+                      (default: images-130-sold; needs local AWS credentials)
+
+Thumbnails: result cards render doc.galleryURL first; when that's missing or
+the CDN image is dead (common for older sold listings), the UI falls back to
+/api/thumb/<os_id>, which serves the 256px variant from our S3 image archive.
 """
 from __future__ import annotations
 
@@ -41,7 +47,7 @@ import time
 from pathlib import Path
 
 import httpx
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -49,10 +55,15 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+from tools.poc_common import image_key
+
 WORKER_URL  = os.environ.get("DINO_WORKER_URL", "http://13.57.253.55:8081").rstrip("/")
 UI_PORT     = int(os.environ.get("LADDER_UI_PORT", 8090))
 LABELS_PATH = Path(os.environ.get("LADDER_LABELS",
                                   ROOT / "experiment/results/dino_ladder/labels.jsonl"))
+IMAGE_BUCKET = os.environ.get("S3_IMAGE_BUCKET", "images-130-sold")
+# Source-namespaced key layout: images/{source}/{variant}/{os_id}.jpg
+_THUMB_SOURCES = ("ebay", "pris", "pwcc", "gold", "ms", "heri", "other")
 
 DL_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; card-oracle/1.0)"}
 
@@ -167,6 +178,48 @@ def label():
     logger.info("labels saved: {} — {} good / {} bad", data["query_id"],
                 n_good, len(record["results"]) - n_good)
     return jsonify({"ok": True, "labeled_queries": _count_labeled()})
+
+
+_s3 = None
+_thumb_cache: dict[str, str | None] = {}   # os_id → resolved S3 key (None = miss)
+
+
+def _get_s3():
+    global _s3
+    if _s3 is None:
+        import boto3
+        _s3 = boto3.client("s3")
+    return _s3
+
+
+@app.route("/api/thumb/<os_id>")
+def thumb(os_id: str):
+    """Serve the archived 256px image for a result whose CDN thumbnail is
+    missing/dead. ?src= hints the marketplace (payload index_type); other
+    sources are tried after it since the client can't always know."""
+    hint = request.args.get("src", "").strip().lower()
+    hint = "ebay" if hint in ("ebay-dated", "") else ("heri" if hint == "heritage" else hint)
+    sources = [hint] + [s for s in _THUMB_SOURCES if s != hint]
+
+    if os_id in _thumb_cache:
+        key = _thumb_cache[os_id]
+        if key is None:
+            return Response(status=404)
+        obj = _get_s3().get_object(Bucket=IMAGE_BUCKET, Key=key)
+        return Response(obj["Body"].read(), mimetype="image/jpeg",
+                        headers={"Cache-Control": "max-age=86400"})
+
+    for src in sources:
+        key = image_key(os_id, "256", src)
+        try:
+            obj = _get_s3().get_object(Bucket=IMAGE_BUCKET, Key=key)
+            _thumb_cache[os_id] = key
+            return Response(obj["Body"].read(), mimetype="image/jpeg",
+                            headers={"Cache-Control": "max-age=86400"})
+        except Exception:
+            continue
+    _thumb_cache[os_id] = None
+    return Response(status=404)
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:

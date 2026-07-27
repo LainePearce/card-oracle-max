@@ -223,8 +223,22 @@ async function runQuery() {
   finally { btn.disabled = false; btn.textContent = 'Search'; }
 }
 
-function cardImg(res) {
-  return (res.doc && res.doc.galleryURL) || '';
+function imgTag(res) {
+  // CDN thumbnail first; dead/missing CDN images fall back to the S3 archive
+  // proxy (/api/thumb), then to a dimmed placeholder if neither exists.
+  const gallery = (res.doc && res.doc.galleryURL) || '';
+  const srcHint = (res.payload && (res.payload.index_type || res.payload.source)) || '';
+  const proxy = `/api/thumb/${encodeURIComponent(res.os_id)}?src=${encodeURIComponent(srcHint)}`;
+  const first = gallery || proxy;
+  return `<img src="${first}" loading="lazy"
+      data-proxy="${proxy}" ${gallery ? '' : 'data-tried-proxy="1"'}
+      onerror="thumbFix(this)">`;
+}
+
+function thumbFix(el) {
+  if (el.dataset.triedProxy) { el.style.opacity = .15; return; }
+  el.dataset.triedProxy = '1';
+  el.src = el.dataset.proxy;
 }
 
 function render(j, url, b64) {
@@ -257,7 +271,7 @@ function render(j, url, b64) {
     document.getElementById('clipGrid').innerHTML = j.clip.qdrant_results.map((r, i) => `
       <div class="rcard" style="cursor:default">
         <span class="score">${r.score.toFixed(3)}</span><span class="rank">#${i + 1}</span>
-        <img src="${cardImg(r)}" loading="lazy" onerror="this.style.opacity=.15">
+        ${imgTag(r)}
         <div class="info"><div class="title">${(r.doc && r.doc.title) || r.os_id}</div></div>
       </div>`).join('');
   }
@@ -268,7 +282,7 @@ function drawDino() {
     <div class="rcard ${r.good === true ? 'good' : r.good === false ? 'bad' : ''}"
          onclick="toggle(${i})">
       <span class="score">${r.score.toFixed(3)}</span><span class="rank">#${i + 1}</span>
-      <img src="${cardImg(r)}" loading="lazy" onerror="this.style.opacity=.15">
+      ${imgTag(r)}
       <span class="bnd" onclick="event.stopPropagation(); boundary(${i})">boundary ▾</span>
       <div class="info"><div class="title">${(r.doc && r.doc.title) || r.os_id}</div></div>
     </div>`).join('');
