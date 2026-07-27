@@ -228,7 +228,9 @@ function imgTag(res) {
   // proxy (/api/thumb), then to a dimmed placeholder if neither exists.
   const gallery = (res.doc && res.doc.galleryURL) || '';
   const srcHint = (res.payload && (res.payload.index_type || res.payload.source)) || '';
-  const proxy = `/api/thumb/${encodeURIComponent(res.os_id)}?src=${encodeURIComponent(srcHint)}`;
+  // Archive keys use the document's numeric `id` field, not the OS _id/os_id.
+  const lookupId = (res.doc && res.doc.id != null) ? res.doc.id : res.os_id;
+  const proxy = `/api/thumb/${encodeURIComponent(String(lookupId))}?src=${encodeURIComponent(srcHint)}`;
   const first = gallery || proxy;
   return `<img src="${first}" loading="lazy"
       data-proxy="${proxy}" ${gallery ? '' : 'data-tried-proxy="1"'}
