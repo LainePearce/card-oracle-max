@@ -65,6 +65,48 @@ IMAGE_BUCKET = os.environ.get("S3_IMAGE_BUCKET", "images-130-sold")
 # Source-namespaced key layout: images/{source}/{variant}/{os_id}.jpg
 _THUMB_SOURCES = ("ebay", "pris", "pwcc", "gold", "ms", "heri", "other")
 
+# Extant OpenSearch (read-only) — used to re-enrich results the worker's
+# _id-based enrichment missed (points whose payload os_id holds the numeric
+# `id` field value instead of the OS _id).
+OS_HOST  = os.environ.get("OPENSEARCH_HOST",
+                          "search-es130point-vector-h3eaau7mwcpyhgynkthfcwzeje.aos.us-west-1.on.aws")
+OS_INDEX = os.environ.get("OPENSEARCH_INDEX", "*,-*.*,-*-live*")
+OS_BASE  = f"https://{OS_HOST}"
+_auth = os.environ.get("OPENSEARCH_AUTH_HEADER", "")
+if not _auth:
+    _u, _p = os.environ.get("OPENSEARCH_USER", ""), os.environ.get("OPENSEARCH_PASSWORD", "")
+    if _u and _p:
+        _auth = "Basic " + base64.b64encode(f"{_u}:{_p}".encode()).decode()
+OS_HEADERS = {"Content-Type": "application/json",
+              **({"Authorization": _auth} if _auth else {})}
+_ENRICH_FIELDS = ["id", "itemId", "title", "galleryURL", "itemURL", "saleType",
+                  "currentPrice", "currentPriceCurrency", "endTime", "globalId",
+                  "source", "itemSpecifics"]
+
+
+def _reenrich(results: list[dict]) -> None:
+    """Fill empty docs in-place via a terms query on the numeric `id` field."""
+    missing = {r["os_id"]: r for r in results
+               if not r.get("doc") and str(r.get("os_id", "")).isdigit()}
+    if not missing:
+        return
+    body = {"size": len(missing), "track_scores": False,
+            "query": {"terms": {"id": [int(i) for i in missing]}},
+            "_source": _ENRICH_FIELDS}
+    try:
+        with httpx.Client(timeout=30, verify=False) as c:
+            r = c.post(f"{OS_BASE}/{OS_INDEX}/_search", json=body, headers=OS_HEADERS)
+            r.raise_for_status()
+        for hit in r.json().get("hits", {}).get("hits", []):
+            src = hit.get("_source", {})
+            rec = missing.get(str(src.get("id", "")))
+            if rec is not None:
+                rec["doc"] = src
+        logger.info("re-enriched {}/{} docs via id-field terms query",
+                    sum(1 for r in missing.values() if r["doc"]), len(missing))
+    except Exception as e:
+        logger.warning("re-enrichment failed (check OPENSEARCH_* env): {}", e)
+
 DL_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; card-oracle/1.0)"}
 
 app = Flask(__name__, static_folder=str(Path(__file__).parent))
@@ -144,6 +186,10 @@ def query():
     except Exception as e:
         logger.error("Worker query failed: {}", e)
         return jsonify({"error": f"Worker query failed: {e}"}), 502
+
+    _reenrich(out["dino"].get("qdrant_results", []))
+    if out.get("clip"):
+        _reenrich(out["clip"].get("qdrant_results", []))
 
     logger.info("query {} — dino {} hits{}", query_id,
                 out["dino"].get("total"),
