@@ -182,15 +182,20 @@ def query():
     """
     Run one query image through the worker.
 
-    Body: { image_url | image_b64, top_k, score_floor, run_clip }
-    Returns: { query_id, image_ref, dino: <worker response>, clip: <worker response>|null }
+    Body: { image_url | image_b64, top_k, score_floor,
+            compare: "clip" | "adaptive" | "none",
+            ladder: {phase1_start, phase1_stop, score_floor} }   # adaptive mode
+    Returns: { query_id, image_ref, dino: <worker response>,
+               ref: <worker response>|null, ref_kind: "clip"|"dino-adaptive" }
+    ("dino" is always the plain top-k DINOv2 search — the labelable column.)
     """
     data        = request.get_json(force=True) or {}
     image_url   = (data.get("image_url") or "").strip()
     image_b64   = (data.get("image_b64") or "").strip()
     top_k       = int(data.get("top_k", 100))
     score_floor = float(data.get("score_floor", 0.0))
-    run_clip    = bool(data.get("run_clip", True))
+    compare     = data.get("compare") or ("clip" if data.get("run_clip", True) else "none")
+    ladder      = data.get("ladder") or {}
 
     if image_url:
         try:
@@ -216,24 +221,30 @@ def query():
                              "score_floor": score_floor})
             r.raise_for_status()
             out["dino"] = r.json()
-            if run_clip:
+            if compare == "adaptive":
+                body = {"image_b64": image_b64, "top_k": top_k, "adaptive": True,
+                        **{k: v for k, v in ladder.items() if v is not None}}
+                r = c.post(f"{WORKER_URL}/search_b64_dino", json=body)
+                r.raise_for_status()
+                out["ref"], out["ref_kind"] = r.json(), "dino-adaptive"
+            elif compare == "clip":
                 r = c.post(f"{WORKER_URL}/search_b64",
                            json={"image_b64": image_b64, "top_k": top_k})
                 r.raise_for_status()
-                out["clip"] = r.json()
+                out["ref"], out["ref_kind"] = r.json(), "clip"
             else:
-                out["clip"] = None
+                out["ref"], out["ref_kind"] = None, None
     except Exception as e:
         logger.error("Worker query failed: {}", e)
         return jsonify({"error": f"Worker query failed: {e}"}), 502
 
     _reenrich(out["dino"].get("qdrant_results", []))
-    if out.get("clip"):
-        _reenrich(out["clip"].get("qdrant_results", []))
+    if out.get("ref"):
+        _reenrich(out["ref"].get("qdrant_results", []))
 
     logger.info("query {} — dino {} hits{}", query_id,
                 out["dino"].get("total"),
-                f", clip {out['clip'].get('total')} hits" if out.get("clip") else "")
+                f", {out['ref_kind']} {out['ref'].get('total')} hits" if out.get("ref") else "")
     return jsonify(out)
 
 

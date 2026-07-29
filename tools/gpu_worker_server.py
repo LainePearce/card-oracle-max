@@ -515,6 +515,101 @@ def _dino_search(vec, hnsw_ef, top_k, score_floor):
     )
 
 
+# DINOv2 ladder defaults — same shape/mechanics as the CLIP ladder above.
+# CLIP's values are the starting point (DINOv2 cosine scores sit higher and
+# tighter than CLIP's); tune from the local ladder UI's analysis, then pin the
+# tuned values here or via env. All are also per-request overridable.
+_DINO_PHASE1_START = float(os.environ.get("DINO_PHASE1_START", _PHASE1_START))
+_DINO_PHASE1_STOP  = float(os.environ.get("DINO_PHASE1_STOP",  _PHASE1_STOP))
+_DINO_PHASE1_STEP  = float(os.environ.get("DINO_PHASE1_STEP",  _PHASE1_STEP))
+_DINO_PHASE2_STEP  = float(os.environ.get("DINO_PHASE2_STEP",  _PHASE2_STEP))
+_DINO_SCORE_FLOOR  = float(os.environ.get("DINO_SCORE_FLOOR",  _DEFAULT_SCORE_FLOOR))
+
+
+def _dino_search_adaptive(
+    vec,
+    hnsw_ef:      int,
+    top_k:        int,
+    score_floor:  float,
+    phase1_start: float,
+    phase1_stop:  float,
+    phase1_step:  float,
+    phase2_step:  float,
+) -> tuple[list, float, int]:
+    """
+    Adaptive score-threshold ladder against cards_dinov2 — the exact mechanics
+    of _qdrant_search_adaptive (phase 1 fine steps → phase 2 coarse steps →
+    floor → unconstrained fallback), with the thresholds parameterised so the
+    DINOv2 score distribution can be tuned independently of CLIP's.
+
+    Returns (hits, final_threshold, qdrant_call_count).
+    """
+    from qdrant_client.models import SearchParams, QuantizationSearchParams
+
+    qdrant = get_qdrant()
+    params = SearchParams(
+        hnsw_ef=hnsw_ef,
+        exact=False,
+        quantization=QuantizationSearchParams(rescore=True),
+    )
+
+    def _search(threshold: float) -> list:
+        return qdrant.search(
+            collection_name=DINO_COLLECTION,
+            query_vector=(DINO_VECTOR, vec.tolist()),
+            limit=top_k,
+            score_threshold=round(threshold, 4),
+            with_payload=True,
+            search_params=params,
+        )
+
+    phase2_trigger = max(1, int(top_k * _PHASE2_TRIGGER_FRAC))
+    calls = 0
+    hits  = []
+
+    # ── Phase 1: fine steps ──────────────────────────────────────────────────
+    threshold = phase1_start
+    while threshold >= phase1_stop - 1e-9:
+        hits  = _search(threshold)
+        calls += 1
+        logger.debug("DINO adaptive: threshold={:.3f} → {} results (phase 1)",
+                     threshold, len(hits))
+        if len(hits) >= top_k:
+            return hits, threshold, calls
+        threshold = round(threshold - phase1_step, 4)
+
+    threshold = phase1_stop
+
+    if len(hits) >= phase2_trigger:
+        return hits, threshold, calls
+
+    # ── Phase 2: coarse steps down to the floor ──────────────────────────────
+    threshold = round(threshold - phase2_step, 4)
+    while threshold > score_floor - 1e-9:
+        if threshold < score_floor:
+            threshold = score_floor
+        hits  = _search(threshold)
+        calls += 1
+        logger.debug("DINO adaptive: threshold={:.3f} → {} results (phase 2)",
+                     threshold, len(hits))
+        if len(hits) >= top_k:
+            return hits, threshold, calls
+        if abs(threshold - score_floor) < 1e-9:
+            if hits:
+                return hits, threshold, calls
+            break
+        threshold = round(threshold - phase2_step, 4)
+
+    # ── Fallback: unconstrained top_k ────────────────────────────────────────
+    if not hits:
+        hits = _dino_search(vec, hnsw_ef, top_k, 0.0)
+        calls += 1
+        threshold = 0.0
+        logger.debug("DINO adaptive: fallback unconstrained → {} results", len(hits))
+
+    return hits, threshold, calls
+
+
 def _format_and_enrich(hits):
     """Build the qdrant_results list and OS-enrich (shared by the DINO endpoints)."""
     qdrant_results, os_ids = [], []
@@ -540,7 +635,7 @@ def _format_and_enrich(hits):
     return qdrant_results
 
 
-def _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, extra):
+def _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, extra, adaptive=False, ladder=None):
     t0 = time.perf_counter()
     try:
         vec = get_dino_encoder().encode(pil_img)
@@ -550,7 +645,18 @@ def _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, extra):
 
     t1 = time.perf_counter()
     try:
-        hits = _dino_search(vec, hnsw_ef, top_k, score_floor)
+        if adaptive:
+            ladder = ladder or {}
+            hits, final_threshold, calls = _dino_search_adaptive(
+                vec, hnsw_ef, top_k, score_floor,
+                ladder.get("phase1_start", _DINO_PHASE1_START),
+                ladder.get("phase1_stop",  _DINO_PHASE1_STOP),
+                ladder.get("phase1_step",  _DINO_PHASE1_STEP),
+                ladder.get("phase2_step",  _DINO_PHASE2_STEP),
+            )
+        else:
+            hits = _dino_search(vec, hnsw_ef, top_k, score_floor)
+            final_threshold, calls = None, 1
     except Exception as e:
         logger.error("DINOv2 Qdrant search error: {}", e)
         return jsonify({"error": f"Qdrant search failed: {e}"}), 500
@@ -559,23 +665,42 @@ def _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, extra):
     t2 = time.perf_counter()
     results = _format_and_enrich(hits)
     enrich_ms = int((time.perf_counter() - t2) * 1000)
-    logger.info("DINOv2 search: {} hits (encode={}ms qdrant={}ms)", len(results), encode_ms, qdrant_ms)
+    logger.info("DINOv2 search{}: {} hits (encode={}ms qdrant={}ms calls={})",
+                " [adaptive]" if adaptive else "", len(results), encode_ms, qdrant_ms, calls)
 
     return jsonify({**extra, "backbone": "dinov2", "collection": DINO_COLLECTION,
                     "qdrant_results": results, "total": len(results),
                     "top_k": top_k, "hnsw_ef": hnsw_ef, "score_floor": round(score_floor, 4),
+                    "adaptive": adaptive,
+                    **({"final_threshold": final_threshold, "qdrant_calls": calls}
+                       if adaptive else {}),
                     "encode_ms": encode_ms, "qdrant_ms": qdrant_ms, "enrich_ms": enrich_ms})
+
+
+def _parse_dino_search_args(data):
+    """Shared body parsing for the two DINO routes: top_k / hnsw_ef /
+    score_floor plus the optional adaptive-ladder block."""
+    adaptive = bool(data.get("adaptive", False))
+    default_floor = _DINO_SCORE_FLOOR if adaptive else 0.0
+    return {
+        "top_k":       _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,   _DEFAULT_TOP_K),
+        "hnsw_ef":     _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF, _DEFAULT_HNSW_EF),
+        "score_floor": _clamp_float(data.get("score_floor"), 0.0, 1.0,          default_floor),
+        "adaptive":    adaptive,
+        "ladder": {k: v for k, v in (
+            (k, _clamp_float(data.get(k), 0.0, 1.0, None))
+            for k in ("phase1_start", "phase1_stop", "phase1_step", "phase2_step"))
+            if v is not None},
+    }
 
 
 @app.route("/search_dino", methods=["POST"])
 def search_dino():
     """DINOv2 A/B test via image URL → DINOv2@512 → cards_dinov2 → OS enrich.
     Additive — the live CLIP /search is unchanged. score_floor defaults to 0."""
-    data        = request.get_json(force=True) or {}
-    image_url   = data.get("image_url", "").strip()
-    top_k       = _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,   _DEFAULT_TOP_K)
-    hnsw_ef     = _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF, _DEFAULT_HNSW_EF)
-    score_floor = _clamp_float(data.get("score_floor"), 0.0, 1.0,          0.0)
+    data      = request.get_json(force=True) or {}
+    image_url = data.get("image_url", "").strip()
+    a         = _parse_dino_search_args(data)
     if not image_url:
         return jsonify({"error": "image_url is required"}), 400
     try:
@@ -587,18 +712,18 @@ def search_dino():
         pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
     except Exception as e:
         return jsonify({"error": f"Failed to download image: {e}"}), 422
-    return _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, {"query_image_url": image_url})
+    return _dino_pipeline(pil_img, a["top_k"], a["hnsw_ef"], a["score_floor"],
+                          {"query_image_url": image_url},
+                          adaptive=a["adaptive"], ladder=a["ladder"])
 
 
 @app.route("/search_b64_dino", methods=["POST"])
 def search_b64_dino():
     """DINOv2 A/B test via pre-resized base64 → DINOv2@512 → cards_dinov2 → enrich.
     Mirrors /search_b64's input contract so the UI can call it with the same payload."""
-    data        = request.get_json(force=True) or {}
-    image_b64   = data.get("image_b64", "").strip()
-    top_k       = _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,   _DEFAULT_TOP_K)
-    hnsw_ef     = _clamp_int(  data.get("hnsw_ef"),     1,   _MAX_HNSW_EF, _DEFAULT_HNSW_EF)
-    score_floor = _clamp_float(data.get("score_floor"), 0.0, 1.0,          0.0)
+    data      = request.get_json(force=True) or {}
+    image_b64 = data.get("image_b64", "").strip()
+    a         = _parse_dino_search_args(data)
     if not image_b64:
         return jsonify({"error": "image_b64 is required"}), 400
     try:
@@ -607,7 +732,9 @@ def search_b64_dino():
         orig    = f"{pil_img.width}x{pil_img.height}"
     except Exception as e:
         return jsonify({"error": f"Failed to decode image: {e}"}), 400
-    return _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, {"image_size": orig})
+    return _dino_pipeline(pil_img, a["top_k"], a["hnsw_ef"], a["score_floor"],
+                          {"image_size": orig},
+                          adaptive=a["adaptive"], ladder=a["ladder"])
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

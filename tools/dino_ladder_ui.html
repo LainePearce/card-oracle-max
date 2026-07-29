@@ -37,6 +37,10 @@
   .querybar label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 5px; }
   .querybar input[type=number] { width: 70px; background: var(--card); color: var(--text);
               border: 1px solid var(--border); border-radius: 6px; padding: 7px 8px; }
+  .querybar select { background: var(--card); color: var(--text);
+              border: 1px solid var(--border); border-radius: 6px; padding: 7px 8px; }
+  #ladderInputs { display: flex; gap: 10px; align-items: center; }
+  #ladderInputs input[type=number] { width: 76px; }
   .querybar button, .filebtn { background: var(--accent); color: #04121f; border: none;
               border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
   .filebtn { background: var(--card); color: var(--text); border: 1px solid var(--border); }
@@ -124,7 +128,18 @@
       <input type="file" id="fileInput" accept="image/*" style="display:none">
       <label>top_k <input type="number" id="topK" value="100" min="1" max="200"></label>
       <label>floor <input type="number" id="scoreFloor" value="0" min="0" max="1" step="0.05"></label>
-      <label><input type="checkbox" id="runClip" checked> CLIP reference</label>
+      <label>compare
+        <select id="compareMode" onchange="toggleLadderInputs()">
+          <option value="clip">CLIP</option>
+          <option value="adaptive">DINO adaptive</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+      <span id="ladderInputs" style="display:none">
+        <label>p1 start <input type="number" id="p1Start" value="0.99" min="0" max="1" step="0.005"></label>
+        <label>p1 stop <input type="number" id="p1Stop" value="0.95" min="0" max="1" step="0.005"></label>
+        <label>ladder floor <input type="number" id="ladderFloor" value="0.85" min="0" max="1" step="0.005"></label>
+      </span>
       <button id="goBtn" onclick="runQuery()">Search</button>
     </div>
 
@@ -146,7 +161,8 @@
         <div class="grid" id="dinoGrid"></div>
       </div>
       <div class="col" id="clipCol">
-        <h2>CLIP (reference, adaptive ladder) — <span id="clipMeta"></span></h2>
+        <h2><span id="refTitle">CLIP (reference, adaptive ladder)</span> — <span id="clipMeta"></span></h2>
+        <div class="dim" id="overlapLine" style="margin-bottom:6px"></div>
         <div class="grid" id="clipGrid"></div>
       </div>
     </div>
@@ -211,7 +227,12 @@ async function runQuery() {
     const body = {
       top_k: +document.getElementById('topK').value,
       score_floor: +document.getElementById('scoreFloor').value,
-      run_clip: document.getElementById('runClip').checked,
+      compare: document.getElementById('compareMode').value,
+      ladder: {
+        phase1_start: +document.getElementById('p1Start').value,
+        phase1_stop: +document.getElementById('p1Stop').value,
+        score_floor: +document.getElementById('ladderFloor').value,
+      },
     };
     if (url) body.image_url = url; else body.image_b64 = b64;
     const r = await fetch('/api/query', { method: 'POST',
@@ -243,34 +264,58 @@ function thumbFix(el) {
   el.src = el.dataset.proxy;
 }
 
+function toggleLadderInputs() {
+  const adaptive = document.getElementById('compareMode').value === 'adaptive';
+  document.getElementById('ladderInputs').style.display = adaptive ? '' : 'none';
+}
+
 function render(j, url, b64) {
   const d = j.dino;
+  const ref = j.ref;
   current = {
     query_id: j.query_id, image_ref: j.image_ref,
     results: d.qdrant_results.map(r => ({ ...r, good: null })),
   };
   document.getElementById('savedMsg').textContent = '';
 
+  const refLabel = j.ref_kind === 'dino-adaptive' ? 'adaptive' : 'clip';
   const qi = document.getElementById('queryImg');
   qi.style.display = '';
   const src = url || ('data:image/jpeg;base64,' + b64);
   qi.innerHTML = `<img src="${src}">
     <div class="meta"><b>query ${j.query_id}</b><br>
       dino: encode ${d.encode_ms}ms · qdrant ${d.qdrant_ms}ms · ${d.total} hits<br>
-      ${j.clip ? `clip: encode ${j.clip.encode_ms ?? '?'}ms · ${j.clip.total} hits` : 'clip: skipped'}</div>`;
+      ${ref ? `${refLabel}: encode ${ref.encode_ms ?? '?'}ms · ${ref.total} hits` : 'compare: skipped'}</div>`;
 
   document.getElementById('dinoMeta').textContent =
     `${d.total} hits, floor ${d.score_floor}`;
   document.getElementById('cols').style.display = '';
-  document.getElementById('cols').className = 'cols' + (j.clip ? '' : ' single');
-  document.getElementById('clipCol').style.display = j.clip ? '' : 'none';
+  document.getElementById('cols').className = 'cols' + (ref ? '' : ' single');
+  document.getElementById('clipCol').style.display = ref ? '' : 'none';
   document.getElementById('saveBar').style.display = '';
 
   drawDino();
 
-  if (j.clip) {
-    document.getElementById('clipMeta').textContent = `${j.clip.total} hits`;
-    document.getElementById('clipGrid').innerHTML = j.clip.qdrant_results.map((r, i) => `
+  if (ref) {
+    document.getElementById('refTitle').textContent =
+      j.ref_kind === 'dino-adaptive'
+        ? `DINOv2 adaptive ladder (threshold ${ref.final_threshold?.toFixed(3)}, ${ref.qdrant_calls} qdrant calls)`
+        : 'CLIP (reference, adaptive ladder)';
+    document.getElementById('clipMeta').textContent = `${ref.total} hits`;
+
+    const ov = document.getElementById('overlapLine');
+    if (j.ref_kind === 'dino-adaptive') {
+      const plainIds = new Set(d.qdrant_results.map(r => r.os_id));
+      const kept = ref.qdrant_results.filter(r => plainIds.has(r.os_id)).length;
+      const added = ref.total - kept;
+      ov.textContent = `overlap vs plain top-${d.total}: kept ${kept}, ` +
+        `cut ${d.total - kept}, new ${added}` +
+        (added ? ' — new results mean the ladder\'s threshold search explored differently' : '');
+    } else {
+      ov.textContent = '';
+    }
+
+    document.getElementById('clipGrid').innerHTML = ref.qdrant_results.map((r, i) => `
       <div class="rcard" style="cursor:default">
         <span class="score">${r.score.toFixed(3)}</span><span class="rank">#${i + 1}</span>
         ${imgTag(r)}
