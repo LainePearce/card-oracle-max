@@ -216,9 +216,11 @@ def query():
 
     try:
         with httpx.Client(timeout=180) as c:
+            # adaptive:false — the labelable left column stays plain top-k
+            # even now that the worker defaults the dino routes to adaptive
             r = c.post(f"{WORKER_URL}/search_b64_dino",
                        json={"image_b64": image_b64, "top_k": top_k,
-                             "score_floor": score_floor})
+                             "score_floor": score_floor, "adaptive": False})
             r.raise_for_status()
             out["dino"] = r.json()
             if compare == "adaptive":

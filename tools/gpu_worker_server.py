@@ -525,6 +525,13 @@ _DINO_PHASE1_STEP  = float(os.environ.get("DINO_PHASE1_STEP",  _PHASE1_STEP))
 _DINO_PHASE2_STEP  = float(os.environ.get("DINO_PHASE2_STEP",  _PHASE2_STEP))
 _DINO_SCORE_FLOOR  = float(os.environ.get("DINO_SCORE_FLOOR",  _DEFAULT_SCORE_FLOOR))
 
+# When true (the default), /search_dino and /search_b64_dino run the adaptive
+# ladder unless the request sends "adaptive": false — mirroring how /search_b64
+# behaves for CLIP, so the production Lambda needs no payload change at
+# cutover. Set DINO_ADAPTIVE_DEFAULT=false to restore plain-top_k default.
+_DINO_ADAPTIVE_DEFAULT = os.environ.get(
+    "DINO_ADAPTIVE_DEFAULT", "true").lower() in ("1", "true", "yes")
+
 
 def _dino_search_adaptive(
     vec,
@@ -679,8 +686,9 @@ def _dino_pipeline(pil_img, top_k, hnsw_ef, score_floor, extra, adaptive=False, 
 
 def _parse_dino_search_args(data):
     """Shared body parsing for the two DINO routes: top_k / hnsw_ef /
-    score_floor plus the optional adaptive-ladder block."""
-    adaptive = bool(data.get("adaptive", False))
+    score_floor plus the optional adaptive-ladder block. Adaptive defaults on
+    (see _DINO_ADAPTIVE_DEFAULT); an explicit "adaptive": false opts out."""
+    adaptive = bool(data.get("adaptive", _DINO_ADAPTIVE_DEFAULT))
     default_floor = _DINO_SCORE_FLOOR if adaptive else 0.0
     return {
         "top_k":       _clamp_int(  data.get("top_k"),       1,   _MAX_TOP_K,   _DEFAULT_TOP_K),
