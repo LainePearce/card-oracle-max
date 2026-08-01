@@ -11,13 +11,23 @@ backbones in the same pass:
   - DINOv2-large @512 (1024-d, "image_dinov2")                 -> `cards_dinov2`
 
 Vectors are written to the S3 vector store (durable) before the Qdrant upsert,
-per the S3-before-Qdrant invariant. Per-day completion markers under
+per the S3-before-Qdrant invariant. Completion markers under
 daily-dual/complete make it idempotent and safe to re-run.
+
+Marker semantics differ by index shape:
+  - eBay dated days (YYYY-MM-DD) are immutable once complete -> boolean marker;
+    a marked day is skipped forever.
+  - Non-eBay indices (2026-07-pris, 2026-gold, ...) GROW over their month/year,
+    and their manifests are append-only -> the marker stores "embedded_rows",
+    and each run embeds only the manifest tail beyond that offset. First run on
+    an unmarked index embeds the whole manifest (idempotent upserts), which
+    doubles as the catch-up for any archived-but-never-embedded backlog.
 
 Usage:
   python tools/daily_dual_embed.py                    # last 2 days + current non-eBay
   python tools/daily_dual_embed.py --days 3
   python tools/daily_dual_embed.py --date 2026-07-01  # one specific index/day
+  python tools/daily_dual_embed.py --days 0           # non-eBay indices only
   python tools/daily_dual_embed.py --no-nonebay --force
 """
 from __future__ import annotations
@@ -27,6 +37,7 @@ import gzip
 import io
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -64,18 +75,22 @@ CARDS_COLLECTION = os.environ.get("QDRANT_COLLECTION", "cards")
 MARKER_PREFIX    = "daily-dual/complete"
 
 
-# ── Per-day markers (idempotency) ───────────────────────────────────────────────
+# ── Per-index markers (idempotency) ─────────────────────────────────────────────
+
+_DATED_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def _marker_key(date_str: str) -> str:
     return f"{MARKER_PREFIX}/{date_str}.json"
 
 
-def is_complete(s3, date_str: str) -> bool:
+def get_marker(s3, date_str: str) -> dict | None:
     try:
-        s3.head_object(Bucket=QUEUE_BUCKET, Key=_marker_key(date_str))
-        return True
+        raw = s3.get_object(Bucket=QUEUE_BUCKET,
+                            Key=_marker_key(date_str))["Body"].read()
+        return json.loads(raw) or {}
     except Exception:
-        return False
+        return None
 
 
 def mark_complete(s3, date_str: str, stats: dict) -> None:
@@ -112,10 +127,16 @@ def load_one(s3, r):
 # ── Dual embed one day/index ────────────────────────────────────────────────────
 
 def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
-              s3, pool, batch) -> dict:
+              s3, pool, batch, start_row: int = 0) -> dict:
     rows = read_manifest(s3, date_str)
-    if not rows:
+    if rows is None:
         return {"embedded": 0, "total": 0, "note": "no manifest"}
+    manifest_len = len(rows)
+    if start_row:
+        rows = rows[start_row:]   # append-only manifest: embed only the new tail
+    if not rows:
+        return {"embedded": 0, "total": 0, "manifest_rows": manifest_len,
+                "note": f"up to date (offset {start_row})"}
 
     source = source_for_index(date_str)
     # eBay keeps the historical "ebay-dated" S3 index_type; non-eBay uses source.
@@ -212,7 +233,7 @@ def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
     _drain(img_buf,  img_n,  final=True)
     _drain(spec_buf, spec_n, final=True)
     _drain(dino_buf, dino_n, final=True)
-    return {"embedded": embedded, "total": total}
+    return {"embedded": embedded, "total": total, "manifest_rows": manifest_len}
 
 
 def build_index_list(os_client_getter, s3, args) -> list[str]:
@@ -258,18 +279,34 @@ def main() -> None:
     logger.info("Dual-embed targets: {}", indices)
 
     for idx in indices:
-        if not args.force and is_complete(s3, idx):
-            logger.info("{} already dual-embedded — skipping", idx)
-            continue
+        dated  = bool(_DATED_DAY.match(idx))
+        marker = None if args.force else get_marker(s3, idx)
+        start_row = 0
+        if marker is not None:
+            if dated:
+                # Immutable day, already complete.
+                logger.info("{} already dual-embedded — skipping", idx)
+                continue
+            # Growing non-eBay index: resume from the recorded offset.
+            start_row = int(marker.get("embedded_rows", 0))
+
         t0 = time.time()
         stats = embed_day(idx, clip_enc, text_enc, dino_encode, qdrant, store,
-                          s3, pool, args.batch)
+                          s3, pool, args.batch, start_row=start_row)
         stats["seconds"] = round(time.time() - t0, 1)
-        if stats.get("total", 0) > 0:
+
+        if dated:
+            if stats.get("total", 0) > 0:
+                mark_complete(s3, idx, stats)
+        elif stats.get("total", 0) > 0:
+            # Advance the offset by rows *attempted* (manifest position), not
+            # rows embedded — load-failures shouldn't be retried forever.
+            stats["embedded_rows"] = start_row + stats["total"]
             mark_complete(s3, idx, stats)
-        logger.info("Done {} — dual-embedded {}/{} in {:.0f}s → cards + {}",
-                    idx, stats["embedded"], stats["total"], stats["seconds"],
-                    DINO_COLLECTION)
+
+        logger.info("Done {} — dual-embedded {}/{} (offset {}) in {:.0f}s → cards + {}",
+                    idx, stats["embedded"], stats["total"], start_row,
+                    stats["seconds"], DINO_COLLECTION)
 
 
 if __name__ == "__main__":
