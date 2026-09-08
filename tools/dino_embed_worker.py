@@ -65,16 +65,22 @@ def ensure_collection(client) -> None:
         if any(c.name == COLLECTION for c in client.get_collections().collections):
             return
         single = os.environ.get("QDRANT_SINGLE_NODE", "false").lower() in ("true", "1", "yes")
+        # always_ram=False is the safe default on a cluster that ALSO holds the
+        # CLIP `cards` collection in RAM: True pinned ~59GB+/node of quantized
+        # vectors on top of it, OOM-killing the 3-node cluster (2026-07-03
+        # outage). On a cluster with the RAM budget for it (e.g. DINOv2-only,
+        # or after the CLIP vectors are demoted/retired), set
+        # DINO_ALWAYS_RAM=true before FIRST creation for lower query latency.
+        # Only affects creation — flipping an existing collection is an
+        # update_collection cluster op to be done deliberately.
+        always_ram = os.environ.get("DINO_ALWAYS_RAM", "false").lower() in ("true", "1", "yes")
         client.create_collection(
             collection_name=COLLECTION,
             vectors_config={VEC_NAME: VectorParams(
                 size=1024, distance=Distance.COSINE, on_disk=True,
                 hnsw_config=HnswConfigDiff(m=16, ef_construct=200, on_disk=True))},
-            # always_ram=False is deliberate: True pinned ~59GB+/node of quantized
-            # vectors in RAM on top of `cards`, OOM-killing the qdrant cluster
-            # (2026-07-03 outage). Quantized vectors page from disk instead.
             quantization_config=ScalarQuantization(scalar=ScalarQuantizationConfig(
-                type=ScalarType.INT8, quantile=0.99, always_ram=False)),
+                type=ScalarType.INT8, quantile=0.99, always_ram=always_ram)),
             optimizers_config=OptimizersConfigDiff(indexing_threshold=50_000,
                                                    memmap_threshold=50_000),
             on_disk_payload=True,

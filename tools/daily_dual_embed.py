@@ -14,20 +14,21 @@ Vectors are written to the S3 vector store (durable) before the Qdrant upsert,
 per the S3-before-Qdrant invariant. Completion markers under
 daily-dual/complete make it idempotent and safe to re-run.
 
-Marker semantics differ by index shape:
-  - eBay dated days (YYYY-MM-DD) are immutable once complete -> boolean marker;
-    a marked day is skipped forever.
-  - Non-eBay indices (2026-07-pris, 2026-gold, ...) GROW over their month/year,
-    and their manifests are append-only -> the marker stores "embedded_rows",
-    and each run embeds only the manifest tail beyond that offset. First run on
-    an unmarked index embeds the whole manifest (idempotent upserts), which
-    doubles as the catch-up for any archived-but-never-embedded backlog.
+Marker semantics — every index (eBay dated days AND non-eBay marketplace
+indices) uses an offset marker: it stores "embedded_rows", and each run embeds
+only the append-only manifest's tail beyond that offset. This makes partial
+runs safe on GROWING indices — including *today's* eBay day — so the job can
+run hourly for a ~2h embed lag (archiver cadence + embed cadence) instead of
+waiting for the day to complete. An unmarked index embeds in full (idempotent
+upserts), which doubles as catch-up for any archived-but-never-embedded
+backlog. Legacy boolean markers (no embedded_rows, from the completed-days
+era) on dated days mean "fully embedded" and are skipped.
 
 Usage:
-  python tools/daily_dual_embed.py                    # last 2 days + current non-eBay
+  python tools/daily_dual_embed.py                    # today + 2 prior days + current non-eBay
   python tools/daily_dual_embed.py --days 3
   python tools/daily_dual_embed.py --date 2026-07-01  # one specific index/day
-  python tools/daily_dual_embed.py --days 0           # non-eBay indices only
+  python tools/daily_dual_embed.py --days -1          # non-eBay indices only
   python tools/daily_dual_embed.py --no-nonebay --force
 """
 from __future__ import annotations
@@ -240,10 +241,9 @@ def build_index_list(os_client_getter, s3, args) -> list[str]:
     if args.date:
         return [args.date]
     today = date.today()
-    # Only COMPLETED days (yesterday backward). Including today would mark it
-    # complete mid-day and the per-day marker would skip the rest of its
-    # listings forever. Today's day gets embedded tomorrow, fully.
-    idx = [(today - timedelta(days=i)).isoformat() for i in range(1, args.days + 1)]
+    # Today is included: offset markers make partial-day embedding safe (each
+    # run embeds only the manifest tail appended since the recorded offset).
+    idx = [(today - timedelta(days=i)).isoformat() for i in range(0, args.days + 1)]
     if not args.no_nonebay:
         idx += recent_nonebay_indices(os_client_getter(), today)
     return idx
@@ -251,7 +251,9 @@ def build_index_list(os_client_getter, s3, args) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--days", type=int, default=2, help="Recent eBay days to embed.")
+    ap.add_argument("--days", type=int, default=2,
+                    help="Prior eBay days to embed in addition to today "
+                         "(-1 = non-eBay indices only).")
     ap.add_argument("--date", help="Embed one specific index/day, then exit.")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--download-workers", type=int, default=16)
@@ -283,22 +285,21 @@ def main() -> None:
         marker = None if args.force else get_marker(s3, idx)
         start_row = 0
         if marker is not None:
-            if dated:
-                # Immutable day, already complete.
-                logger.info("{} already dual-embedded — skipping", idx)
+            if "embedded_rows" in marker:
+                # Offset marker: resume from where the last run left off.
+                start_row = int(marker["embedded_rows"])
+            elif dated:
+                # Legacy boolean marker (completed-days era) — the whole day
+                # was embedded in one pass; nothing to resume.
+                logger.info("{} already dual-embedded (legacy marker) — skipping", idx)
                 continue
-            # Growing non-eBay index: resume from the recorded offset.
-            start_row = int(marker.get("embedded_rows", 0))
 
         t0 = time.time()
         stats = embed_day(idx, clip_enc, text_enc, dino_encode, qdrant, store,
                           s3, pool, args.batch, start_row=start_row)
         stats["seconds"] = round(time.time() - t0, 1)
 
-        if dated:
-            if stats.get("total", 0) > 0:
-                mark_complete(s3, idx, stats)
-        elif stats.get("total", 0) > 0:
+        if stats.get("total", 0) > 0:
             # Advance the offset by rows *attempted* (manifest position), not
             # rows embedded — load-failures shouldn't be retried forever.
             stats["embedded_rows"] = start_row + stats["total"]
