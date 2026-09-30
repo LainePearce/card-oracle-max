@@ -58,16 +58,51 @@ def image_key(os_id: str, variant: str, source: str = "ebay") -> str:
     return f"{S3_IMAGE_PREFIX}/{source}/{variant}/{os_id.replace('/', '_')}.jpg"
 
 
+_EBAY_DAILY_RE   = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Aged eBay daily indices are consolidated into YYYY-MM monthly indices (the
+# last 3 full months stay daily). Same marketplace, same S3 image namespace.
+_EBAY_MONTHLY_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+def is_ebay_monthly(index_name: str) -> bool:
+    return bool(_EBAY_MONTHLY_RE.match(index_name))
+
+
 def source_for_index(index_name: str) -> str:
-    """eBay-dated YYYY-MM-DD -> 'ebay'; non-eBay -> its marketplace suffix
-    (pris/pwcc/ms/gold/heri; 'heritage' normalised to 'heri')."""
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", index_name):
+    """eBay YYYY-MM-DD (daily) or YYYY-MM (consolidated month) -> 'ebay';
+    non-eBay -> its marketplace suffix (pris/pwcc/ms/gold/heri; 'heritage'
+    normalised to 'heri')."""
+    if _EBAY_DAILY_RE.match(index_name) or _EBAY_MONTHLY_RE.match(index_name):
         return "ebay"
     m = re.match(r"^\d{4}(?:-\d{2})?-(pris|pwcc|heri|heritage|ms|gold)$", index_name)
     if not m:
         return "other"
     sfx = m.group(1)
     return "heri" if sfx == "heritage" else sfx
+
+
+def refuse_consolidated_ebay_month(s3, bucket: str, manifests_prefix: str,
+                                   index_name: str) -> None:
+    """Guard for operator-targeted runs (--index / --date).
+
+    A consolidated eBay month's listings were already archived and embedded
+    under their DAILY manifests. Targeting the month as one index would diff
+    against a fresh YYYY-MM manifest and redo the entire month (~7.5M rows,
+    days of work) for no gain. Refuse when daily manifests for that month
+    exist. A month with none is a legitimate fresh backfill and is allowed.
+    """
+    if not is_ebay_monthly(index_name):
+        return
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{manifests_prefix}/{index_name}-",
+                              MaxKeys=64)
+    daily = [o["Key"] for o in resp.get("Contents", [])
+             if _EBAY_DAILY_RE.match(o["Key"].rsplit("/", 1)[-1].split(".")[0])]
+    if daily:
+        raise SystemExit(
+            f"{index_name} is a consolidated eBay month whose days are already archived "
+            f"({len(daily)} daily manifests under {manifests_prefix}/{index_name}-*). "
+            f"Target the daily names instead (e.g. {index_name}-01); processing the month "
+            f"as one index would re-download/re-embed all of it.")
 
 
 _SL_RE = re.compile(r"s-l\d+")

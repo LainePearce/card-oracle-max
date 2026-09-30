@@ -61,7 +61,7 @@ from src.embeddings.rds_batch_job import (
     encode_pil_batch, IMAGE_MODEL_ID, IMAGE_PARAMS, TEXT_MODEL_ID, TEXT_PARAMS,
 )
 from src.ingestion.qdrant_writer import get_qdrant_client, extract_payload, build_point
-from tools.poc_common import get_image_pil, source_for_index
+from tools.poc_common import get_image_pil, source_for_index, refuse_consolidated_ebay_month
 from tools.dino_embed_worker import (
     _point_id, ensure_collection,
     COLLECTION as DINO_COLLECTION, VEC_NAME as DINO_VEC,
@@ -78,6 +78,9 @@ MARKER_PREFIX    = "daily-dual/complete"
 
 # ── Per-index markers (idempotency) ─────────────────────────────────────────────
 
+# Only gates the legacy-boolean-marker skip below. Consolidated eBay months
+# (YYYY-MM) deliberately don't match: they never had boolean markers, and the
+# offset semantics that apply to everything else are correct for them too.
 _DATED_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -239,6 +242,7 @@ def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
 
 def build_index_list(os_client_getter, s3, args) -> list[str]:
     if args.date:
+        refuse_consolidated_ebay_month(s3, QUEUE_BUCKET, ARCHIVE_MANIFESTS, args.date)
         return [args.date]
     today = date.today()
     # Today is included: offset markers make partial-day embedding safe (each

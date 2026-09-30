@@ -113,7 +113,7 @@ def _reenrich(results: list[dict]) -> None:
             if iid:
                 by_item_id.setdefault(iid, r)
         if by_item_id:
-            hits = _os_search({"size": len(by_item_id), "track_scores": False,
+            hits = _os_search({"size": 2 * len(by_item_id), "track_scores": False,
                                "query": {"ids": {"values": list(by_item_id)}},
                                "_source": _ENRICH_FIELDS})
             for hit in hits:

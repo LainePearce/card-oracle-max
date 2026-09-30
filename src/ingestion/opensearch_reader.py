@@ -43,6 +43,10 @@ SCROLL_SOURCE_FIELDS = [
 
 # eBay: YYYY-MM-DD  (must match before the broader marketplace patterns)
 _EBAY_RE     = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# eBay, consolidated: aged daily indices are rolled up into YYYY-MM monthly
+# indices (the last 3 full months stay daily). Same marketplace/index_type so
+# S3 partitioning and specifics_source stay consistent with the daily shape.
+_EBAY_MONTHLY_RE = re.compile(r"^\d{4}-\d{2}$")
 # Pristine / Fanatics: YYYY-MM-<suffix>
 _YYYYMM_RE   = re.compile(r"^(\d{4}-\d{2})-(pris|pwcc)$")
 # Heritage / MySlabs / Goldin: YYYY-<suffix>
@@ -77,12 +81,12 @@ def classify_index(index_name: str) -> dict:
       index_type:         short string used as S3 partition key and Qdrant specifics_source
       partition:          date fragment used for S3 key construction
     """
-    if _EBAY_RE.match(index_name):
+    if _EBAY_RE.match(index_name) or _EBAY_MONTHLY_RE.match(index_name):
         return {
             "marketplace":        "ebay",
             "has_item_specifics": True,
             "index_type":         "ebay-dated",
-            "partition":          index_name,          # YYYY-MM-DD
+            "partition":          index_name,          # YYYY-MM-DD or YYYY-MM
         }
 
     m = _YYYYMM_RE.match(index_name)

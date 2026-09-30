@@ -351,7 +351,7 @@ def vector_search():
     # Step 3: OpenSearch enrichment
     if os_ids:
         ids_query = {
-            "size": len(os_ids),
+            "size": 2 * len(os_ids),   # daily+monthly dual-existence headroom; deduped by _id
             "query": {"ids": {"values": os_ids}},
             "_source": [
                 "id", "itemId", "title", "galleryURL", "itemURL",

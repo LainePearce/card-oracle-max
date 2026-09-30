@@ -627,7 +627,10 @@ def _format_and_enrich(hits):
                                "payload": h.payload, "doc": {}})
         os_ids.append(os_id)
     if os_ids and OS_BASE:
-        ids_query = {"size": len(os_ids), "query": {"ids": {"values": os_ids}},
+        # 2x: a document can briefly exist in both a daily index and its
+        # consolidated monthly index; results are de-duplicated by _id below,
+        # but size must leave room or unique ids get crowded out.
+        ids_query = {"size": 2 * len(os_ids), "query": {"ids": {"values": os_ids}},
                      "_source": ["id", "itemId", "title", "galleryURL", "itemURL",
                                  "saleType", "currentPrice", "currentPriceCurrency",
                                  "endTime", "globalId", "source", "itemSpecifics"]}
@@ -894,7 +897,7 @@ def search():
     t2 = time.perf_counter()
     if os_ids and OS_BASE:
         ids_query = {
-            "size": len(os_ids),
+            "size": 2 * len(os_ids),   # daily+monthly dual-existence headroom; deduped by _id
             "query": {"ids": {"values": os_ids}},
             "_source": [
                 "id", "itemId", "title", "galleryURL", "itemURL",
@@ -1082,7 +1085,7 @@ def search_b64():
     t2 = time.perf_counter()
     if os_ids and OS_BASE:
         ids_query = {
-            "size": len(os_ids),
+            "size": 2 * len(os_ids),   # daily+monthly dual-existence headroom; deduped by _id
             "query": {"ids": {"values": os_ids}},
             "_source": [
                 "id", "itemId", "title", "galleryURL", "itemURL",

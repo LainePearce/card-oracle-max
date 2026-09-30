@@ -38,7 +38,7 @@ from loguru import logger
 from opensearchpy.exceptions import NotFoundError
 
 from tools.poc_image_archive import fetch_window, process_one
-from tools.poc_common import source_for_index
+from tools.poc_common import source_for_index, refuse_consolidated_ebay_month
 from src.ingestion.opensearch_reader import get_opensearch_client
 from tools.image_archive_common import (
     s3_client, mark_complete, QUEUE_BUCKET, IMAGE_BUCKET, MANIFESTS,
@@ -144,6 +144,8 @@ def main() -> None:
 
     if args.index:
         indices = args.index
+        for idx in indices:
+            refuse_consolidated_ebay_month(s3, QUEUE_BUCKET, MANIFESTS, idx)
     else:
         # eBay dated days + the non-eBay indices where new listings currently land.
         indices = [(today - timedelta(days=i)).isoformat() for i in range(args.days)]
