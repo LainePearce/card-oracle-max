@@ -63,8 +63,11 @@ fi
 # then spawns a new process that dies on EADDRINUSE — silently, because the
 # old process still answers /health. Result: deploys rsync new code but the
 # old code keeps serving for weeks. Guard against it: after restart, assert
-# systemd's MainPID is the process actually bound to 8081; if not, kill every
+# the process bound to 8081 belongs to the unit's cgroup; if not, kill every
 # gunicorn for this app and restart cleanly, then re-assert.
+# NOTE: gunicorn's *worker* child holds the listening socket, not the master
+# (systemd's MainPID), so "MainPID == port owner" is the wrong test — it
+# false-alarmed on every healthy deploy. Cgroup membership is the right one.
 echo "→ Restarting gpu-search-worker service (with squatter check)..."
 ssh -i "${KEY}" -o StrictHostKeyChecking=no "${REMOTE}" bash <<'REMOTE_CMDS'
   set -euo pipefail
@@ -78,6 +81,12 @@ ssh -i "${KEY}" -o StrictHostKeyChecking=no "${REMOTE}" bash <<'REMOTE_CMDS'
   main_pid() {
     systemctl show gpu-search-worker -p MainPID --value
   }
+  unit_owns_port() {
+    # True if the PID holding the port is inside the service's cgroup
+    # (gunicorn master or one of its workers).
+    [[ -n "${1:-}" ]] && sudo cat "/proc/${1}/cgroup" 2>/dev/null \
+      | grep -q 'gpu-search-worker\.service'
+  }
 
   echo "  restarting..."
   sudo systemctl restart gpu-search-worker
@@ -87,7 +96,7 @@ ssh -i "${KEY}" -o StrictHostKeyChecking=no "${REMOTE}" bash <<'REMOTE_CMDS'
   LP="$(port_pid || true)"
   echo "  MainPID=${MP:-0}  port-${PORT}-owner=${LP:-none}"
 
-  if [[ -z "${MP}" || "${MP}" == "0" || "${MP}" != "${LP}" ]]; then
+  if [[ -z "${MP}" || "${MP}" == "0" ]] || ! unit_owns_port "${LP}"; then
     echo "  ✗ systemd does not own port ${PORT} — a squatter is holding it."
     echo "  killing all gunicorn for tools.gpu_worker_server:app ..."
     sudo systemctl stop gpu-search-worker || true
@@ -107,12 +116,12 @@ ssh -i "${KEY}" -o StrictHostKeyChecking=no "${REMOTE}" bash <<'REMOTE_CMDS'
     echo "  MainPID=${MP:-0}  port-${PORT}-owner=${LP:-none}"
   fi
 
-  if [[ -z "${MP}" || "${MP}" == "0" || "${MP}" != "${LP}" ]]; then
-    echo "  ✗ FAILED: systemd MainPID (${MP:-0}) is not the process bound to ${PORT} (${LP:-none})."
+  if [[ -z "${MP}" || "${MP}" == "0" ]] || ! unit_owns_port "${LP}"; then
+    echo "  ✗ FAILED: port ${PORT} owner (${LP:-none}) is not inside gpu-search-worker.service (MainPID ${MP:-0})."
     sudo systemctl status gpu-search-worker --no-pager | head -10
     exit 1
   fi
-  echo "  ✓ systemd MainPID ${MP} owns port ${PORT}."
+  echo "  ✓ port ${PORT} owner ${LP} is inside gpu-search-worker.service (MainPID ${MP})."
   sudo systemctl status gpu-search-worker --no-pager | head -6
 REMOTE_CMDS
 
