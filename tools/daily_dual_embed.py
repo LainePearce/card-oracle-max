@@ -157,18 +157,39 @@ def _upsert_with_retry(qdrant, collection: str, points: list, what: str) -> None
             delay = min(delay * 2, 60.0)
 
 
+def missing_rows(qdrant, rows: list[dict], batch: int = 1000) -> list[dict]:
+    """Manifest rows whose point is absent from cards_dinov2 (one replica's view
+    via the NLB — good enough: a false 'missing' just re-upserts a point that
+    exists, which is harmless and also repairs any replica that lacked it)."""
+    out: list[dict] = []
+    for i in range(0, len(rows), batch):
+        chunk = rows[i:i + batch]
+        ids = [_point_id(r["qdrant_id"]) for r in chunk]
+        present = {str(p.id) for p in qdrant.retrieve(
+            collection_name=DINO_COLLECTION, ids=ids, with_payload=False, with_vectors=False)}
+        out += [r for r, pid in zip(chunk, ids) if str(pid) not in present]
+    return out
+
+
 def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
-              s3, pool, batch, start_row: int = 0, checkpoint=None) -> dict:
+              s3, pool, batch, start_row: int = 0, checkpoint=None,
+              rows_override: list[dict] | None = None) -> dict:
     """`checkpoint(rows_attempted)` is called every CHECKPOINT_ROWS after the
     S3 vector buffers have been flushed, so the caller can persist an offset
     marker mid-run. A crash then costs at most CHECKPOINT_ROWS of work instead
-    of the whole pass, and never leaves a vector in Qdrant that isn't in S3."""
-    rows = read_manifest(s3, date_str)
-    if rows is None:
-        return {"embedded": 0, "total": 0, "note": "no manifest"}
-    manifest_len = len(rows)
-    if start_row:
-        rows = rows[start_row:]   # append-only manifest: embed only the new tail
+    of the whole pass, and never leaves a vector in Qdrant that isn't in S3.
+
+    `rows_override` embeds exactly those manifest rows instead of the offset
+    tail (used by --only-missing); offsets/markers are left untouched."""
+    if rows_override is not None:
+        rows, manifest_len = rows_override, len(rows_override)
+    else:
+        rows = read_manifest(s3, date_str)
+        if rows is None:
+            return {"embedded": 0, "total": 0, "note": "no manifest"}
+        manifest_len = len(rows)
+        if start_row:
+            rows = rows[start_row:]   # append-only manifest: embed only the new tail
     if not rows:
         return {"embedded": 0, "total": 0, "manifest_rows": manifest_len,
                 "note": f"up to date (offset {start_row})"}
@@ -308,6 +329,10 @@ def main() -> None:
     ap.add_argument("--download-workers", type=int, default=16)
     ap.add_argument("--no-nonebay", action="store_true")
     ap.add_argument("--force", action="store_true", help="Re-embed even if marker exists.")
+    ap.add_argument("--only-missing", action="store_true",
+                    help="With --date: embed exactly the manifest rows that have no point "
+                         "in cards_dinov2 (heals rows dropped inside an old snapshot or by "
+                         "a crashed run) — markers/offsets untouched. Idempotent.")
     args = ap.parse_args()
 
     s3 = s3_client()
@@ -328,6 +353,20 @@ def main() -> None:
     from src.ingestion.opensearch_reader import get_opensearch_client
     indices = build_index_list(get_opensearch_client, s3, args)
     logger.info("Dual-embed targets: {}", indices)
+
+    if args.only_missing:
+        if not args.date:
+            ap.error("--only-missing requires --date")
+        rows = read_manifest(s3, args.date) or []
+        todo = missing_rows(qdrant, rows)
+        logger.info("{}: {:,} manifest rows, {:,} without a point — embedding those only",
+                    args.date, len(rows), len(todo))
+        t0 = time.time()
+        stats = embed_day(args.date, clip_enc, text_enc, dino_encode, qdrant, store,
+                          s3, pool, args.batch, rows_override=todo)
+        logger.info("Done {} — only-missing: dual-embedded {}/{} in {:.0f}s → cards + {}",
+                    args.date, stats["embedded"], stats["total"], time.time() - t0, DINO_COLLECTION)
+        return
 
     for idx in indices:
         dated  = bool(_DATED_DAY.match(idx))
