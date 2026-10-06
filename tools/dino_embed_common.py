@@ -37,7 +37,11 @@ ARCHIVE_COMPLETE  = "image-archive/complete"
 
 
 def s3_client():
-    return boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-west-1"))
+    # Pool sized above the embed/archive download thread counts (12–16) — the
+    # default 10 spams "Connection pool is full, discarding connection".
+    from botocore.config import Config
+    return boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-west-1"),
+                        config=Config(max_pool_connections=32))
 
 
 def _now() -> str:

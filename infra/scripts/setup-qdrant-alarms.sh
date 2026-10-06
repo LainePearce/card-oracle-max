@@ -140,6 +140,20 @@ for node in "${NODES[@]}"; do
     --alarm-actions "$TOPIC" --ok-actions "$TOPIC"
 done
 
+#   - ReplicaCountSpread > 100000 for 10 consecutive minutes (replica divergence
+#     — approximate per-node counts normally agree to within a few thousand)
+for coll in cards cards_dinov2; do
+  aws cloudwatch put-metric-alarm --region "$REGION" \
+    --alarm-name "qdrant-${coll}-replica-divergence" \
+    --alarm-description "qdrant ${coll}: per-node point counts differ by >100k for 10 min (replica divergence)" \
+    --namespace "$NAMESPACE" --metric-name ReplicaCountSpread \
+    --dimensions "Name=Collection,Value=${coll}" \
+    --statistic Maximum --period 60 --evaluation-periods 10 \
+    --threshold 100000 --comparison-operator GreaterThanThreshold \
+    --treat-missing-data notBreaching \
+    --alarm-actions "$TOPIC" --ok-actions "$TOPIC"
+done
+
 echo "== Test message =="
 aws lambda invoke --region "$REGION" --function-name "$FN_NAME" --payload \
   '{"Records":[{"Sns":{"Message":"{\"AlarmName\":\"qdrant-alerts-setup-test\",\"NewStateValue\":\"OK\",\"NewStateReason\":\"Setup complete — this is a test message.\",\"Trigger\":{\"MetricName\":\"Setup\",\"Dimensions\":[{\"name\":\"Node\",\"value\":\"all\"}]}}"}}]}' \

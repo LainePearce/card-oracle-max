@@ -130,8 +130,39 @@ def load_one(s3, r):
 
 # ── Dual embed one day/index ────────────────────────────────────────────────────
 
+UPSERT_RETRIES   = int(os.environ.get("DUAL_EMBED_UPSERT_RETRIES", 6))
+CHECKPOINT_ROWS  = int(os.environ.get("DUAL_EMBED_CHECKPOINT_ROWS", 5000))
+
+
+def _upsert_with_retry(qdrant, collection: str, points: list, what: str) -> None:
+    """Upsert with exponential backoff. The Qdrant cluster drops connections
+    under load ("Connection reset by peer"); one transient error used to kill
+    an 8-hour run (and, with write_consistency_factor=2, a replica that fails
+    to ack surfaces as an error here too — retrying is the fix, not a crash).
+    Raises after the last attempt so the run aborts without marking progress
+    it didn't make."""
+    if not points:
+        return
+    delay = 2.0
+    for attempt in range(1, UPSERT_RETRIES + 1):
+        try:
+            qdrant.upsert(collection_name=collection, points=points, wait=True)
+            return
+        except Exception as e:
+            if attempt == UPSERT_RETRIES:
+                raise
+            logger.warning("upsert {} ({} pts) attempt {}/{} failed: {} — retrying in {:.0f}s",
+                           what, len(points), attempt, UPSERT_RETRIES, e, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+
+
 def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
-              s3, pool, batch, start_row: int = 0) -> dict:
+              s3, pool, batch, start_row: int = 0, checkpoint=None) -> dict:
+    """`checkpoint(rows_attempted)` is called every CHECKPOINT_ROWS after the
+    S3 vector buffers have been flushed, so the caller can persist an offset
+    marker mid-run. A crash then costs at most CHECKPOINT_ROWS of work instead
+    of the whole pass, and never leaves a vector in Qdrant that isn't in S3."""
     rows = read_manifest(s3, date_str)
     if rows is None:
         return {"embedded": 0, "total": 0, "note": "no manifest"}
@@ -162,9 +193,19 @@ def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
         if final and buf:
             store.write_shard(buf, shard_n)
             shard_n += 1
+            buf.clear()
         return shard_n
 
+    def _flush_all():
+        # Force every buffer to S3 (sub-SHARD_SIZE parquet files are fine) so a
+        # checkpointed offset never covers rows whose vectors aren't durable.
+        nonlocal img_n, spec_n, dino_n
+        img_n  = _drain(img_buf,  img_n,  final=True)
+        spec_n = _drain(spec_buf, spec_n, final=True)
+        dino_n = _drain(dino_buf, dino_n, final=True)
+
     load_failed = 0
+    next_checkpoint = CHECKPOINT_ROWS
     for i in range(0, total, batch):
         chunk = rows[i:i + batch]
         raw = list(pool.map(lambda r: load_one(s3, r), chunk))
@@ -227,16 +268,20 @@ def embed_day(date_str, clip_enc, text_enc, dino_encode, qdrant, store,
         img_n  = _drain(img_buf,  img_n)
         spec_n = _drain(spec_buf, spec_n)
         dino_n = _drain(dino_buf, dino_n)
-        qdrant.upsert(collection_name=CARDS_COLLECTION,  points=cards_pts, wait=True)
-        qdrant.upsert(collection_name=DINO_COLLECTION,   points=dino_pts,  wait=True)
+        _upsert_with_retry(qdrant, CARDS_COLLECTION, cards_pts, f"{date_str} cards")
+        _upsert_with_retry(qdrant, DINO_COLLECTION,  dino_pts,  f"{date_str} dinov2")
 
         embedded += len(sub)
         if (i // batch) % 20 == 0:
             logger.info("  [{}] {}/{} dual-embedded", date_str, embedded, total)
 
-    _drain(img_buf,  img_n,  final=True)
-    _drain(spec_buf, spec_n, final=True)
-    _drain(dino_buf, dino_n, final=True)
+        attempted = i + len(chunk)
+        if checkpoint is not None and attempted >= next_checkpoint and attempted < total:
+            _flush_all()
+            checkpoint(attempted)
+            next_checkpoint = attempted + CHECKPOINT_ROWS
+
+    _flush_all()
     return {"embedded": embedded, "total": total, "manifest_rows": manifest_len}
 
 
@@ -299,8 +344,16 @@ def main() -> None:
                 continue
 
         t0 = time.time()
+
+        def _checkpoint(attempted: int, idx=idx, start_row=start_row) -> None:
+            # Mid-run offset marker (vectors already flushed to S3 by embed_day).
+            mark_complete(s3, idx, {"embedded_rows": start_row + attempted,
+                                    "partial": True, "checkpoint_at": time.time()})
+            logger.info("  [{}] checkpoint — offset {}", idx, start_row + attempted)
+
         stats = embed_day(idx, clip_enc, text_enc, dino_encode, qdrant, store,
-                          s3, pool, args.batch, start_row=start_row)
+                          s3, pool, args.batch, start_row=start_row,
+                          checkpoint=_checkpoint)
         stats["seconds"] = round(time.time() - t0, 1)
 
         if stats.get("total", 0) > 0:

@@ -13,6 +13,7 @@ infra/scripts/setup-qdrant-alarms.sh) page when a node crosses the line.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 import boto3
+import requests
 from loguru import logger
 
 SSH_KEY = str(Path.home() / ".ssh" / "qdrant-test.pem")
@@ -33,6 +35,22 @@ NODES = {
     "node-2": "172.31.6.110",
 }
 NAMESPACE = "CardOracle/Qdrant"
+COLLECTIONS = ("cards", "cards_dinov2")
+_QHEADERS = {"api-key": os.environ.get("QDRANT_API_KEY", "")}
+
+
+def poll_points(ip: str, collection: str) -> int | None:
+    """Approximate point count as seen from this node. Reads prefer local
+    replicas, so per-node counts diverge when replicas do — the Sept 2026
+    cards_dinov2/node-2 gap (411k points) was invisible to every other metric."""
+    try:
+        r = requests.post(f"http://{ip}:6333/collections/{collection}/points/count",
+                          json={"exact": False}, headers=_QHEADERS, timeout=20)
+        r.raise_for_status()
+        return int(r.json()["result"]["count"])
+    except Exception as e:
+        logger.warning("count {} via {} failed: {}", collection, ip, e)
+        return None
 
 
 def poll_node(ip: str) -> dict | None:
@@ -71,7 +89,23 @@ def main() -> None:
                         "Dimensions": [{"Name": "Node", "Value": name}]})
         logger.info("{}: mem {}%  swap {}GB", name, m["mem_used_pct"], m["swap_used_gb"])
 
-    cw.put_metric_data(Namespace=NAMESPACE, MetricData=metrics)
+    # Replica divergence: spread of per-node point counts per collection.
+    for coll in COLLECTIONS:
+        counts = {n: poll_points(ip, coll) for n, ip in NODES.items()}
+        for n, cnt in counts.items():
+            if cnt is not None:
+                metrics.append({"MetricName": "PointsCount", "Value": cnt,
+                                "Dimensions": [{"Name": "Node", "Value": n},
+                                               {"Name": "Collection", "Value": coll}]})
+        good = [c for c in counts.values() if c is not None]
+        if len(good) >= 2:
+            spread = max(good) - min(good)
+            metrics.append({"MetricName": "ReplicaCountSpread", "Value": spread,
+                            "Dimensions": [{"Name": "Collection", "Value": coll}]})
+            logger.info("{}: counts {}  spread {:,}", coll, counts, spread)
+
+    for i in range(0, len(metrics), 20):   # PutMetricData caps at 20 datapoints
+        cw.put_metric_data(Namespace=NAMESPACE, MetricData=metrics[i:i + 20])
     logger.info("Published {} datapoints to {}", len(metrics), NAMESPACE)
 
 
