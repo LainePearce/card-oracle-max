@@ -154,7 +154,7 @@ def main() -> None:
 
     s3 = s3_client()
     coll = args.collection
-    total_missing = total_fixed = total_remaining = 0
+    total_missing = total_fixed = total_remaining = total_never = 0
     with httpx.Client(timeout=180) as c:
         for idx in indices:
             ids = manifest_ids(s3, idx)
@@ -170,6 +170,7 @@ def main() -> None:
                 chunk = missing[i:i + args.batch]
                 pts = fetch_full(c, coll, chunk)
                 if len(pts) < len(chunk):
+                    total_never += len(chunk) - len(pts)
                     logger.warning("{}: {} ids not found on ANY node (never written) — skipped",
                                    idx, len(chunk) - len(pts))
                 if pts:
@@ -180,9 +181,9 @@ def main() -> None:
             total_remaining += remaining
             logger.info("{}: re-upserted {:,}; remaining missing after verify: {:,}", idx, fixed, remaining)
 
-    logger.info("DONE — missing {:,} | re-upserted {:,} | still missing {:,}{}",
-                total_missing, total_fixed, total_remaining,
-                "  (dry run)" if args.dry_run else "")
+    logger.info("DONE — missing {:,} | re-upserted {:,} | never written (skipped) {:,} | "
+                "still missing {:,}{}", total_missing, total_fixed, total_never,
+                total_remaining, "  (dry run)" if args.dry_run else "")
 
 
 if __name__ == "__main__":
