@@ -12,8 +12,8 @@
 #   2. Bucket policy: add s3:ListBucket for the distribution so a missing key
 #      returns a true 404 (without it S3 answers 403, which CloudFront caches
 #      and the app can't distinguish from an access problem).
-#   3. Distribution: custom error responses (403/404 -> 404, 60s TTL so a
-#      listing archived after a miss shows up fast), SimpleCORS response
+#   3. Distribution: 60s error-cache TTL on 403/404 (so a listing archived
+#      after a miss shows up fast; status passes through), SimpleCORS response
 #      headers (canvas use), and — when the cert is ISSUED — the
 #      img.130point.com alias + cert (TLS 1.2, SNI).
 #   4. Prints the DNS CNAME to add (the public 130point.com zone is not in
@@ -97,7 +97,10 @@ src, dst, host, cert, cors = sys.argv[1:]
 cfg = json.load(open(src))["DistributionConfig"]
 before = json.dumps(cfg, sort_keys=True)
 
-errors = [{"ErrorCode": c, "ResponsePagePath": "", "ResponseCode": "404", "ErrorCachingMinTTL": 60}
+# Pass the origin's status through (ListBucket makes missing keys true 404s);
+# only shorten the error cache so a listing archived after a miss shows fast.
+# CloudFront rejects ResponseCode without ResponsePagePath — both stay empty.
+errors = [{"ErrorCode": c, "ResponsePagePath": "", "ResponseCode": "", "ErrorCachingMinTTL": 60}
           for c in (403, 404)]
 cfg["CustomErrorResponses"] = {"Quantity": len(errors), "Items": errors}
 
